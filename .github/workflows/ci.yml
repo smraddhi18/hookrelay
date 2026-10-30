@@ -1,0 +1,131 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+env:
+  UV_VERSION: "0.13.6"
+  PYTHON_VERSION: "3.12"
+
+jobs:
+  lint:
+    name: Lint & type-check
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v10.3.3
+        with:
+          version: ${{ env.UV_VERSION }}
+          python-version: ${{ env.PYTHON_VERSION }}
+          enable-cache: true
+      - name: Install (locked)
+        run: uv sync --locked
+      - name: ruff check
+        run: uv run ruff check --output-format=github .
+      - name: ruff format --check
+        run: uv run ruff format --check .
+      - name: mypy
+        run: uv run mypy
+
+  test:
+    name: Migrations & tests (Postgres 16)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_USER: hookrelay
+          POSTGRES_PASSWORD: hookrelay
+          POSTGRES_DB: hookrelay
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U hookrelay -d hookrelay"
+          --health-interval 2s
+          --health-timeout 3s
+          --health-retries 30
+    env:
+      APP_ENV: test
+      LOG_FORMAT: json
+      DATABASE_URL: postgresql+asyncpg://hookrelay:hookrelay@localhost:5432/hookrelay
+      TEST_DATABASE_URL: postgresql://hookrelay:hookrelay@localhost:5432/hookrelay
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v10.3.3
+        with:
+          version: ${{ env.UV_VERSION }}
+          python-version: ${{ env.PYTHON_VERSION }}
+          enable-cache: true
+      - name: Install (locked)
+        run: uv sync --locked
+      - name: alembic upgrade head
+        run: uv run alembic upgrade head
+      - name: alembic upgrade head (idempotent re-run)
+        run: uv run alembic upgrade head
+      - name: alembic check (models match migrations)
+        run: uv run alembic check
+      - name: alembic downgrade base / upgrade head roundtrip
+        run: |
+          uv run alembic downgrade base
+          uv run alembic upgrade head
+      - name: pytest (unit + integration)
+        run: uv run pytest --cov --cov-report=term --cov-report=xml
+      - name: Fail if integration tests were skipped
+        run: |
+          uv run pytest tests/integration -q -rs | tee integration.log
+          if grep -q "SKIPPED" integration.log; then echo "integration tests were skipped" >&2; exit 1; fi
+
+  docker:
+    name: Docker build & smoke test
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_USER: hookrelay
+          POSTGRES_PASSWORD: hookrelay
+          POSTGRES_DB: hookrelay
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U hookrelay -d hookrelay"
+          --health-interval 2s
+          --health-timeout 3s
+          --health-retries 30
+    env:
+      DATABASE_URL: postgresql+asyncpg://hookrelay:hookrelay@127.0.0.1:5432/hookrelay
+    steps:
+      - uses: actions/checkout@v4
+      - name: docker build
+        run: docker build --tag hookrelay:ci .
+      - name: Image runs as non-root
+        run: test "$(docker run --rm hookrelay:ci id -u)" = "10001"
+      - name: Migrations from the image
+        run: docker run --rm --network host -e DATABASE_URL hookrelay:ci alembic upgrade head
+      - name: API from the image answers /health and /ready
+        run: |
+          docker run -d --name hookrelay-api --network host -e DATABASE_URL hookrelay:ci
+          for i in $(seq 1 30); do
+            if curl -fsS http://127.0.0.1:8000/ready; then echo; break; fi
+            sleep 1
+          done
+          curl -fsS -H 'X-Request-ID: ci-smoke' -D - http://127.0.0.1:8000/health | tee headers.txt
+          grep -qi '^x-request-id: ci-smoke' headers.txt
+          curl -fsS http://127.0.0.1:8000/ready
+          docker exec hookrelay-api python -m hookrelay.healthcheck
+      - name: Container logs
+        if: always()
+        run: docker logs hookrelay-api || true
