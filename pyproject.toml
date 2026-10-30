@@ -1,0 +1,122 @@
+[project]
+name = "hookrelay"
+version = "0.1.0"
+description = "Multi-tenant webhook delivery platform: signed, retried, observable HTTP deliveries backed by Postgres."
+readme = "README.md"
+license = "MIT"
+license-files = ["LICENSE"]
+authors = [{ name = "Smraddhi Rathore" }]
+requires-python = ">=3.12,<3.14"
+classifiers = [
+    "Framework :: FastAPI",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Typing :: Typed",
+]
+dependencies = [
+    "fastapi>=0.160,<1",
+    "uvicorn[standard]>=0.50",
+    "sqlalchemy[asyncio]>=2.1,<2.2",
+    "asyncpg>=0.31",
+    "alembic>=1.18",
+    "pydantic>=2.12,<3",
+    "pydantic-settings>=2.12",
+    "structlog>=25.4",
+]
+
+[dependency-groups]
+dev = [
+    "pytest>=9.0",
+    "pytest-asyncio>=1.3",
+    "pytest-cov>=7.0",
+    "httpx>=0.28",
+    "ruff==0.17.3",
+    "mypy==2.4.1",
+    "asyncpg-stubs>=0.31",
+]
+
+[project.scripts]
+hookrelay = "hookrelay.__main__:main"
+
+[build-system]
+requires = ["hatchling>=1.25"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/hookrelay"]
+
+# --------------------------------------------------------------------------- ruff
+[tool.ruff]
+line-length = 100
+target-version = "py312"
+src = ["src", "tests"]
+extend-exclude = ["alembic/versions/*.py.mako"]
+
+[tool.ruff.lint]
+select = [
+    "E", "W", "F", "I", "B", "UP", "N", "S", "SIM", "C4", "RUF", "ASYNC",
+    "PT", "RET", "PL", "TRY", "DTZ", "T20", "PERF", "FAST", "ANN",
+]
+ignore = [
+    "PLR0913", # FastAPI handlers / factories legitimately take many args
+    "TRY003",  # long messages in exceptions are fine for a typed AppError
+    "ANN401",  # Any is needed for a few generic ASGI signatures
+]
+
+[tool.ruff.lint.isort]
+known-first-party = ["hookrelay", "tests"]
+# The local ./alembic directory holds migration scripts, not a package; the import is the library.
+known-third-party = ["alembic"]
+
+[tool.ruff.lint.per-file-ignores]
+"tests/**" = ["S101", "S105", "S106", "PLR2004", "ANN", "S311"]
+"alembic/**" = ["ANN"]
+
+[tool.ruff.lint.flake8-bugbear]
+extend-immutable-calls = ["fastapi.Depends", "fastapi.Query", "fastapi.Header"]
+
+[tool.ruff.format]
+quote-style = "double"
+docstring-code-format = true
+
+# --------------------------------------------------------------------------- mypy
+[tool.mypy]
+python_version = "3.12"
+strict = true
+warn_unreachable = true
+pretty = true
+show_error_codes = true
+plugins = ["pydantic.mypy"]
+files = ["src", "tests", "alembic"]
+mypy_path = "src"
+explicit_package_bases = true
+
+[[tool.mypy.overrides]]
+module = "tests.*"
+disallow_untyped_defs = false
+disallow_incomplete_defs = false
+
+[tool.pydantic-mypy]
+init_forbid_extra = true
+init_typed = true
+warn_required_dynamic_aliases = true
+
+# --------------------------------------------------------------------------- pytest
+[tool.pytest.ini_options]
+minversion = "8.0"
+testpaths = ["tests"]
+addopts = ["-ra", "--strict-markers", "--strict-config"]
+asyncio_mode = "auto"
+asyncio_default_fixture_loop_scope = "function"
+markers = [
+    "integration: needs a real Postgres (TEST_DATABASE_URL); skipped when it is not set",
+]
+filterwarnings = ["error"]
+
+[tool.coverage.run]
+source = ["hookrelay"]
+branch = true
+
+[tool.coverage.report]
+show_missing = true
+skip_covered = true
