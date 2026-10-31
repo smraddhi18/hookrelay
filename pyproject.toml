@@ -22,6 +22,7 @@ dependencies = [
     "pydantic>=2.12,<3",
     "pydantic-settings>=2.12",
     "structlog>=25.4",
+    "cryptography>=46",
 ]
 
 [dependency-groups]
@@ -116,6 +117,9 @@ filterwarnings = ["error"]
 [tool.coverage.run]
 source = ["hookrelay"]
 branch = true
+# SQLAlchemy's asyncio layer runs ORM code inside greenlets; without this, every line after
+# the first awaited DB call in a request would be reported as uncovered.
+concurrency = ["greenlet", "thread"]
 
 [tool.coverage.report]
 show_missing = true

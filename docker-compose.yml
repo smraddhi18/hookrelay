@@ -10,6 +10,10 @@ x-app-env: &app-env
   DOCS_ENABLED: "true"
   DATABASE_URL: postgresql+asyncpg://hookrelay:hookrelay@postgres:5432/hookrelay
   REDIS_URL: redis://redis:6379/0
+  # Local-stack defaults only; export real values in your shell (or .env) to override.
+  OPERATOR_TOKEN: ${OPERATOR_TOKEN:-local-operator-token-change-me-0123456789}
+  SECRETS_ENCRYPTION_KEY: ${SECRETS_ENCRYPTION_KEY:-bG9jYWwtY29tcG9zZS1rZXktbm90LWZvci1wcm9kISE}
+  SECRETS_ENCRYPTION_KEY_PREVIOUS: ${SECRETS_ENCRYPTION_KEY_PREVIOUS:-}
 
 services:
   postgres:
