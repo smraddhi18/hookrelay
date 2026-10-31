@@ -8,6 +8,7 @@ structlog's ``ProcessorFormatter`` means *every* line shares one format and carr
 from __future__ import annotations
 
 import logging
+import re
 import sys
 from typing import Any
 
@@ -16,14 +17,40 @@ from structlog.types import EventDict, Processor, WrappedLogger
 
 from hookrelay.core.config import LogFormat, Settings
 
-_SENSITIVE_KEYS = frozenset({"password", "secret", "authorization", "api_key", "token"})
+_SENSITIVE_KEYS = frozenset(
+    {
+        "password",
+        "secret",
+        "authorization",
+        "api_key",
+        "token",
+        "operator_token",
+        "signing_secret",
+        "key_hash",
+        "secret_ciphertext",
+        "headers",
+    }
+)
+# Credential shapes minted by hookrelay (API keys, endpoint signing secrets), wherever they appear.
+_SECRET_VALUE = re.compile(r"\b(?:hrk_[a-z0-9]{12}_[A-Za-z0-9_-]{20,}|whsec_[A-Za-z0-9+/=_-]{20,})")
+REDACTED = "[REDACTED]"
+_DICT_TRACEBACKS = structlog.processors.ExceptionRenderer(
+    structlog.tracebacks.ExceptionDictTransformer(show_locals=False)
+)
+
+
+def redact_text(value: str) -> str:
+    """Replace any hookrelay credential embedded in free text (exception messages, URLs)."""
+    return _SECRET_VALUE.sub(REDACTED, value)
 
 
 def _redact_sensitive(_: WrappedLogger, __: str, event_dict: EventDict) -> EventDict:
-    """Defense in depth: never let an obviously sensitive field reach the log sink."""
-    for key in list(event_dict):
+    """Defense in depth: never let an obviously sensitive field or value reach the log sink."""
+    for key, value in list(event_dict.items()):
         if key.lower() in _SENSITIVE_KEYS:
-            event_dict[key] = "[REDACTED]"
+            event_dict[key] = REDACTED
+        elif isinstance(value, str) and ("hrk_" in value or "whsec_" in value):
+            event_dict[key] = redact_text(value)
     return event_dict
 
 
@@ -53,7 +80,9 @@ def configure_logging(settings: Settings, *, stream: Any = None) -> None:
     renderer: Processor
     if settings.log_format is LogFormat.JSON:
         renderer = structlog.processors.JSONRenderer()
-        shared = [*shared, structlog.processors.dict_tracebacks]
+        # Structured tracebacks *without* frame locals: locals routinely hold request headers,
+        # API keys and decrypted secrets, which must never reach the log pipeline.
+        shared = [*shared, _DICT_TRACEBACKS]
     else:
         renderer = structlog.dev.ConsoleRenderer(colors=False)
 

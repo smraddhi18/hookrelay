@@ -6,6 +6,8 @@ without one would be a mistake; those are validated in :meth:`Settings._check_pr
 
 from __future__ import annotations
 
+import base64
+import binascii
 from enum import StrEnum
 from functools import lru_cache
 from typing import Annotated, Self
@@ -52,6 +54,22 @@ def normalize_database_url(raw: str) -> str:
 
 
 PositiveFloat = Annotated[float, Field(gt=0)]
+TimeoutMs = Annotated[int, Field(ge=1000, le=60_000)]
+
+OPERATOR_TOKEN_MIN_LENGTH = 32
+ENCRYPTION_KEY_BYTES = 32
+
+
+def decode_encryption_key(raw: str) -> bytes:
+    """Decode a base64 / base64url AES-256 key (32 bytes). Padding is optional."""
+    value = raw.strip()
+    try:
+        key = base64.urlsafe_b64decode(value + "=" * (-len(value) % 4))
+    except (binascii.Error, ValueError) as exc:
+        raise ValueError("SECRETS_ENCRYPTION_KEY must be base64-encoded") from exc
+    if len(key) != ENCRYPTION_KEY_BYTES:
+        raise ValueError("SECRETS_ENCRYPTION_KEY must decode to exactly 32 bytes (AES-256)")
+    return key
 
 
 class Settings(BaseSettings):
@@ -98,6 +116,24 @@ class Settings(BaseSettings):
     # Request correlation
     request_id_header: str = "X-Request-ID"
 
+    # Operator (platform admin) API under /admin. Unset = every /admin call is rejected.
+    operator_token: SecretStr | None = None
+
+    # AES-256-GCM key for endpoint signing secrets at rest (base64, 32 bytes). Required in
+    # production; the previous key stays readable during a key rotation.
+    secrets_encryption_key: SecretStr | None = None
+    secrets_encryption_key_previous: SecretStr | None = None
+
+    # Tenant API keys
+    api_key_rotation_overlap_s: Annotated[int, Field(ge=0, le=7 * 86_400)] = 86_400
+    api_key_last_used_resolution_s: Annotated[int, Field(ge=0, le=3_600)] = 60
+
+    # Endpoints (the full resolve-then-connect SSRF guard lands with delivery in M3)
+    endpoint_allow_http: bool = False
+    endpoint_allow_private_networks: bool = False
+    endpoint_default_timeout_ms: TimeoutMs = 10_000
+    endpoint_max_timeout_ms: TimeoutMs = 30_000
+
     @field_validator("database_url", mode="before")
     @classmethod
     def _normalize_db_url(cls, value: object) -> object:
@@ -122,6 +158,34 @@ class Settings(BaseSettings):
             raise ValueError("REQUEST_ID_HEADER must be a valid HTTP header name")
         return value
 
+    @field_validator("operator_token", mode="before")
+    @classmethod
+    def _check_operator_token(cls, value: object) -> object:
+        raw = value.get_secret_value() if isinstance(value, SecretStr) else value
+        if raw is None or (isinstance(raw, str) and not raw.strip()):
+            return None
+        if isinstance(raw, str) and len(raw.strip()) < OPERATOR_TOKEN_MIN_LENGTH:
+            raise ValueError(
+                f"OPERATOR_TOKEN must be at least {OPERATOR_TOKEN_MIN_LENGTH} characters"
+            )
+        return value
+
+    @field_validator("secrets_encryption_key", "secrets_encryption_key_previous", mode="before")
+    @classmethod
+    def _check_encryption_key(cls, value: object) -> object:
+        raw = value.get_secret_value() if isinstance(value, SecretStr) else value
+        if raw is None or (isinstance(raw, str) and not raw.strip()):
+            return None
+        if isinstance(raw, str):
+            decode_encryption_key(raw)
+        return value
+
+    @model_validator(mode="after")
+    def _check_endpoint_timeouts(self) -> Self:
+        if self.endpoint_default_timeout_ms > self.endpoint_max_timeout_ms:
+            raise ValueError("ENDPOINT_DEFAULT_TIMEOUT_MS must not exceed ENDPOINT_MAX_TIMEOUT_MS")
+        return self
+
     @model_validator(mode="after")
     def _check_production(self) -> Self:
         if self.app_env is Environment.PRODUCTION:
@@ -131,6 +195,8 @@ class Settings(BaseSettings):
                 raise ValueError("DB_ECHO must be false in production (it logs bound parameters)")
             if self.log_level is LogLevel.DEBUG:
                 raise ValueError("LOG_LEVEL=DEBUG is not allowed in production")
+            if self.secrets_encryption_key is None:
+                raise ValueError("SECRETS_ENCRYPTION_KEY is required in production")
         return self
 
     @property

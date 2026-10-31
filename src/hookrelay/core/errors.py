@@ -89,6 +89,27 @@ class ConflictError(AppError):
     code = "conflict"
 
 
+class PreconditionFailedError(AppError):
+    """``If-Match`` did not match the current version (optimistic concurrency conflict)."""
+
+    status_code = HTTPStatus.PRECONDITION_FAILED
+    code = "precondition_failed"
+
+
+class UnprocessableEntityError(AppError):
+    """Well-formed request that fails a semantic check the schema cannot express."""
+
+    status_code = HTTPStatus.UNPROCESSABLE_ENTITY
+    code = "validation_error"
+
+
+class PreconditionRequiredError(AppError):
+    """An update was sent without ``If-Match`` (lost-update protection is mandatory)."""
+
+    status_code = HTTPStatus.PRECONDITION_REQUIRED
+    code = "precondition_required"
+
+
 class ServiceUnavailableError(AppError):
     status_code = HTTPStatus.SERVICE_UNAVAILABLE
     code = "service_unavailable"
@@ -102,9 +123,11 @@ _HTTP_STATUS_CODES: dict[int, str] = {
     405: "method_not_allowed",
     406: "not_acceptable",
     409: "conflict",
+    412: "precondition_failed",
     413: "payload_too_large",
     415: "unsupported_media_type",
     422: "validation_error",
+    428: "precondition_required",
     429: "rate_limited",
     500: "internal_error",
     503: "service_unavailable",
