@@ -18,6 +18,10 @@ from hookrelay.main import create_app
 if TYPE_CHECKING:
     from hookrelay.db.engine import Database
 
+# Fixed 32-byte AES key for tests (base64url). Never use outside tests.
+TEST_ENCRYPTION_KEY = "dGVzdC1rZXktdGVzdC1rZXktdGVzdC1rZXktMzJieXQ"
+TEST_OPERATOR_TOKEN = "op-test-token-0123456789abcdefghijklmnop"
+
 # Never let a developer's .env or shell leak into unit tests.
 _ISOLATED_ENV = {"_env_file": None}
 
