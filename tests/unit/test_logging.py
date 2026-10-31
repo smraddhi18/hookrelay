@@ -86,3 +86,37 @@ async def test_access_log_line_per_request(app_factory) -> None:
     assert entry["path"] == "/health"
     assert entry["status_code"] == 200
     assert isinstance(entry["duration_ms"], float)
+
+
+def test_credentials_are_scrubbed_from_values() -> None:
+    stream = io.StringIO()
+    configure_logging(make_settings(log_level="INFO"), stream=stream)
+    key = "hrk_abcdefghijkl_" + "A" * 43
+    secret = "whsec_" + "B" * 44
+    structlog.stdlib.get_logger("t").info(
+        f"failed with {key}", detail=f"secret={secret}", api_key="x", token="y", count=3
+    )
+    (line,) = _lines(stream)
+    assert key not in json.dumps(line)
+    assert secret not in json.dumps(line)
+    assert line["event"] == "failed with [REDACTED]"
+    assert line["detail"] == "secret=[REDACTED]"
+    assert line["api_key"] == "[REDACTED]"
+    assert line["token"] == "[REDACTED]"
+    assert line["count"] == 3
+
+
+def test_exception_logs_do_not_include_frame_locals() -> None:
+    stream = io.StringIO()
+    configure_logging(make_settings(log_level="INFO"), stream=stream)
+    authorization = "Bearer top-secret-header-value"  # noqa: F841 - must not be logged
+    try:
+        raise RuntimeError("boom")  # noqa: TRY301
+    except RuntimeError:
+        structlog.stdlib.get_logger("t").exception("failed")
+    out = stream.getvalue()
+    assert "top-secret-header-value" not in out
+    (line,) = _lines(stream)
+    frames = line["exception"]
+    assert isinstance(frames, list)
+    assert all("locals" not in frame for frame in frames[0]["frames"])

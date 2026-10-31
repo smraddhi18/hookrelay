@@ -1,10 +1,18 @@
 from __future__ import annotations
 
+import base64
+
 import pytest
 from pydantic import ValidationError
 
-from hookrelay.core.config import Environment, LogFormat, Settings, normalize_database_url
-from tests.conftest import make_settings
+from hookrelay.core.config import (
+    Environment,
+    LogFormat,
+    Settings,
+    decode_encryption_key,
+    normalize_database_url,
+)
+from tests.conftest import TEST_ENCRYPTION_KEY, TEST_OPERATOR_TOKEN, make_settings
 
 
 @pytest.fixture(autouse=True)
@@ -48,11 +56,15 @@ def test_reads_environment_variables(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setenv("DB_POOL_SIZE", "25")
     monkeypatch.setenv("APP_ENV", "production")
     monkeypatch.setenv("REDIS_URL", "redis://cache:6379/0")
+    monkeypatch.setenv("SECRETS_ENCRYPTION_KEY", TEST_ENCRYPTION_KEY)
+    monkeypatch.setenv("OPERATOR_TOKEN", TEST_OPERATOR_TOKEN)
     s = Settings(_env_file=None)
     assert s.database_dsn == "postgresql+asyncpg://a:b@db:5432/x"
     assert s.db_pool_size == 25
     assert s.is_production
     assert s.redis_url == "redis://cache:6379/0"
+    assert s.operator_token is not None
+    assert s.operator_token.get_secret_value() == TEST_OPERATOR_TOKEN
 
 
 def test_database_password_is_not_in_repr() -> None:
@@ -97,11 +109,84 @@ def test_rejects_out_of_range_values(field: str, value: object) -> None:
 )
 def test_production_guards(overrides: dict[str, object]) -> None:
     with pytest.raises(ValidationError, match="production"):
-        make_settings(app_env="production", **overrides)
+        make_settings(app_env="production", secrets_encryption_key=TEST_ENCRYPTION_KEY, **overrides)
+
+
+def test_production_requires_an_encryption_key() -> None:
+    with pytest.raises(ValidationError, match="SECRETS_ENCRYPTION_KEY is required"):
+        make_settings(app_env="production")
 
 
 def test_production_with_safe_values_is_accepted() -> None:
-    assert make_settings(app_env="production", log_format="json").is_production
+    s = make_settings(
+        app_env="production", log_format="json", secrets_encryption_key=TEST_ENCRYPTION_KEY
+    )
+    assert s.is_production
+
+
+def test_m1_defaults() -> None:
+    s = Settings(_env_file=None)
+    assert s.operator_token is None
+    assert s.secrets_encryption_key is None
+    assert s.api_key_rotation_overlap_s == 86_400
+    assert s.api_key_last_used_resolution_s == 60
+    assert not s.endpoint_allow_http
+    assert not s.endpoint_allow_private_networks
+    assert (s.endpoint_default_timeout_ms, s.endpoint_max_timeout_ms) == (10_000, 30_000)
+
+
+def test_empty_operator_token_disables_the_operator_api() -> None:
+    assert make_settings(operator_token="").operator_token is None
+    assert make_settings(operator_token="   ").operator_token is None
+
+
+def test_short_operator_token_is_rejected() -> None:
+    with pytest.raises(ValidationError, match="OPERATOR_TOKEN"):
+        make_settings(operator_token="too-short")
+
+
+def test_operator_token_is_not_in_repr() -> None:
+    s = make_settings(operator_token=TEST_OPERATOR_TOKEN)
+    assert TEST_OPERATOR_TOKEN not in repr(s)
+    assert TEST_OPERATOR_TOKEN not in str(s.model_dump())
+
+
+@pytest.mark.parametrize("field", ["secrets_encryption_key", "secrets_encryption_key_previous"])
+@pytest.mark.parametrize(
+    "value",
+    ["not base64 !!", "c2hvcnQ", base64.urlsafe_b64encode(b"x" * 33).decode()],
+)
+def test_rejects_bad_encryption_keys(field: str, value: str) -> None:
+    with pytest.raises(ValidationError, match="SECRETS_ENCRYPTION_KEY"):
+        make_settings(**{field: value})
+
+
+def test_accepts_padded_and_unpadded_encryption_keys() -> None:
+    raw = bytes(range(32))
+    padded = base64.urlsafe_b64encode(raw).decode()
+    assert decode_encryption_key(padded) == raw
+    assert decode_encryption_key(padded.rstrip("=")) == raw
+    assert make_settings(secrets_encryption_key=padded).secrets_encryption_key is not None
+
+
+def test_empty_encryption_key_means_unset() -> None:
+    assert make_settings(secrets_encryption_key="").secrets_encryption_key is None
+
+
+@pytest.mark.parametrize(
+    "overrides",
+    [
+        {"endpoint_default_timeout_ms": 999},
+        {"endpoint_max_timeout_ms": 60_001},
+        {"endpoint_default_timeout_ms": 40_000, "endpoint_max_timeout_ms": 30_000},
+        {"api_key_rotation_overlap_s": -1},
+        {"api_key_rotation_overlap_s": 8 * 86_400},
+        {"api_key_last_used_resolution_s": 3_601},
+    ],
+)
+def test_rejects_bad_m1_values(overrides: dict[str, object]) -> None:
+    with pytest.raises(ValidationError):
+        make_settings(**overrides)
 
 
 @pytest.mark.parametrize("value", ["http://cache:6379", "cache:6379"])
