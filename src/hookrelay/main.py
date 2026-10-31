@@ -19,7 +19,9 @@ from hookrelay.core.config import Settings, get_settings
 from hookrelay.core.errors import ErrorEnvelope, register_exception_handlers
 from hookrelay.core.logging import configure_logging
 from hookrelay.core.request_context import RequestContextMiddleware
+from hookrelay.core.security import SecretBox
 from hookrelay.db.engine import Database
+from hookrelay.services.endpoints import EndpointPolicy
 
 logger = structlog.stdlib.get_logger("hookrelay.app")
 
@@ -43,6 +45,7 @@ def create_app(settings: Settings | None = None, database: Database | None = Non
             env=settings.app_env.value,
             version=__version__,
             pool_size=settings.db_pool_size,
+            operator_api=settings.operator_token is not None,
         )
         try:
             # Fail soft: a cold database should make /ready return 503, not crash-loop the pod.
@@ -71,6 +74,9 @@ def create_app(settings: Settings | None = None, database: Database | None = Non
         },
     )
     app.state.settings = settings
+    # Built eagerly so a malformed SECRETS_ENCRYPTION_KEY fails at boot, not on first request.
+    app.state.secret_box = SecretBox.from_settings(settings)
+    app.state.endpoint_policy = EndpointPolicy.from_settings(settings)
     app.state.request_id_header = settings.request_id_header
     app.state.draining = False
 
