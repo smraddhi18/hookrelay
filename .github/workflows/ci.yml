@@ -107,6 +107,9 @@ jobs:
           --health-retries 30
     env:
       DATABASE_URL: postgresql+asyncpg://hookrelay:hookrelay@127.0.0.1:5432/hookrelay
+      # Throwaway CI-only values: the image runs with APP_ENV=production, which requires a key.
+      SECRETS_ENCRYPTION_KEY: Y2ktb25seS1rZXktY2ktb25seS1rZXktY2ktb25seSE
+      OPERATOR_TOKEN: ci-operator-token-0123456789abcdefghij
     steps:
       - uses: actions/checkout@v4
       - name: docker build
@@ -114,10 +117,11 @@ jobs:
       - name: Image runs as non-root
         run: test "$(docker run --rm hookrelay:ci id -u)" = "10001"
       - name: Migrations from the image
-        run: docker run --rm --network host -e DATABASE_URL hookrelay:ci alembic upgrade head
+        run: docker run --rm --network host -e DATABASE_URL -e SECRETS_ENCRYPTION_KEY hookrelay:ci alembic upgrade head
       - name: API from the image answers /health and /ready
         run: |
-          docker run -d --name hookrelay-api --network host -e DATABASE_URL hookrelay:ci
+          docker run -d --name hookrelay-api --network host \
+            -e DATABASE_URL -e SECRETS_ENCRYPTION_KEY -e OPERATOR_TOKEN hookrelay:ci
           for i in $(seq 1 30); do
             if curl -fsS http://127.0.0.1:8000/ready; then echo; break; fi
             sleep 1
@@ -126,6 +130,15 @@ jobs:
           grep -qi '^x-request-id: ci-smoke' headers.txt
           curl -fsS http://127.0.0.1:8000/ready
           docker exec hookrelay-api python -m hookrelay.healthcheck
+      - name: API from the image enforces auth and serves the tenant API
+        run: |
+          test "$(curl -s -o /dev/null -w '%{http_code}' http://127.0.0.1:8000/v1/endpoints)" = "401"
+          test "$(curl -s -o /dev/null -w '%{http_code}' -H 'Authorization: Bearer wrong' \
+            http://127.0.0.1:8000/admin/tenants)" = "401"
+          curl -fsS -X POST http://127.0.0.1:8000/admin/tenants \
+            -H "Authorization: Bearer ${OPERATOR_TOKEN}" -H 'Content-Type: application/json' \
+            -d '{"slug": "ci-smoke", "name": "CI smoke"}' -o tenant.json
+          grep -q '"slug":"ci-smoke"' tenant.json
       - name: Container logs
         if: always()
         run: docker logs hookrelay-api || true
