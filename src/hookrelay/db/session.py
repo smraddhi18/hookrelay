@@ -24,4 +24,6 @@ async def get_session(database: DatabaseDep) -> AsyncIterator[AsyncSession]:
         yield session
 
 
-SessionDep = Annotated[AsyncSession, Depends(get_session)]
+# scope="function": the unit of work commits when the path operation returns, *before* the
+# response is sent, so a failed commit becomes an error response instead of a lying 2xx.
+SessionDep = Annotated[AsyncSession, Depends(get_session, scope="function")]
