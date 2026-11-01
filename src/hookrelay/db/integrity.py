@@ -2,7 +2,9 @@
 
 from __future__ import annotations
 
-from sqlalchemy.exc import IntegrityError
+from sqlalchemy.exc import DBAPIError, IntegrityError
+
+LOCK_NOT_AVAILABLE = "55P03"
 
 
 def violated_constraint(exc: IntegrityError) -> str | None:
@@ -16,4 +18,15 @@ def violated_constraint(exc: IntegrityError) -> str | None:
         name = getattr(candidate, "constraint_name", None)
         if isinstance(name, str) and name:
             return name
+    return None
+
+
+def sqlstate(exc: DBAPIError) -> str | None:
+    """SQLSTATE of a wrapped driver error (e.g. ``55P03`` lock_not_available), if reported."""
+    candidates: list[object] = [exc.orig, getattr(exc.orig, "__cause__", None)]
+    for candidate in candidates:
+        for attribute in ("sqlstate", "pgcode"):
+            code = getattr(candidate, attribute, None)
+            if isinstance(code, str) and code:
+                return code
     return None
