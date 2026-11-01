@@ -139,6 +139,48 @@ jobs:
             -H "Authorization: Bearer ${OPERATOR_TOKEN}" -H 'Content-Type: application/json' \
             -d '{"slug": "ci-smoke", "name": "CI smoke"}' -o tenant.json
           grep -q '"slug":"ci-smoke"' tenant.json
+      - name: Publish an event (with idempotent replay) and fan it out with the relay image
+        run: |
+          API=http://127.0.0.1:8000
+          JSON='Content-Type: application/json'
+          TENANT_ID="$(jq -r .id tenant.json)"
+          KEY="$(curl -fsS -X POST "$API/admin/tenants/$TENANT_ID/api-keys" \
+            -H "Authorization: Bearer ${OPERATOR_TOKEN}" -H "$JSON" \
+            -d '{"name": "ci", "role": "admin"}' | jq -r .key)"
+          AUTH="Authorization: Bearer $KEY"
+          curl -fsS -X POST "$API/v1/event-types" -H "$AUTH" -H "$JSON" -d '{"name": "ci.smoke"}'
+          ENDPOINT_ID="$(curl -fsS -X POST "$API/v1/endpoints" -H "$AUTH" -H "$JSON" \
+            -d '{"url": "https://hooks.example.com/ci"}' | jq -r .id)"
+          curl -fsS -X POST "$API/v1/endpoints/$ENDPOINT_ID/subscriptions" -H "$AUTH" -H "$JSON" \
+            -d '{"event_type": "ci.*"}'
+          EVENT='{"event_type": "ci.smoke", "payload": {"ok": true}}'
+          test "$(curl -s -o event.json -w '%{http_code}' -X POST "$API/v1/events" -H "$AUTH" \
+            -H "$JSON" -H 'Idempotency-Key: ci-smoke-1' -d "$EVENT")" = "202"
+          EVENT_ID="$(jq -r .id event.json)"
+          curl -fsS -D replay.txt -o replay.json -X POST "$API/v1/events" -H "$AUTH" -H "$JSON" \
+            -H 'Idempotency-Key: ci-smoke-1' -d "$EVENT"
+          grep -qi '^idempotent-replayed: true' replay.txt
+          test "$(jq -r .id replay.json)" = "$EVENT_ID"
+          docker run --rm --network host -e DATABASE_URL -e SECRETS_ENCRYPTION_KEY hookrelay:ci \
+            python -m hookrelay.relay --once
+          curl -fsS "$API/v1/events/$EVENT_ID/deliveries" -H "$AUTH" | tee deliveries.json
+          test "$(jq '.data | length' deliveries.json)" = "1"
+          test "$(jq -r '.data[0].endpoint_id' deliveries.json)" = "$ENDPOINT_ID"
+          test "$(jq -r '.data[0].status' deliveries.json)" = "pending"
+      - name: Relay loop from the image heartbeats and stops cleanly on SIGTERM
+        run: |
+          docker run -d --name hookrelay-relay --network host \
+            -e DATABASE_URL -e SECRETS_ENCRYPTION_KEY hookrelay:ci python -m hookrelay.relay
+          for i in $(seq 1 20); do
+            if docker exec hookrelay-relay python -m hookrelay.relay --healthcheck; then break; fi
+            sleep 1
+          done
+          docker exec hookrelay-relay python -m hookrelay.relay --healthcheck
+          docker stop --time 20 hookrelay-relay
+          test "$(docker inspect -f '{{.State.ExitCode}}' hookrelay-relay)" = "0"
+          docker logs hookrelay-relay 2>&1 | grep -q '"event": "relay.stopped"'
       - name: Container logs
         if: always()
-        run: docker logs hookrelay-api || true
+        run: |
+          docker logs hookrelay-api || true
+          docker logs hookrelay-relay || true
