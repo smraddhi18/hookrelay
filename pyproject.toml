@@ -38,6 +38,7 @@ dev = [
 
 [project.scripts]
 hookrelay = "hookrelay.__main__:main"
+hookrelay-relay = "hookrelay.relay:main"
 
 [build-system]
 requires = ["hatchling>=1.25"]

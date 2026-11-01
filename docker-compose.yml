@@ -1,4 +1,4 @@
-# Local stack: Postgres 16 + Redis 7 + a one-shot migration job + the API.
+# Local stack: Postgres 16 + Redis 7 + a one-shot migration job + the API + the fan-out relay.
 #   docker compose up --build        -> http://localhost:8000/docs
 #   docker compose down -v           -> stop and wipe data
 name: hookrelay
@@ -14,6 +14,13 @@ x-app-env: &app-env
   OPERATOR_TOKEN: ${OPERATOR_TOKEN:-local-operator-token-change-me-0123456789}
   SECRETS_ENCRYPTION_KEY: ${SECRETS_ENCRYPTION_KEY:-bG9jYWwtY29tcG9zZS1rZXktbm90LWZvci1wcm9kISE}
   SECRETS_ENCRYPTION_KEY_PREVIOUS: ${SECRETS_ENCRYPTION_KEY_PREVIOUS:-}
+  EVENT_MAX_PAYLOAD_BYTES: ${EVENT_MAX_PAYLOAD_BYTES:-262144}
+  EVENT_RETENTION_DAYS: ${EVENT_RETENTION_DAYS:-30}
+  IDEMPOTENCY_KEY_TTL_S: ${IDEMPOTENCY_KEY_TTL_S:-86400}
+  IDEMPOTENCY_LOCK_TIMEOUT_MS: ${IDEMPOTENCY_LOCK_TIMEOUT_MS:-2000}
+  RELAY_BATCH_SIZE: ${RELAY_BATCH_SIZE:-100}
+  RELAY_POLL_MIN_MS: ${RELAY_POLL_MIN_MS:-100}
+  RELAY_POLL_MAX_MS: ${RELAY_POLL_MAX_MS:-2000}
 
 services:
   postgres:
@@ -65,6 +72,26 @@ services:
         condition: service_completed_successfully
       redis:
         condition: service_healthy
+    restart: unless-stopped
+    stop_grace_period: 30s
+
+  # Drains the transactional outbox into deliveries. Scale out freely
+  # (`docker compose up --scale relay=3`): relays claim disjoint batches with SKIP LOCKED.
+  relay:
+    image: hookrelay:local
+    command: ["python", "-m", "hookrelay.relay"]
+    environment: *app-env
+    depends_on:
+      migrate:
+        condition: service_completed_successfully
+    # The image's default probe checks the API port; the relay has none, so it proves
+    # liveness through a heartbeat file touched on every polling iteration.
+    healthcheck:
+      test: ["CMD", "python", "-m", "hookrelay.relay", "--healthcheck"]
+      interval: 10s
+      timeout: 3s
+      start_period: 10s
+      retries: 3
     restart: unless-stopped
     stop_grace_period: 30s
 
