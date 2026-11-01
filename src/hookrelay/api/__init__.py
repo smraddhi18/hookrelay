@@ -14,6 +14,7 @@ from hookrelay.api.routers import (
     api_keys,
     endpoints,
     event_types,
+    events,
     health,
     me,
     subscriptions,
@@ -29,6 +30,7 @@ v1_router.include_router(api_keys.router)
 v1_router.include_router(endpoints.router)
 v1_router.include_router(event_types.router)
 v1_router.include_router(subscriptions.router)
+v1_router.include_router(events.router)
 
 api_router = APIRouter()
 api_router.include_router(health.router)
