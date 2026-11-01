@@ -14,10 +14,11 @@ It is built milestone by milestone with production habits: typed config, structu
 migrations with downgrade paths, tests against real Postgres, containers and CI from day one.
 See the **[roadmap](ROADMAP.md)** for the plan and progress log.
 
-> **Status:** Milestones 0 (foundation) and 1 (tenancy) are complete. An operator can create
-> and suspend tenants; tenants authenticate with hashed, role-scoped, rotatable API keys and
-> manage endpoints (with encrypted signing secrets), an event-type registry and wildcard
-> subscriptions. Event ingestion and delivery land from Milestone 2 onwards.
+> **Status:** Milestones 0 (foundation), 1 (tenancy) and 2 (ingestion) are complete. Tenants
+> authenticate with hashed, role-scoped API keys, manage endpoints, event types and wildcard
+> subscriptions, and publish events through `POST /v1/events` with `Idempotency-Key` support.
+> Each event and its outbox row commit in one transaction, and a separate relay process fans
+> the outbox out into exactly one `delivery` per (event, endpoint). HTTP delivery comes in Milestone 3.
 
 ## Features
 
@@ -35,7 +36,11 @@ See the **[roadmap](ROADMAP.md)** for the plan and progress log.
 | Tenancy | Endpoints CRUD: URL policy, header deny-list, timeout bounds, AES-256-GCM-encrypted signing secret (admin-only reveal), soft delete | ✅ M1 |
 | Tenancy | Event-type registry (archive / unarchive) and subscriptions with `*` / `invoice.*` wildcards, fan-out preview | ✅ M1 |
 | API | Keyset cursor pagination, `ETag` / `If-Match` optimistic concurrency (428 / 412), OpenAPI examples + security schemes | ✅ M1 |
-| Ingestion | `POST /v1/events`, idempotency keys, transactional outbox, fan-out | 🔜 M2 |
+| Ingestion | `POST /v1/events`: strict JSON (media type, size limits checked before and while reading, depth limit, no `NaN` / `\u0000`), registered non-archived types, `external_id` uniqueness, `occurred_at` skew check | ✅ M2 |
+| Ingestion | `Idempotency-Key`: tenant-scoped, request fingerprint, replayed response (`Idempotent-Replayed: true`), `422` on mismatch, concurrent duplicates serialised (`409` + `Retry-After` past a lock timeout), TTL, errors never cached | ✅ M2 |
+| Ingestion | Transactional outbox: event + outbox row (+ idempotency record) in one transaction | ✅ M2 |
+| Ingestion | Fan-out relay process: `SKIP LOCKED` batches, `ON CONFLICT DO NOTHING` deliveries (exactly one per event and endpoint), poison-row isolation with backoff, adaptive polling, heartbeat health check, graceful `SIGTERM` | ✅ M2 |
+| Ingestion | Event read APIs (list with filters, get with payload, deliveries per event) and retention (`retain_until`, purged by the relay) | ✅ M2 |
 | Delivery | `SKIP LOCKED` workers, Standard-Webhooks HMAC-SHA256 signing, timeouts, retries with jittered backoff, SSRF guard, attempt log | 🔜 M3 |
 | Isolation | Per-endpoint circuit breakers, rate limits, concurrency caps, DLQ, replay | 🔜 M4 |
 | Operability | Secret rotation (dual signing), delivery log search, endpoint health | 🔜 M5 |
@@ -97,7 +102,7 @@ flowchart LR
     Workers -. metrics, traces .-> OBS
 ```
 
-### What exists today (Milestone 1)
+### Tenancy and auth (Milestone 1)
 
 ```mermaid
 flowchart LR
@@ -153,6 +158,50 @@ flowchart LR
     App -->|"JSON logs, secrets redacted"| OUT[(stdout)]
 ```
 
+### Ingestion and fan-out (Milestone 2)
+
+```mermaid
+flowchart LR
+    PUB["Producer<br/>(publisher key)"] -->|"POST /v1/events<br/>Idempotency-Key"| ING
+
+    subgraph API["FastAPI app"]
+        ING["events router<br/>read_body: media type, size, depth<br/>canonical JSON + fingerprint"]
+        IDS["idempotency.claim<br/>INSERT ... ON CONFLICT<br/>(row lock = in-flight marker)"]
+        EVS["events.ingest_event<br/>type check, external_id, skew"]
+        READ["GET /v1/events<br/>/v1/events/{id}<br/>/v1/events/{id}/deliveries"]
+        ING --> IDS --> EVS
+    end
+
+    subgraph PG["Postgres 16"]
+        IK[(idempotency_keys)]
+        EV[(events)]
+        OB[(event_outbox<br/>partial index: pending)]
+        DL[(deliveries<br/>unique event_id, endpoint_id)]
+        SUB[(subscriptions +<br/>endpoints)]
+    end
+
+    IDS --> IK
+    EVS -->|"one transaction:<br/>event + outbox row<br/>+ stored response"| EV
+    EVS --> OB
+    READ --> EV
+    READ --> DL
+
+    subgraph Relay["Relay processes (python -m hookrelay.relay, N replicas)"]
+        CL["claim batch<br/>FOR UPDATE SKIP LOCKED"]
+        FO["fan-out INSERT ... SELECT<br/>ON CONFLICT DO NOTHING"]
+        PZ["per-row savepoints on failure<br/>→ backoff via available_at"]
+        HK["housekeeping<br/>expired keys / processed outbox / expired events"]
+        CL --> FO
+        FO -. batch failed .-> PZ
+    end
+
+    OB --> CL
+    SUB --> FO
+    FO -->|"mark processed_at<br/>same transaction"| DL
+    HK --> PG
+    DL -. "M3: delivery workers" .-> W["HTTP delivery"]
+```
+
 ### Request flow (with auth)
 
 1. `RequestContextMiddleware` (pure ASGI) reads `X-Request-ID`. A caller-supplied ID is kept only
@@ -181,16 +230,45 @@ flowchart LR
 8. The response gets `X-Request-ID` (and `ETag` / `Location` / `Cache-Control: no-store` where relevant),
    and one `http.request` access-log line records method, path, status and duration.
 
-### Planned delivery flow (M2 to M4)
+### Ingest and fan-out flow (Milestone 2)
 
-1. **Ingest:** authenticate the API key, check `Idempotency-Key`, then insert the `event` and an `outbox`
-   row **in the same transaction** and return `202`. No dual write to a broker.
-2. **Fan-out:** a relay claims outbox rows (`SKIP LOCKED`), resolves matching subscriptions and inserts
-   one `delivery` per endpoint (unique on `(event_id, endpoint_id)`).
-3. **Deliver:** workers lease due deliveries (`FOR UPDATE SKIP LOCKED`, lease token for fencing),
+1. **Authenticate** a `publisher` (or `admin`) key. A malformed `Idempotency-Key` (not 1 to 255
+   printable ASCII chars) is rejected with `400` before anything else happens.
+2. **Read the body defensively.** Only `application/json` (or `+json`) is accepted (`415`). A
+   `Content-Length` above `EVENT_MAX_PAYLOAD_BYTES` + 16 KiB envelope headroom is refused before
+   reading; a chunked body is cut off at the same limit (`413 request_too_large`). JSON must be
+   UTF-8 and at most 64 levels deep, without `NaN`/`Infinity`, `\u0000` or lone surrogates
+   (which `jsonb` cannot store), so bad input is a `422`, never a `500`. The payload is
+   re-serialised canonically (sorted keys, no whitespace) and its size checked against
+   `EVENT_MAX_PAYLOAD_BYTES` (`413 payload_too_large`).
+3. **Claim the idempotency key** (when sent): `INSERT ... ON CONFLICT (tenant_id, key) DO UPDATE ...
+   WHERE expired` inside the request transaction, with `lock_timeout = IDEMPOTENCY_LOCK_TIMEOUT_MS`.
+   - Row with a stored response and the same fingerprint (SHA-256 of method, path and canonical body):
+     return the stored `202` body with `Idempotent-Replayed: true`. Nothing new is written.
+   - Same key, different request: `422 idempotency_key_mismatch`.
+   - Another request is still holding the key (uncommitted claim): this request waits on the row
+     lock; past the timeout it gets `409 idempotency_key_in_progress` with `Retry-After: 1`.
+4. **Write the event:** check the type is registered and not archived, `occurred_at` is at most
+   `EVENT_OCCURRED_AT_MAX_FUTURE_S` ahead, then insert the `events` row (`retain_until = now() +
+   EVENT_RETENTION_DAYS`) and its `event_outbox` row, and store the response on the idempotency row.
+   One commit covers all three; any error rolls everything back, including the key claim.
+5. Return `202 Accepted` with `Location: /v1/events/{id}`.
+6. **Relay:** each relay loop claims up to `RELAY_BATCH_SIZE` due outbox rows `FOR UPDATE SKIP LOCKED`,
+   inserts deliveries with one `INSERT ... SELECT` over enabled, non-deleted endpoints whose
+   subscriptions match (exact or prefix wildcard) using `ON CONFLICT (event_id, endpoint_id) DO NOTHING`,
+   and sets `processed_at` in the same transaction. If the batch statement fails, it retries row by
+   row inside savepoints; a failing row gets `attempts + 1`, `last_error` and
+   `available_at = now() + min(2^(attempts-1), RELAY_RETRY_MAX_S)` seconds so it cannot block the others.
+7. **Housekeeping** (every `RELAY_HOUSEKEEPING_INTERVAL_S`, in bounded batches): delete expired idempotency
+   keys, processed outbox rows older than `RELAY_OUTBOX_RETENTION_S`, and events past `retain_until`
+   (their outbox rows and deliveries cascade).
+
+### Planned delivery flow (M3 to M4)
+
+1. **Deliver:** workers lease due deliveries (`FOR UPDATE SKIP LOCKED`, lease token for fencing),
    check the endpoint's breaker and rate limit, resolve and vet the target IP (SSRF guard),
    sign with HMAC-SHA256 (Standard Webhooks headers) and POST with strict timeouts.
-4. **Record:** every attempt is logged. 2xx marks the delivery done. Other outcomes schedule a retry with
+2. **Record:** every attempt is logged. 2xx marks the delivery done. Other outcomes schedule a retry with
    exponential backoff and full jitter (honouring `Retry-After`) until attempts run out, then it is dead-lettered.
    Tenants can replay anything.
 
@@ -275,6 +353,52 @@ flowchart LR
   (`Cache-Control: no-store`); readers and publishers see custom header values masked as `********`;
   the logging pipeline redacts credential-like keys and never renders traceback locals.
 
+### Milestone 2 decisions
+
+- **Transactional outbox, not "publish after commit".** The event, its outbox row and the stored
+  idempotent response commit together, so an accepted event is never lost and a rolled-back one is
+  never fanned out. The outbox is a separate narrow table with a partial index on pending rows, so
+  the relay's claim query stays fast no matter how large `events` grows, and processed rows are
+  purged on their own schedule.
+- **Exactly-once fan-out from at-least-once processing.** A relay can crash after inserting deliveries
+  but before committing, or a row can be processed twice after an operator resets it. The unique
+  `(event_id, endpoint_id)` constraint plus `ON CONFLICT DO NOTHING` makes re-processing harmless; the
+  tests run 4 relays concurrently over 60 events × 3 endpoints, crash one mid-batch and replay the
+  outbox, and always find exactly 180 deliveries.
+- **`SKIP LOCKED` instead of a leader.** Any number of relays can run; they take disjoint batches
+  without coordination, and a dead relay's locks vanish with its connection. Ordering across events
+  is not guaranteed (it never is with parallel consumers); receivers get `occurred_at` and ids.
+- **Subscriptions are evaluated at relay time, not at ingest.** Ingest stays a constant-cost write,
+  and a subscription created a second after publishing still catches an event that has not been
+  fanned out yet. The trade-off: during a relay backlog, unsubscribing also stops not-yet-fanned-out
+  events. Deliveries inherit the event's `retain_until`.
+- **Idempotency record = an uncommitted row lock.** Claiming the key is an `INSERT ... ON CONFLICT`
+  in the same transaction as the write, so a concurrent duplicate simply blocks in Postgres until the
+  first commits (then replays) or rolls back (then proceeds). No separate "in progress" state can be
+  left behind by a crash. `lock_timeout` bounds the wait (`409` + `Retry-After`) so a slow request
+  cannot pin connections of its retries. Verified with 8 concurrent identical requests → 1 event, 7 replays.
+- **Only successes are remembered.** Errors roll back the claim, so a client that fixes a `422`
+  (for example, registers the missing event type) can retry with the same key. This follows the
+  IETF idempotency-key draft's intent; the trade-off is that a non-deterministic failure is retried
+  rather than replayed, which is what clients want for a publish endpoint.
+- **Fingerprints use the canonical body.** Key order and whitespace do not change the fingerprint, so
+  re-serialising clients still replay; any semantic change (another payload, type or `occurred_at`) is
+  a mismatch. Floats are kept as Python floats (IEEE-754 doubles), so numbers beyond double precision
+  are normalised; producers needing exact decimals should send them as strings.
+- **Limits enforced before work.** The declared `Content-Length` is checked before the body is read, a
+  streaming body is cut off at the limit, and JSON depth is bounded, so a hostile request cannot make
+  the API buffer megabytes or recurse deeply. The payload limit applies to the canonical form, which
+  is exactly what is stored and later signed.
+- **Poison rows back off, healthy rows flow.** A set-based batch is fast; when it fails the relay
+  falls back to per-row savepoints, parks only the failing row with exponential backoff and records
+  the error, so one bad row costs one retry per backoff period rather than a stuck queue.
+- **Retention is a column now, partitions later.** `retain_until` is indexed on events and deliveries
+  and purged in bounded batches by the relay. When volume calls for it, the same column becomes the
+  range-partition key and purging becomes `DROP PARTITION` (M8 capacity plan).
+- **Relay health is a heartbeat file.** The relay serves no HTTP, so the container probe
+  (`python -m hookrelay.relay --healthcheck`) checks that the loop touched its heartbeat within
+  `RELAY_HEARTBEAT_MAX_AGE_S`. A wedged loop is restarted even if the process is alive.
+
 ## Getting started
 
 ### Prerequisites
@@ -325,19 +449,28 @@ EP=$(curl -s -X POST localhost:8000/v1/endpoints -H "Authorization: Bearer $KEY"
 curl -s -X POST localhost:8000/v1/endpoints/$EP/subscriptions -H "Authorization: Bearer $KEY" \
   -H 'Content-Type: application/json' -d '{"event_type": "invoice.*"}'
 curl -s "localhost:8000/v1/subscriptions/match?event_type=invoice.paid" -H "Authorization: Bearer $KEY"
+
+# 3. Publish an event (safe to retry with the same Idempotency-Key) and fan it out
+EVENT=$(curl -s -X POST localhost:8000/v1/events -H "Authorization: Bearer $KEY" \
+  -H 'Content-Type: application/json' -H 'Idempotency-Key: inv_1042-paid' \
+  -d '{"event_type": "invoice.paid", "payload": {"invoice_id": "inv_1042", "amount": 4200}}' | jq -r .id)
+uv run hookrelay-relay --once     # or run `uv run hookrelay-relay` continuously
+curl -s localhost:8000/v1/events/$EVENT/deliveries -H "Authorization: Bearer $KEY"
 ```
 
 ### Docker Compose
 
 ```bash
-docker compose up --build   # postgres:16 + redis:7 + one-shot migrate job + api on :8000
+docker compose up --build   # postgres:16 + redis:7 + one-shot migrate job + api on :8000 + relay
 curl -i localhost:8000/ready
 docker compose down -v
 ```
 
 Compose ships local-only defaults for `OPERATOR_TOKEN` and `SECRETS_ENCRYPTION_KEY` (export your own
 values to override them). The `migrate` service runs `alembic upgrade head` and exits. `api` starts only after it completes
-successfully. The image runs as UID 10001 and has a stdlib-only `HEALTHCHECK`.
+successfully. The image runs as UID 10001 and has a stdlib-only `HEALTHCHECK`. The `relay` service
+reuses the same image with `python -m hookrelay.relay` and overrides the health check with the
+relay's heartbeat probe; scale it with `docker compose up --scale relay=3`.
 
 ## Configuration
 
@@ -361,6 +494,16 @@ All settings are environment variables (or `.env`), validated at startup. See
 | `API_KEY_LAST_USED_RESOLUTION_S` | `60` | minimum seconds between `last_used_at` writes per key |
 | `ENDPOINT_ALLOW_HTTP` / `ENDPOINT_ALLOW_PRIVATE_NETWORKS` | `false` / `false` | development escape hatches for `http://` and localhost / private targets |
 | `ENDPOINT_DEFAULT_TIMEOUT_MS` / `ENDPOINT_MAX_TIMEOUT_MS` | `10000` / `30000` | per-endpoint delivery timeout default and cap (1000 to 60000) |
+| `EVENT_MAX_PAYLOAD_BYTES` | `262144` | max canonical JSON size of `payload`; the request may be 16 KiB larger for the envelope |
+| `EVENT_OCCURRED_AT_MAX_FUTURE_S` | `300` | allowed clock skew for a client-supplied `occurred_at` |
+| `EVENT_RETENTION_DAYS` | `30` | events and their deliveries are purged after this |
+| `IDEMPOTENCY_KEY_TTL_S` | `86400` | how long an `Idempotency-Key` is remembered (60 to 604800) |
+| `IDEMPOTENCY_LOCK_TIMEOUT_MS` | `2000` | wait for a concurrent request with the same key before `409` + `Retry-After` |
+| `RELAY_BATCH_SIZE` | `100` | outbox rows claimed per relay transaction |
+| `RELAY_POLL_MIN_MS` / `RELAY_POLL_MAX_MS` | `100` / `2000` | idle polling backoff bounds (min ≤ max enforced) |
+| `RELAY_RETRY_MAX_S` | `300` | cap of the exponential backoff for a failing outbox row |
+| `RELAY_HOUSEKEEPING_INTERVAL_S` / `RELAY_OUTBOX_RETENTION_S` | `60` / `3600` | purge cadence; how long processed outbox rows are kept |
+| `RELAY_HEARTBEAT_FILE` / `RELAY_HEARTBEAT_MAX_AGE_S` | `/tmp/hookrelay-relay.heartbeat` / `60` | liveness file for `--healthcheck` |
 
 ## API
 
@@ -402,6 +545,10 @@ Interactive docs: `/docs` (Swagger UI), `/redoc`, schema at `/openapi.json` (dis
 | `GET` / `POST` | `/v1/endpoints/{endpoint_id}/subscriptions` | List / subscribe to `invoice.paid`, `invoice.*` or `*` | reader / admin |
 | `DELETE` | `/v1/endpoints/{endpoint_id}/subscriptions/{subscription_id}` | Unsubscribe | admin |
 | `GET` | `/v1/subscriptions/match?event_type=` | Fan-out preview: enabled endpoints + matched patterns | reader |
+| `POST` | `/v1/events` | Publish an event (`202`, `Location`); optional `Idempotency-Key` header | publisher |
+| `GET` | `/v1/events` | List events, newest first (`?event_type=`, `?created_after=`, `?created_before=`), without payloads | reader |
+| `GET` | `/v1/events/{event_id}` | Get an event with its payload and `payload_size` | reader |
+| `GET` | `/v1/events/{event_id}/deliveries` | Deliveries created for the event (status, attempts, next attempt) | reader |
 
 List responses share one shape: `{"data": [...], "next_cursor": "...", "has_more": true}`; pass
 `?cursor=<next_cursor>&limit=<1..100>` for the next page.
@@ -427,11 +574,38 @@ Cache-Control: no-store
  "timeout_ms": 5000, "version": 1, "signing_secret": "whsec_...", ...}
 ```
 
+Example: publishing an event.
+
+```http
+POST /v1/events
+Authorization: Bearer hrk_3k9x0q7m2p1a_...
+Content-Type: application/json
+Idempotency-Key: inv_1042-paid
+
+{"event_type": "invoice.paid", "external_id": "inv_1042:paid",
+ "occurred_at": "2026-11-01T09:30:00Z", "payload": {"invoice_id": "inv_1042", "amount": 4200}}
+```
+
+```http
+HTTP/1.1 202 Accepted
+Location: /v1/events/7b1e9a52-...
+
+{"id": "7b1e9a52-...", "event_type": "invoice.paid", "external_id": "inv_1042:paid",
+ "occurred_at": "2026-11-01T09:30:00Z", "created_at": "2026-11-01T09:30:00.120Z",
+ "retain_until": "2026-12-01T09:30:00.120Z"}
+```
+
+Sending the same request again with the same key returns the same body and status plus
+`Idempotent-Replayed: true`; a different body with that key gets `422 idempotency_key_mismatch`.
+
 Common error codes: `unauthorized`, `api_key_revoked`, `api_key_expired` (401); `insufficient_role`,
 `tenant_suspended`, `operator_api_disabled` (403); `*_not_found` (404); `tenant_slug_taken`,
-`endpoint_url_taken`, `event_type_exists`, `subscription_exists`, `api_key_already_rotated` (409);
-`precondition_failed` (412); `invalid_endpoint_url`, `timeout_too_large`, `unknown_event_type`,
-`validation_error` (422); `precondition_required` (428); `secret_unavailable` (500).
+`endpoint_url_taken`, `event_type_exists`, `subscription_exists`, `api_key_already_rotated`,
+`event_exists`, `idempotency_key_in_progress` (409); `precondition_failed` (412);
+`request_too_large`, `payload_too_large` (413); `unsupported_media_type` (415);
+`invalid_endpoint_url`, `timeout_too_large`, `unknown_event_type`, `event_type_archived`,
+`occurred_at_in_future`, `idempotency_key_mismatch`, `validation_error` (422);
+`precondition_required` (428); `secret_unavailable` (500). `invalid_idempotency_key` is a `400`.
 
 Error format (all non-2xx responses):
 
@@ -453,24 +627,36 @@ src/hookrelay/
   main.py               app factory + lifespan
   __main__.py           `hookrelay` / `python -m hookrelay` (uvicorn)
   healthcheck.py        container HEALTHCHECK probe (stdlib only)
+  relay.py              fan-out relay process (`python -m hookrelay.relay` / `hookrelay-relay`)
   api/
     deps.py             auth dependencies (operator token, API key → Principal, roles)
     contracts/          request/response models with OpenAPI examples
-    routers/            thin HTTP layer: admin_tenants, api_keys, endpoints, event_types, subscriptions, me, health
+    routers/            thin HTTP layer: admin_tenants, api_keys, endpoints, event_types, subscriptions,
+                        events, me, health
+    body.py             bounded body reading, strict JSON parsing, canonical JSON
     etag.py             ETag / If-Match parsing
   core/                 config, logging (redaction), errors, request context, security (keys, SecretBox)
   db/                   engine/session lifecycle, declarative base, models, integrity-error mapping
   services/             business logic (framework-free): tenants, api_keys, endpoints, endpoint_rules,
-                        event_types, subscriptions, pagination
-alembic/                async env + versioned migrations (0001 tenants ... 0004 subscriptions)
+                        event_types, subscriptions, pagination, events, idempotency, fanout, housekeeping
+alembic/                async env + versioned migrations (0001 tenants ... 0006 deliveries)
 tests/unit/             fast tests (fake database): config, security, rules, pagination, auth wiring audit
-tests/integration/      real Postgres: migrations, schema constraints, full HTTP flows per resource
+tests/integration/      real Postgres: migrations, schema constraints, full HTTP flows per resource,
+                        idempotency races, concurrent relays and crash/replay
 ```
 
 ## Scaling notes
 
 - The API is stateless. Scale it horizontally behind a load balancer and size the total Postgres connections
   as `replicas × (DB_POOL_SIZE + DB_MAX_OVERFLOW)`. Add PgBouncer (transaction mode) once replicas grow.
+- Relays scale independently of the API: `SKIP LOCKED` hands each replica a disjoint batch, and the
+  claim query is served by a partial index over pending outbox rows (`WHERE processed_at IS NULL`),
+  so its cost tracks the backlog, not table size. One fan-out statement per batch keeps round trips
+  at O(batches), not O(events × endpoints). Adaptive polling keeps idle relays to a few queries per
+  second; M6 adds Redis wake-ups to cut latency further.
+- Ingest is a handful of indexed writes in one transaction (event, outbox row, idempotency row).
+  Idempotency keys live in Postgres so the guarantee survives a Redis outage; expired keys are purged
+  in batches by the relay, and the table is keyed `(tenant_id, key)`.
 - Workers (M3+) scale independently. `SKIP LOCKED` leasing lets N workers share the queue without
   coordination, and per-endpoint concurrency caps keep one slow receiver from starving the others.
 - Authentication costs one indexed lookup (`api_keys.prefix` unique) joined to `tenants`, plus at most one
@@ -479,7 +665,7 @@ tests/integration/      real Postgres: migrations, schema constraints, full HTTP
   auth shows up in profiles; revocation would then need explicit invalidation.
 - Every list query is served by a `(tenant_id, created_at, id)` index (partial `WHERE deleted_at IS NULL`
   for endpoints), so pagination stays O(page size) no matter how many rows a tenant has.
-- The fan-out lookup (`/v1/subscriptions/match`, reused by M2) uses `(tenant_id, event_type_pattern)` for
+- The fan-out lookup (`/v1/subscriptions/match` and the relay's fan-out query) uses `(tenant_id, event_type_pattern)` for
   exact matches; wildcard rows per tenant are few, and M6 caches the resolved set in Redis.
 - Hot tables (`deliveries`, `delivery_attempts`) are designed for time-based partitioning and
   retention (M5/M8). Redis (M6) only accelerates. Losing it degrades latency, not correctness.

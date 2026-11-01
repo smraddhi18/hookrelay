@@ -32,13 +32,13 @@ Legend: `[x]` done, `[ ]` planned.
 - [x] Cursor (keyset) pagination, ETag/`If-Match` optimistic concurrency on updates
 - [x] Migrations `0002+` with FKs, partial unique indexes, CHECKs; OpenAPI examples
 
-## Milestone 2: Event ingestion, idempotency and the transactional outbox
+## Milestone 2: Event ingestion, idempotency and the transactional outbox ✅
 
-- [ ] `POST /v1/events` with JSON payload limits and schema checks
-- [ ] `Idempotency-Key` support (tenant-scoped, request fingerprint, replayed response, TTL)
-- [ ] Transactional outbox: event row + outbox row in one transaction
-- [ ] Fan-out relay: outbox → one `delivery` row per matching subscription, exactly once per (event, endpoint)
-- [ ] Event retrieval and listing APIs; retention column for later partitioning
+- [x] `POST /v1/events` with JSON payload limits and schema checks
+- [x] `Idempotency-Key` support (tenant-scoped, request fingerprint, replayed response, TTL)
+- [x] Transactional outbox: event row + outbox row in one transaction
+- [x] Fan-out relay: outbox → one `delivery` row per matching subscription, exactly once per (event, endpoint)
+- [x] Event retrieval and listing APIs; retention column for later partitioning
 
 ## Milestone 3: Delivery workers
 
@@ -105,3 +105,15 @@ Legend: `[x]` done, `[ ]` planned.
 - Structured logs never contain secrets (credential redaction, tracebacks rendered without frame locals). New env vars: `OPERATOR_TOKEN`, `SECRETS_ENCRYPTION_KEY(_PREVIOUS)`, `API_KEY_*`, `ENDPOINT_*`; production refuses to start without an encryption key.
 - 374 tests (291 unit, 83 integration on Postgres 16), 97% line+branch coverage (coverage now traces SQLAlchemy greenlets); ruff, ruff format, mypy strict, Alembic roundtrip + `alembic check` pass. CI's docker smoke test now also checks `401` on `/v1` and creates a tenant through the operator API.
 - Next: Milestone 2 (`POST /v1/events`, idempotency keys, transactional outbox, fan-out relay).
+
+### 2026-11-01: Milestone 2 complete
+
+- `POST /v1/events` (publisher role): the body is read by the route itself after auth, with `415` for non-JSON media types, `413 request_too_large` on a declared or streamed body over `EVENT_MAX_PAYLOAD_BYTES` + 16 KiB, strict UTF-8 JSON (depth ≤ 64, no `NaN`/`Infinity`/`\u0000`/lone surrogates), canonical re-serialisation and `413 payload_too_large` on the canonical payload size. Registered, non-archived types only; unique `external_id` per tenant (`409 event_exists`); `occurred_at` skew check; `202` + `Location`.
+- `Idempotency-Key`: tenant-scoped, 1 to 255 printable ASCII chars, SHA-256 fingerprint over method + path + canonical body; claim is an `INSERT ... ON CONFLICT DO UPDATE WHERE expired` in the request transaction, so concurrent duplicates block on the row lock (bounded by `IDEMPOTENCY_LOCK_TIMEOUT_MS` → `409 idempotency_key_in_progress` + `Retry-After`); replays return the stored `202` with `Idempotent-Replayed: true`; mismatch → `422`; errors roll back the claim and are never cached; expired keys can be reused. 8 concurrent identical requests → 1 event, 7 replays.
+- Transactional outbox: event + `event_outbox` row + stored response commit together (verified by forcing a failure after the insert: no rows survive).
+- Fan-out relay `python -m hookrelay.relay` / `hookrelay-relay`: `FOR UPDATE SKIP LOCKED` batches, one `INSERT ... SELECT ... ON CONFLICT (event_id, endpoint_id) DO NOTHING` per batch against enabled, non-deleted, matching endpoints; per-row savepoint fallback parks poison rows with exponential backoff (`attempts`, `last_error`, `available_at`); adaptive idle polling; housekeeping purges expired idempotency keys, old processed outbox rows and expired events (cascading deliveries); heartbeat file + `--healthcheck`; graceful `SIGTERM`/`SIGINT`; `--once` mode. 4 concurrent relays over 60 events × 3 endpoints → exactly 180 deliveries; crash mid-batch + outbox replay → no duplicates.
+- Read APIs: `GET /v1/events` (type and time-range filters, keyset pagination, metadata only), `GET /v1/events/{id}` (with payload), `GET /v1/events/{id}/deliveries`. `retain_until` on events and deliveries (`EVENT_RETENTION_DAYS`).
+- Migrations `0005` (events, event_outbox with a partial pending index, idempotency_keys) and `0006` (deliveries with status/attempt/next-attempt columns ready for M3, `updated_at` trigger); composite same-tenant FKs and CHECKs for every invariant; stepwise downgrade test extended.
+- New env vars `EVENT_*`, `IDEMPOTENCY_*`, `RELAY_*`; compose gains a `relay` service with a heartbeat health check; CI's docker smoke test now publishes an event, checks the idempotent replay, runs the relay from the image and asserts one delivery, then runs the relay loop, probes its health check and stops it with `SIGTERM`.
+- 476 tests (340 unit, 136 integration on Postgres 16), 97% line+branch coverage; ruff, ruff format, mypy strict, Alembic roundtrip + `alembic check` pass; the OpenAPI deny-by-default audit covers the new routes.
+- Next: Milestone 3 (delivery workers: leasing, Standard-Webhooks signing, retries with jitter, SSRF guard, attempt log).
