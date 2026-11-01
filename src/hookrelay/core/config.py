@@ -58,6 +58,8 @@ TimeoutMs = Annotated[int, Field(ge=1000, le=60_000)]
 
 OPERATOR_TOKEN_MIN_LENGTH = 32
 ENCRYPTION_KEY_BYTES = 32
+# event_type, external_id, occurred_at and JSON punctuation around the payload.
+EVENT_ENVELOPE_HEADROOM_BYTES = 16_384
 
 
 def decode_encryption_key(raw: str) -> bytes:
@@ -134,6 +136,26 @@ class Settings(BaseSettings):
     endpoint_default_timeout_ms: TimeoutMs = 10_000
     endpoint_max_timeout_ms: TimeoutMs = 30_000
 
+    # Event ingestion (POST /v1/events)
+    event_max_payload_bytes: Annotated[int, Field(ge=1_024, le=10 * 1_048_576)] = 262_144
+    event_occurred_at_max_future_s: Annotated[int, Field(ge=0, le=86_400)] = 300
+    event_retention_days: Annotated[int, Field(ge=1, le=3_650)] = 30
+
+    # Idempotency-Key records: how long a key is remembered, and how long a request waits for
+    # a concurrent request holding the same key before answering 409 + Retry-After.
+    idempotency_key_ttl_s: Annotated[int, Field(ge=60, le=7 * 86_400)] = 86_400
+    idempotency_lock_timeout_ms: Annotated[int, Field(ge=50, le=30_000)] = 2_000
+
+    # Fan-out relay (python -m hookrelay.relay)
+    relay_batch_size: Annotated[int, Field(ge=1, le=1_000)] = 100
+    relay_poll_min_ms: Annotated[int, Field(ge=10, le=10_000)] = 100
+    relay_poll_max_ms: Annotated[int, Field(ge=10, le=60_000)] = 2_000
+    relay_retry_max_s: Annotated[int, Field(ge=1, le=3_600)] = 300
+    relay_housekeeping_interval_s: Annotated[int, Field(ge=1, le=86_400)] = 60
+    relay_outbox_retention_s: Annotated[int, Field(ge=0, le=30 * 86_400)] = 3_600
+    relay_heartbeat_file: str = "/tmp/hookrelay-relay.heartbeat"  # noqa: S108 - container-local
+    relay_heartbeat_max_age_s: Annotated[int, Field(ge=5, le=3_600)] = 60
+
     @field_validator("database_url", mode="before")
     @classmethod
     def _normalize_db_url(cls, value: object) -> object:
@@ -185,6 +207,17 @@ class Settings(BaseSettings):
         if self.endpoint_default_timeout_ms > self.endpoint_max_timeout_ms:
             raise ValueError("ENDPOINT_DEFAULT_TIMEOUT_MS must not exceed ENDPOINT_MAX_TIMEOUT_MS")
         return self
+
+    @model_validator(mode="after")
+    def _check_relay_polling(self) -> Self:
+        if self.relay_poll_min_ms > self.relay_poll_max_ms:
+            raise ValueError("RELAY_POLL_MIN_MS must not exceed RELAY_POLL_MAX_MS")
+        return self
+
+    @property
+    def event_max_request_bytes(self) -> int:
+        """Hard cap on the whole POST /v1/events body: the payload plus envelope headroom."""
+        return self.event_max_payload_bytes + EVENT_ENVELOPE_HEADROOM_BYTES
 
     @model_validator(mode="after")
     def _check_production(self) -> Self:

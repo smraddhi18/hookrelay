@@ -96,6 +96,16 @@ class PreconditionFailedError(AppError):
     code = "precondition_failed"
 
 
+class PayloadTooLargeError(AppError):
+    status_code = HTTPStatus.REQUEST_ENTITY_TOO_LARGE
+    code = "payload_too_large"
+
+
+class UnsupportedMediaTypeError(AppError):
+    status_code = HTTPStatus.UNSUPPORTED_MEDIA_TYPE
+    code = "unsupported_media_type"
+
+
 class UnprocessableEntityError(AppError):
     """Well-formed request that fails a semantic check the schema cannot express."""
 
