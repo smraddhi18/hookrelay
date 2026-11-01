@@ -16,7 +16,7 @@ from __future__ import annotations
 import uuid
 
 import structlog
-from sqlalchemy import and_, func, literal, or_, select
+from sqlalchemy import ColumnElement, SQLColumnExpression, and_, func, literal, or_, select
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -133,18 +133,29 @@ async def delete_subscription(
     )
 
 
+def pattern_matches_sql(
+    pattern: SQLColumnExpression[str], event_type: SQLColumnExpression[str]
+) -> ColumnElement[bool]:
+    """SQL twin of :func:`pattern_matches`, shared by the matcher API and the fan-out relay.
+
+    ``invoice.*`` matches by prefix ``invoice.`` (never ``invoice`` itself) and ``*`` by the
+    empty prefix, i.e. everything. Integration tests check both implementations agree.
+    """
+    return or_(
+        pattern == event_type,
+        and_(
+            func.right(pattern, 1) == WILDCARD,
+            func.starts_with(event_type, func.left(pattern, -1)),
+        ),
+    )
+
+
 async def match_endpoints(
     session: AsyncSession, tenant_id: uuid.UUID, event_type: str
 ) -> list[tuple[Endpoint, list[str]]]:
     """Live, enabled endpoints subscribed to ``event_type`` plus the patterns that matched."""
     pattern = Subscription.event_type_pattern
-    matched = or_(
-        pattern == event_type,
-        and_(
-            func.right(pattern, 1) == WILDCARD,
-            func.starts_with(literal(event_type), func.left(pattern, -1)),
-        ),
-    )
+    matched = pattern_matches_sql(pattern, literal(event_type))
     rows = (
         await session.execute(
             select(Endpoint, func.array_agg(pattern.distinct()).label("patterns"))
