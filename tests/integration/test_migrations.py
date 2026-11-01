@@ -16,6 +16,8 @@ from hookrelay.db.base import Base
 from tests.integration.conftest import _asyncpg_dsn, alembic_config
 
 M1_TABLES = {"api_keys", "endpoints", "event_types", "subscriptions"}
+M2_TABLES = {"events", "event_outbox", "idempotency_keys", "deliveries"}
+ALL_TABLES = {"tenants", *M1_TABLES, *M2_TABLES}
 
 
 async def _fetch(url: str, sql: str, *args: object) -> list[asyncpg.Record]:
@@ -74,7 +76,7 @@ def test_upgrade_is_idempotent_and_matches_models(scratch_database_url: str) -> 
     command.upgrade(cfg, "head")
     command.upgrade(cfg, "head")  # second run must be a no-op
     assert _version(scratch_database_url) == head
-    assert {"tenants", "alembic_version", *M1_TABLES} <= _tables(scratch_database_url)
+    assert {"alembic_version", *ALL_TABLES} <= _tables(scratch_database_url)
     assert _schema_diff(scratch_database_url) == []
 
 
@@ -83,10 +85,10 @@ def test_downgrade_to_base_and_back(scratch_database_url: str) -> None:
     command.upgrade(cfg, "head")
     command.downgrade(cfg, "base")
     assert _version(scratch_database_url) is None
-    assert not ({"tenants", *M1_TABLES} & _tables(scratch_database_url))
+    assert not (ALL_TABLES & _tables(scratch_database_url))
     assert not _has_function(scratch_database_url, "hookrelay_set_updated_at")
     command.upgrade(cfg, "head")
-    assert {"tenants", *M1_TABLES} <= _tables(scratch_database_url)
+    assert _tables(scratch_database_url) >= ALL_TABLES
     assert _has_function(scratch_database_url, "hookrelay_set_updated_at")
     assert _schema_diff(scratch_database_url) == []
 
@@ -96,11 +98,28 @@ def test_offline_sql_generation(scratch_database_url: str, capsys) -> None:
     sql = capsys.readouterr().out
     assert "CREATE TABLE tenants" in sql
     assert "CREATE TRIGGER trg_tenants_updated_at" in sql
-    for table in sorted(M1_TABLES):
+    for table in sorted(M1_TABLES | M2_TABLES):
         assert f"CREATE TABLE {table}" in sql
-    for partial_index in ("uq_api_keys_rotated_from_id", "uq_endpoints_tenant_url_live"):
+    for partial_index in (
+        "uq_api_keys_rotated_from_id",
+        "uq_endpoints_tenant_url_live",
+        "uq_events_tenant_external_id",
+    ):
         assert f"CREATE UNIQUE INDEX {partial_index}" in sql
     assert "fk_subscriptions_endpoint_same_tenant" in sql
+    # M2: same-tenant composite FKs, the outbox's partial claim index and the delivery trigger.
+    for name in (
+        "fk_events_event_type_same_tenant",
+        "fk_event_outbox_event_same_tenant",
+        "fk_idempotency_keys_event_same_tenant",
+        "fk_deliveries_event_same_tenant",
+        "fk_deliveries_endpoint_same_tenant",
+        "uq_deliveries_event_endpoint",
+    ):
+        assert name in sql
+    assert "CREATE INDEX ix_event_outbox_pending" in sql
+    assert "WHERE processed_at IS NULL" in sql
+    assert "CREATE TRIGGER trg_deliveries_updated_at" in sql
 
 
 def test_each_revision_downgrades_one_step(scratch_database_url: str) -> None:
@@ -109,6 +128,8 @@ def test_each_revision_downgrades_one_step(scratch_database_url: str) -> None:
     script = ScriptDirectory.from_config(cfg)
     command.upgrade(cfg, "head")
     expected_removed = {
+        "0006": {"deliveries"},
+        "0005": {"events", "event_outbox", "idempotency_keys"},
         "0004": {"event_types", "subscriptions"},
         "0003": {"endpoints"},
         "0002": {"api_keys"},
@@ -120,5 +141,22 @@ def test_each_revision_downgrades_one_step(scratch_database_url: str) -> None:
         removed = before - _tables(scratch_database_url)
         assert expected_removed[revision.revision] <= removed, revision.revision
         assert _version(scratch_database_url) == revision.down_revision
+    command.upgrade(cfg, "head")
+    assert _schema_diff(scratch_database_url) == []
+
+
+def test_m2_downgrade_drops_delivery_trigger(scratch_database_url: str) -> None:
+    cfg = alembic_config(scratch_database_url)
+    command.upgrade(cfg, "head")
+    triggers = asyncio.run(
+        _fetch(
+            scratch_database_url,
+            "SELECT tgname FROM pg_trigger WHERE tgname = 'trg_deliveries_updated_at'",
+        )
+    )
+    assert len(triggers) == 1
+    command.downgrade(cfg, "0004")
+    assert not (M2_TABLES & _tables(scratch_database_url))
+    assert _has_function(scratch_database_url, "hookrelay_set_updated_at")  # owned by 0001
     command.upgrade(cfg, "head")
     assert _schema_diff(scratch_database_url) == []

@@ -191,3 +191,55 @@ async def issue_key(client: httpx.AsyncClient, tenant: TenantCtx, role: str, **e
 @pytest.fixture
 async def tenant(client: httpx.AsyncClient) -> TenantCtx:
     return await create_tenant(client)
+
+
+# --- M2 helpers: event types, endpoints, subscriptions and publishing ---------------------
+
+
+async def register_event_type(
+    client: httpx.AsyncClient, tenant: TenantCtx, name: str
+) -> dict[str, Any]:
+    response = await client.post("/v1/event-types", json={"name": name}, headers=tenant.headers)
+    assert response.status_code == 201, response.text
+    body: dict[str, Any] = response.json()
+    return body
+
+
+async def create_endpoint(client: httpx.AsyncClient, tenant: TenantCtx, suffix: str) -> str:
+    response = await client.post(
+        "/v1/endpoints",
+        json={"url": f"https://hooks.example.com/{suffix}"},
+        headers=tenant.headers,
+    )
+    assert response.status_code == 201, response.text
+    return str(response.json()["id"])
+
+
+async def subscribe(
+    client: httpx.AsyncClient, tenant: TenantCtx, endpoint_id: str, pattern: str
+) -> None:
+    response = await client.post(
+        f"/v1/endpoints/{endpoint_id}/subscriptions",
+        json={"event_type": pattern},
+        headers=tenant.headers,
+    )
+    assert response.status_code == 201, response.text
+
+
+async def publish(
+    client: httpx.AsyncClient,
+    tenant: TenantCtx,
+    event_type: str,
+    payload: dict[str, Any] | None = None,
+    *,
+    key: str | None = None,
+    **extra: Any,
+) -> httpx.Response:
+    headers = dict(tenant.headers)
+    if key is not None:
+        headers["Idempotency-Key"] = key
+    return await client.post(
+        "/v1/events",
+        json={"event_type": event_type, "payload": payload or {"n": 1}, **extra},
+        headers=headers,
+    )
