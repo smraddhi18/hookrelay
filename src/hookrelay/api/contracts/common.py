@@ -41,6 +41,8 @@ _ERROR_DESCRIPTIONS: dict[int, str] = {
     404: "Not found (or owned by another tenant)",
     409: "Conflicts with the current state",
     412: "If-Match did not match the current ETag",
+    413: "Request body or payload exceeds the configured size limit",
+    415: "Content-Type must be application/json",
     422: "Validation error",
     428: "If-Match header is required",
 }
