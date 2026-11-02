@@ -13,7 +13,7 @@ from functools import lru_cache
 from typing import Annotated, Self
 
 from pydantic import Field, SecretStr, field_validator, model_validator
-from pydantic_settings import BaseSettings, SettingsConfigDict
+from pydantic_settings import BaseSettings, NoDecode, SettingsConfigDict
 
 _ASYNC_DRIVER = "postgresql+asyncpg"
 _ACCEPTED_SCHEMES = ("postgres", "postgresql", "postgresql+asyncpg")
@@ -60,6 +60,8 @@ OPERATOR_TOKEN_MIN_LENGTH = 32
 ENCRYPTION_KEY_BYTES = 32
 # event_type, external_id, occurred_at and JSON punctuation around the payload.
 EVENT_ENVELOPE_HEADROOM_BYTES = 16_384
+WORKER_ID_MAX_LENGTH = 128
+MAX_PORT = 65_535
 
 
 def decode_encryption_key(raw: str) -> bytes:
@@ -156,6 +158,32 @@ class Settings(BaseSettings):
     relay_heartbeat_file: str = "/tmp/hookrelay-relay.heartbeat"  # noqa: S108 - container-local
     relay_heartbeat_max_age_s: Annotated[int, Field(ge=5, le=3_600)] = 60
 
+    # Delivery worker process (python -m hookrelay.worker)
+    worker_id: str | None = None
+    worker_concurrency: Annotated[int, Field(ge=1, le=512)] = 16
+    worker_batch_size: Annotated[int, Field(ge=1, le=500)] = 50
+    worker_poll_min_ms: Annotated[int, Field(ge=10, le=10_000)] = 100
+    worker_poll_max_ms: Annotated[int, Field(ge=10, le=60_000)] = 2_000
+    worker_lease_s: Annotated[int, Field(ge=5, le=3_600)] = 60
+    worker_lease_renew_interval_s: Annotated[float, Field(gt=0, le=1_200)] = 15.0
+    worker_reclaim_interval_s: Annotated[float, Field(gt=0, le=3_600)] = 10.0
+    worker_drain_timeout_s: Annotated[float, Field(ge=0, le=600)] = 25.0
+    worker_heartbeat_file: str = "/tmp/hookrelay-worker.heartbeat"  # noqa: S108 - container-local
+    worker_heartbeat_max_age_s: Annotated[int, Field(ge=5, le=3_600)] = 60
+
+    # Outbound webhook HTTP and retry policy (used by the worker)
+    delivery_connect_timeout_ms: TimeoutMs = 5_000
+    delivery_response_max_bytes: Annotated[int, Field(ge=0, le=65_536)] = 4_096
+    delivery_max_attempts: Annotated[int, Field(ge=1, le=100)] = 8
+    delivery_max_age_s: Annotated[int, Field(ge=60, le=30 * 86_400)] = 3 * 86_400
+    delivery_backoff_base_s: Annotated[float, Field(gt=0, le=3_600)] = 5.0
+    delivery_backoff_max_s: Annotated[float, Field(gt=0, le=86_400)] = 3_600.0
+    delivery_retry_after_max_s: Annotated[int, Field(ge=0, le=86_400)] = 3_600
+    delivery_allowed_ports: Annotated[frozenset[int], NoDecode] = frozenset({80, 443, 8080, 8443})
+    # Lets the worker reach loopback / RFC 1918 / CGNAT targets (local receivers in tests and
+    # development). Refused in production; cloud metadata addresses stay blocked regardless.
+    delivery_allow_private_networks: bool = False
+
     @field_validator("database_url", mode="before")
     @classmethod
     def _normalize_db_url(cls, value: object) -> object:
@@ -208,6 +236,46 @@ class Settings(BaseSettings):
             raise ValueError("ENDPOINT_DEFAULT_TIMEOUT_MS must not exceed ENDPOINT_MAX_TIMEOUT_MS")
         return self
 
+    @field_validator("worker_id")
+    @classmethod
+    def _check_worker_id(cls, value: str | None) -> str | None:
+        if value is None or not value.strip():
+            return None
+        value = value.strip()
+        if len(value) > WORKER_ID_MAX_LENGTH or not value.isprintable():
+            raise ValueError(f"WORKER_ID must be 1 to {WORKER_ID_MAX_LENGTH} printable characters")
+        return value
+
+    @field_validator("delivery_allowed_ports", mode="before")
+    @classmethod
+    def _parse_ports(cls, value: object) -> object:
+        """Accept ``"443,8443"`` (env var) as well as any iterable of ints."""
+        if isinstance(value, str):
+            items = [part.strip() for part in value.split(",") if part.strip()]
+            try:
+                value = [int(item) for item in items]
+            except ValueError as exc:
+                raise ValueError("DELIVERY_ALLOWED_PORTS must be a comma-separated list") from exc
+        if isinstance(value, (list, tuple, set, frozenset)):
+            ports = frozenset(int(p) for p in value)
+            if not ports:
+                raise ValueError("DELIVERY_ALLOWED_PORTS must list at least one port")
+            if any(not 1 <= p <= MAX_PORT for p in ports):
+                raise ValueError("DELIVERY_ALLOWED_PORTS entries must be between 1 and 65535")
+            return ports
+        return value
+
+    @model_validator(mode="after")
+    def _check_worker(self) -> Self:
+        if self.worker_poll_min_ms > self.worker_poll_max_ms:
+            raise ValueError("WORKER_POLL_MIN_MS must not exceed WORKER_POLL_MAX_MS")
+        # Two renewals must fit in one lease, so one slow renewal round never loses a lease.
+        if self.worker_lease_renew_interval_s * 2 > self.worker_lease_s:
+            raise ValueError("WORKER_LEASE_RENEW_INTERVAL_S must be at most WORKER_LEASE_S / 2")
+        if self.delivery_backoff_base_s > self.delivery_backoff_max_s:
+            raise ValueError("DELIVERY_BACKOFF_BASE_S must not exceed DELIVERY_BACKOFF_MAX_S")
+        return self
+
     @model_validator(mode="after")
     def _check_relay_polling(self) -> Self:
         if self.relay_poll_min_ms > self.relay_poll_max_ms:
@@ -230,6 +298,11 @@ class Settings(BaseSettings):
                 raise ValueError("LOG_LEVEL=DEBUG is not allowed in production")
             if self.secrets_encryption_key is None:
                 raise ValueError("SECRETS_ENCRYPTION_KEY is required in production")
+            if self.delivery_allow_private_networks:
+                raise ValueError(
+                    "DELIVERY_ALLOW_PRIVATE_NETWORKS is for tests and development only; "
+                    "it is refused in production (SSRF guard)"
+                )
         return self
 
     @property
