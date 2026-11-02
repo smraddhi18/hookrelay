@@ -12,6 +12,7 @@ from hookrelay.api.deps import authenticate
 from hookrelay.api.routers import (
     admin_tenants,
     api_keys,
+    deliveries,
     endpoints,
     event_types,
     events,
@@ -31,6 +32,7 @@ v1_router.include_router(endpoints.router)
 v1_router.include_router(event_types.router)
 v1_router.include_router(subscriptions.router)
 v1_router.include_router(events.router)
+v1_router.include_router(deliveries.router)
 
 api_router = APIRouter()
 api_router.include_router(health.router)
