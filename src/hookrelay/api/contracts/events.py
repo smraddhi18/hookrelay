@@ -126,12 +126,14 @@ class DeliveryOut(BaseModel):
                     "event_id": _EVENT_EXAMPLE_ID,
                     "endpoint_id": "9a8b7c6d-5e4f-4a3b-9c2d-1e0f9a8b7c6d",
                     "status": "pending",
-                    "attempt_count": 0,
-                    "next_attempt_at": "2026-11-01T09:30:00.300Z",
-                    "last_attempt_at": None,
+                    "attempt_count": 1,
+                    "next_attempt_at": "2026-11-01T09:30:04.120Z",
+                    "last_attempt_at": "2026-11-01T09:30:00.410Z",
+                    "last_status_code": 503,
+                    "last_error_class": "http_status",
                     "completed_at": None,
                     "created_at": "2026-11-01T09:30:00.300Z",
-                    "updated_at": "2026-11-01T09:30:00.300Z",
+                    "updated_at": "2026-11-01T09:30:00.690Z",
                 }
             ]
         }
@@ -140,10 +142,17 @@ class DeliveryOut(BaseModel):
     id: uuid.UUID
     event_id: uuid.UUID
     endpoint_id: uuid.UUID
-    status: str = Field(description="`pending`, `delivering`, `succeeded` or `dead`.")
-    attempt_count: int
-    next_attempt_at: datetime
+    status: str = Field(
+        description="`pending`, `delivering` (a worker holds it), `succeeded`, `failed` "
+        "(terminal error, or attempts / max age exhausted) or `dead` (reserved for the DLQ)."
+    )
+    attempt_count: int = Field(description="Attempts started so far (including an in-flight one).")
+    next_attempt_at: datetime = Field(description="When a `pending` delivery is next due.")
     last_attempt_at: datetime | None
+    last_status_code: int | None = Field(description="HTTP status of the latest attempt, if any.")
+    last_error_class: str | None = Field(
+        description="Error class of the latest unsuccessful attempt (see the attempt log)."
+    )
     completed_at: datetime | None
     created_at: datetime
     updated_at: datetime
@@ -158,6 +167,8 @@ class DeliveryOut(BaseModel):
             attempt_count=delivery.attempt_count,
             next_attempt_at=delivery.next_attempt_at,
             last_attempt_at=delivery.last_attempt_at,
+            last_status_code=delivery.last_status_code,
+            last_error_class=delivery.last_error_class,
             completed_at=delivery.completed_at,
             created_at=delivery.created_at,
             updated_at=delivery.updated_at,
