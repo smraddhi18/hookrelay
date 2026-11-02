@@ -17,7 +17,8 @@ from tests.integration.conftest import _asyncpg_dsn, alembic_config
 
 M1_TABLES = {"api_keys", "endpoints", "event_types", "subscriptions"}
 M2_TABLES = {"events", "event_outbox", "idempotency_keys", "deliveries"}
-ALL_TABLES = {"tenants", *M1_TABLES, *M2_TABLES}
+M3_TABLES = {"delivery_attempts"}
+ALL_TABLES = {"tenants", *M1_TABLES, *M2_TABLES, *M3_TABLES}
 
 
 async def _fetch(url: str, sql: str, *args: object) -> list[asyncpg.Record]:
@@ -98,7 +99,7 @@ def test_offline_sql_generation(scratch_database_url: str, capsys) -> None:
     sql = capsys.readouterr().out
     assert "CREATE TABLE tenants" in sql
     assert "CREATE TRIGGER trg_tenants_updated_at" in sql
-    for table in sorted(M1_TABLES | M2_TABLES):
+    for table in sorted(M1_TABLES | M2_TABLES | M3_TABLES):
         assert f"CREATE TABLE {table}" in sql
     for partial_index in (
         "uq_api_keys_rotated_from_id",
@@ -120,6 +121,16 @@ def test_offline_sql_generation(scratch_database_url: str, capsys) -> None:
     assert "CREATE INDEX ix_event_outbox_pending" in sql
     assert "WHERE processed_at IS NULL" in sql
     assert "CREATE TRIGGER trg_deliveries_updated_at" in sql
+    # M3: lease columns + fencing CHECK, the lease-expiry index and the attempt log's FK.
+    for name in (
+        "ck_deliveries_lease_iff_delivering",
+        "uq_deliveries_tenant_id_id",
+        "fk_delivery_attempts_delivery_same_tenant",
+        "uq_delivery_attempts_number",
+    ):
+        assert name in sql
+    assert "CREATE INDEX ix_deliveries_lease_expiry" in sql
+    assert "ADD COLUMN lease_token UUID" in sql
 
 
 def test_each_revision_downgrades_one_step(scratch_database_url: str) -> None:
@@ -128,6 +139,7 @@ def test_each_revision_downgrades_one_step(scratch_database_url: str) -> None:
     script = ScriptDirectory.from_config(cfg)
     command.upgrade(cfg, "head")
     expected_removed = {
+        "0007": {"delivery_attempts"},
         "0006": {"deliveries"},
         "0005": {"events", "event_outbox", "idempotency_keys"},
         "0004": {"event_types", "subscriptions"},
@@ -158,5 +170,49 @@ def test_m2_downgrade_drops_delivery_trigger(scratch_database_url: str) -> None:
     command.downgrade(cfg, "0004")
     assert not (M2_TABLES & _tables(scratch_database_url))
     assert _has_function(scratch_database_url, "hookrelay_set_updated_at")  # owned by 0001
+    command.upgrade(cfg, "head")
+    assert _schema_diff(scratch_database_url) == []
+
+
+async def _seed_m3_rows(url: str) -> None:
+    from tests.integration.test_m1_schema import _endpoint, _event_type, _tenant  # noqa: PLC0415
+    from tests.integration.test_m2_schema import _event  # noqa: PLC0415
+
+    conn = await asyncpg.connect(_asyncpg_dsn(url))
+    try:
+        tenant = await _tenant(conn, "m3-downgrade")
+        await _event_type(conn, tenant, "x.y")
+        insert = (
+            "INSERT INTO deliveries (tenant_id, event_id, endpoint_id, retain_until, status, "
+            "completed_at, lease_token, leased_until, leased_by) "
+            "VALUES ($1, $2, $3, now() + interval '1 day', $4, $5, $6, $7, $8)"
+        )
+        endpoint = await _endpoint(conn, tenant, "https://a.example.com/")
+        failed = (await _event(conn, tenant, "x.y"), "failed", "now", None, None, None)
+        leased = (await _event(conn, tenant, "x.y"), "delivering", None, "lease", "now", "w")
+        for event_id, status, completed, token, until, by in (failed, leased):
+            await conn.execute(
+                insert.replace("$5", "now()" if completed else "NULL::timestamptz")
+                .replace("$6", "gen_random_uuid()" if token else "NULL::uuid")
+                .replace("$7", "now()" if until else "NULL::timestamptz")
+                .replace("$8", "$5"),
+                tenant,
+                event_id,
+                endpoint,
+                status,
+                by,
+            )
+    finally:
+        await conn.close()
+
+
+def test_m3_downgrade_maps_failed_and_in_flight_rows(scratch_database_url: str) -> None:
+    cfg = alembic_config(scratch_database_url)
+    command.upgrade(cfg, "head")
+    asyncio.run(_seed_m3_rows(scratch_database_url))
+    command.downgrade(cfg, "0006")
+    rows = asyncio.run(_fetch(scratch_database_url, "SELECT status FROM deliveries ORDER BY 1"))
+    assert [r["status"] for r in rows] == ["dead", "pending"]
+    assert "delivery_attempts" not in _tables(scratch_database_url)
     command.upgrade(cfg, "head")
     assert _schema_diff(scratch_database_url) == []
