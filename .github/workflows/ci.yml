@@ -120,8 +120,10 @@ jobs:
         run: docker run --rm --network host -e DATABASE_URL -e SECRETS_ENCRYPTION_KEY hookrelay:ci alembic upgrade head
       - name: API from the image answers /health and /ready
         run: |
+          # The smoke receiver runs on the runner's loopback, so this API may register it.
           docker run -d --name hookrelay-api --network host \
-            -e DATABASE_URL -e SECRETS_ENCRYPTION_KEY -e OPERATOR_TOKEN hookrelay:ci
+            -e DATABASE_URL -e SECRETS_ENCRYPTION_KEY -e OPERATOR_TOKEN \
+            -e ENDPOINT_ALLOW_HTTP=true -e ENDPOINT_ALLOW_PRIVATE_NETWORKS=true hookrelay:ci
           for i in $(seq 1 30); do
             if curl -fsS http://127.0.0.1:8000/ready; then echo; break; fi
             sleep 1
@@ -139,6 +141,32 @@ jobs:
             -H "Authorization: Bearer ${OPERATOR_TOKEN}" -H 'Content-Type: application/json' \
             -d '{"slug": "ci-smoke", "name": "CI smoke"}' -o tenant.json
           grep -q '"slug":"ci-smoke"' tenant.json
+      - name: Start a mock webhook receiver on the runner
+        run: |
+          mkdir -p received
+          cat > receiver.py <<'PY'
+          import json, pathlib
+          from http.server import BaseHTTPRequestHandler, HTTPServer
+
+          OUT = pathlib.Path("received")
+
+          class Hook(BaseHTTPRequestHandler):
+              def do_POST(self):
+                  body = self.rfile.read(int(self.headers.get("Content-Length", "0")))
+                  n = len(list(OUT.glob("*.json"))) + 1
+                  (OUT / f"{n}.body").write_bytes(body)
+                  headers = {k.lower(): v for k, v in self.headers.items()}
+                  (OUT / f"{n}.json").write_text(json.dumps({"path": self.path, "headers": headers}))
+                  self.send_response(204)
+                  self.end_headers()
+
+          HTTPServer(("127.0.0.1", 8080), Hook).serve_forever()
+          PY
+          nohup python3 receiver.py > receiver.log 2>&1 &
+          for i in $(seq 1 20); do
+            if curl -s -o /dev/null http://127.0.0.1:8080/; then break; fi
+            sleep 0.5
+          done
       - name: Publish an event (with idempotent replay) and fan it out with the relay image
         run: |
           API=http://127.0.0.1:8000
@@ -149,8 +177,10 @@ jobs:
             -d '{"name": "ci", "role": "admin"}' | jq -r .key)"
           AUTH="Authorization: Bearer $KEY"
           curl -fsS -X POST "$API/v1/event-types" -H "$AUTH" -H "$JSON" -d '{"name": "ci.smoke"}'
-          ENDPOINT_ID="$(curl -fsS -X POST "$API/v1/endpoints" -H "$AUTH" -H "$JSON" \
-            -d '{"url": "https://hooks.example.com/ci"}' | jq -r .id)"
+          curl -fsS -X POST "$API/v1/endpoints" -H "$AUTH" -H "$JSON" \
+            -d '{"url": "http://127.0.0.1:8080/hook"}' -o endpoint.json
+          ENDPOINT_ID="$(jq -r .id endpoint.json)"
+          echo "$KEY" > api-key.txt
           curl -fsS -X POST "$API/v1/endpoints/$ENDPOINT_ID/subscriptions" -H "$AUTH" -H "$JSON" \
             -d '{"event_type": "ci.*"}'
           EVENT='{"event_type": "ci.smoke", "payload": {"ok": true}}'
@@ -167,6 +197,53 @@ jobs:
           test "$(jq '.data | length' deliveries.json)" = "1"
           test "$(jq -r '.data[0].endpoint_id' deliveries.json)" = "$ENDPOINT_ID"
           test "$(jq -r '.data[0].status' deliveries.json)" = "pending"
+      - name: Worker from the image delivers the signed webhook and records the attempt
+        run: |
+          API=http://127.0.0.1:8000
+          AUTH="Authorization: Bearer $(cat api-key.txt)"
+          # Development mode is the only one that may target the loopback receiver: production
+          # refuses DELIVERY_ALLOW_PRIVATE_NETWORKS (SSRF guard). ENDPOINT_ALLOW_HTTP lets the
+          # worker send to the plain-http receiver too.
+          docker run --rm --network host -e DATABASE_URL -e SECRETS_ENCRYPTION_KEY \
+            -e APP_ENV=development -e LOG_FORMAT=json -e ENDPOINT_ALLOW_HTTP=true \
+            -e DELIVERY_ALLOW_PRIVATE_NETWORKS=true \
+            hookrelay:ci python -m hookrelay.worker --once
+          DELIVERY_ID="$(jq -r '.data[0].id' deliveries.json)"
+          curl -fsS "$API/v1/deliveries/$DELIVERY_ID" -H "$AUTH" | tee delivery.json
+          test "$(jq -r .status delivery.json)" = "succeeded"
+          test "$(jq -r .attempt_count delivery.json)" = "1"
+          test "$(jq -r .last_status_code delivery.json)" = "204"
+          curl -fsS "$API/v1/deliveries/$DELIVERY_ID/attempts" -H "$AUTH" | tee attempts.json
+          test "$(jq '.data | length' attempts.json)" = "1"
+          test "$(jq -r '.data[0].outcome' attempts.json)" = "succeeded"
+          test "$(jq -r '.data[0].request_headers["webhook-signature"]' attempts.json)" = "v1,[redacted]"
+          test "$(ls received/*.json | wc -l)" = "1"
+          test "$(jq -r .path received/1.json)" = "/hook"
+          # Verify the Standard Webhooks signature with the library receivers can copy.
+          docker run --rm -v "$PWD:/smoke:ro" hookrelay:ci python -c '
+          import json
+          from hookrelay.core.signing import verify
+          secret = json.load(open("/smoke/endpoint.json"))["signing_secret"]
+          headers = json.load(open("/smoke/received/1.json"))["headers"]
+          body = open("/smoke/received/1.body", "rb").read()
+          event_id = json.load(open("/smoke/event.json"))["id"]
+          assert verify(secret, headers, body) == event_id, "webhook-id is not the event id"
+          webhook = json.loads(body)
+          assert webhook["type"] == "ci.smoke" and webhook["data"] == {"ok": True}, webhook
+          print("signature verified for", event_id)
+          '
+      - name: Worker loop from the image heartbeats and stops cleanly on SIGTERM
+        run: |
+          docker run -d --name hookrelay-worker --network host \
+            -e DATABASE_URL -e SECRETS_ENCRYPTION_KEY hookrelay:ci python -m hookrelay.worker
+          for i in $(seq 1 20); do
+            if docker exec hookrelay-worker python -m hookrelay.worker --healthcheck; then break; fi
+            sleep 1
+          done
+          docker exec hookrelay-worker python -m hookrelay.worker --healthcheck
+          docker stop --time 35 hookrelay-worker
+          test "$(docker inspect -f '{{.State.ExitCode}}' hookrelay-worker)" = "0"
+          docker logs hookrelay-worker 2>&1 | grep -q '"event": "worker.stopped"'
       - name: Relay loop from the image heartbeats and stops cleanly on SIGTERM
         run: |
           docker run -d --name hookrelay-relay --network host \
@@ -184,3 +261,5 @@ jobs:
         run: |
           docker logs hookrelay-api || true
           docker logs hookrelay-relay || true
+          docker logs hookrelay-worker || true
+          cat receiver.log || true
