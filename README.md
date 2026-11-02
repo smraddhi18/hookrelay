@@ -14,11 +14,14 @@ It is built milestone by milestone with production habits: typed config, structu
 migrations with downgrade paths, tests against real Postgres, containers and CI from day one.
 See the **[roadmap](ROADMAP.md)** for the plan and progress log.
 
-> **Status:** Milestones 0 (foundation), 1 (tenancy) and 2 (ingestion) are complete. Tenants
-> authenticate with hashed, role-scoped API keys, manage endpoints, event types and wildcard
-> subscriptions, and publish events through `POST /v1/events` with `Idempotency-Key` support.
-> Each event and its outbox row commit in one transaction, and a separate relay process fans
-> the outbox out into exactly one `delivery` per (event, endpoint). HTTP delivery comes in Milestone 3.
+> **Status:** Milestones 0 (foundation), 1 (tenancy), 2 (ingestion) and 3 (delivery workers) are
+> complete. Tenants authenticate with hashed, role-scoped API keys, manage endpoints, event types
+> and wildcard subscriptions, and publish events through `POST /v1/events` with `Idempotency-Key`
+> support. Each event and its outbox row commit in one transaction; a relay process fans the
+> outbox out into exactly one `delivery` per (event, endpoint); and delivery workers lease due
+> deliveries with `SKIP LOCKED` + fencing tokens, POST them signed (Standard Webhooks) through an
+> SSRF-guarded HTTP client, record every attempt and retry with full-jitter backoff until the
+> delivery succeeds or ends `failed`. Circuit breakers, DLQ and replay come in Milestone 4.
 
 ## Features
 
@@ -41,7 +44,12 @@ See the **[roadmap](ROADMAP.md)** for the plan and progress log.
 | Ingestion | Transactional outbox: event + outbox row (+ idempotency record) in one transaction | ✅ M2 |
 | Ingestion | Fan-out relay process: `SKIP LOCKED` batches, `ON CONFLICT DO NOTHING` deliveries (exactly one per event and endpoint), poison-row isolation with backoff, adaptive polling, heartbeat health check, graceful `SIGTERM` | ✅ M2 |
 | Ingestion | Event read APIs (list with filters, get with payload, deliveries per event) and retention (`retain_until`, purged by the relay) | ✅ M2 |
-| Delivery | `SKIP LOCKED` workers, Standard-Webhooks HMAC-SHA256 signing, timeouts, retries with jittered backoff, SSRF guard, attempt log | 🔜 M3 |
+| Delivery | Worker process: `SKIP LOCKED` leases sized to free slots, lease expiry + renewal, fencing tokens on every transition, expired-lease reaper, concurrency semaphore, heartbeat `--healthcheck`, `--once`, `SIGTERM` drain that releases unfinished leases unspent | ✅ M3 |
+| Delivery | Standard-Webhooks signing (`webhook-id` / `webhook-timestamp` / `webhook-signature`, HMAC-SHA256) plus a dependency-free `verify()` helper for receivers | ✅ M3 |
+| Delivery | httpx client: connect + total timeouts, response-body cap, no redirects, no proxies from env, connection reuse | ✅ M3 |
+| Delivery | Retries: 5xx / 408 / 409 / 425 / 429 / timeouts / connection errors, full-jitter exponential backoff, capped `Retry-After` floor, max attempts and max age → terminal `failed` | ✅ M3 |
+| Delivery | SSRF guard: resolve-then-connect to a vetted, pinned IP (every resolved address checked, re-resolved per connection), private / loopback / CGNAT / link-local / metadata / IPv4-mapped IPv6 blocked, scheme and port allow-list; dev opt-in refused in production | ✅ M3 |
+| Delivery | Attempt log (`delivery_attempts`: status, latency, truncated response, error class, worker, masked request headers) and `GET /v1/deliveries/{id}` / `.../attempts` | ✅ M3 |
 | Isolation | Per-endpoint circuit breakers, rate limits, concurrency caps, DLQ, replay | 🔜 M4 |
 | Operability | Secret rotation (dual signing), delivery log search, endpoint health | 🔜 M5 |
 | Redis | Worker wake-ups, cached lookups, token buckets | 🔜 M6 |
@@ -199,7 +207,49 @@ flowchart LR
     SUB --> FO
     FO -->|"mark processed_at<br/>same transaction"| DL
     HK --> PG
-    DL -. "M3: delivery workers" .-> W["HTTP delivery"]
+    DL -. "leased by" .-> W["Delivery workers (M3)"]
+```
+
+### Delivery workers (Milestone 3)
+
+```mermaid
+flowchart LR
+    subgraph PG["Postgres 16"]
+        DL[(deliveries<br/>pending / delivering /<br/>succeeded / failed)]
+        DA[(delivery_attempts<br/>append-only)]
+        EPT[(endpoints<br/>encrypted secret)]
+    end
+
+    subgraph Worker["Delivery workers (python -m hookrelay.worker, N replicas)"]
+        LS["lease_due<br/>FOR UPDATE SKIP LOCKED<br/>≤ free slots, new lease_token"]
+        SEM["semaphore<br/>WORKER_CONCURRENCY"]
+        SG["sign<br/>Standard Webhooks HMAC-SHA256"]
+        HC["httpx client<br/>timeouts, body cap,<br/>no redirects"]
+        GB["SSRF backend<br/>resolve → vet every IP →<br/>connect to pinned IP"]
+        CP["complete<br/>WHERE lease_token = mine<br/>+ attempt row"]
+        RN["renew leases<br/>(lost lease → cancel)"]
+        RP["reaper<br/>expired leases → retry / failed"]
+        LS --> SEM --> SG --> HC --> GB
+        HC --> CP
+    end
+
+    subgraph Receivers["Tenant receivers"]
+        R1["https://api.acme.example/hooks<br/>verify(secret, headers, body)"]
+        R2["https://hooks.globex.example"]
+    end
+
+    DL --> LS
+    EPT --> SG
+    GB -->|"POST, Host/SNI = name"| R1
+    GB --> R2
+    GB -. "blocked: 10/8, 127/8, 100.64/10,<br/>169.254.169.254, ::ffff:..." .-x X["internal network"]
+    CP -->|"succeeded / pending + next_attempt_at / failed"| DL
+    CP --> DA
+    RN --> DL
+    RP --> DL
+    RP --> DA
+    API["GET /v1/deliveries/{id}<br/>/v1/deliveries/{id}/attempts"] --> DL
+    API --> DA
 ```
 
 ### Request flow (with auth)
@@ -263,14 +313,45 @@ flowchart LR
    keys, processed outbox rows older than `RELAY_OUTBOX_RETENTION_S`, and events past `retain_until`
    (their outbox rows and deliveries cascade).
 
-### Planned delivery flow (M3 to M4)
+### Delivery flow (Milestone 3)
 
-1. **Deliver:** workers lease due deliveries (`FOR UPDATE SKIP LOCKED`, lease token for fencing),
-   check the endpoint's breaker and rate limit, resolve and vet the target IP (SSRF guard),
-   sign with HMAC-SHA256 (Standard Webhooks headers) and POST with strict timeouts.
-2. **Record:** every attempt is logged. 2xx marks the delivery done. Other outcomes schedule a retry with
-   exponential backoff and full jitter (honouring `Retry-After`) until attempts run out, then it is dead-lettered.
-   Tenants can replay anything.
+1. **Lease.** Each worker loop leases at most `min(WORKER_BATCH_SIZE, free slots)` due deliveries:
+   `status = 'pending' AND next_attempt_at <= now()` on an enabled, non-deleted endpoint of an active
+   tenant, `FOR UPDATE OF d SKIP LOCKED`, oldest-due first. The same statement sets
+   `status = 'delivering'`, a fresh `lease_token` (UUID), `leased_until = now() + WORKER_LEASE_S`,
+   `leased_by` and `attempt_count + 1`. A CHECK makes "delivering without a lease" unrepresentable.
+2. **Prepare.** The endpoint's signing secret is decrypted (AES-256-GCM, AAD bound to tenant and
+   endpoint) and the body rendered once as compact JSON `{"type", "timestamp", "data"}`. Headers:
+   the endpoint's custom headers, then `webhook-id` (the event id, stable across retries),
+   `webhook-timestamp` and `webhook-signature: v1,<base64 HMAC-SHA256 of id.timestamp.body>`.
+3. **Send.** A shared httpx client with the endpoint's `timeout_ms` as the total deadline and
+   `DELIVERY_CONNECT_TIMEOUT_MS` for the handshake, `follow_redirects=False`, `trust_env=False`
+   and `Accept-Encoding: identity`. Its network backend resolves the host, refuses the request if
+   **any** resolved address is blocked, and connects to a vetted IP while the URL (and so `Host`
+   and TLS SNI / certificate checks) keeps the name. At most `DELIVERY_RESPONSE_MAX_BYTES` of the
+   response body is read.
+4. **Classify.** 2xx → `succeeded`. 3xx → terminal (redirects are never followed). 408 / 409 / 425 /
+   429 and 5xx, timeouts, connection / DNS / TLS / protocol errors → retryable. Other 4xx and a
+   blocked destination → terminal `failed`.
+5. **Complete under the fence.** One `UPDATE ... WHERE id = :id AND lease_token = :mine AND
+   status = 'delivering'` sets the new state (`succeeded`, `failed` with `completed_at`, or
+   `pending` with `next_attempt_at`), `last_status_code` and `last_error_class`, and clears the
+   lease; the attempt row is inserted in the same transaction. Zero rows updated means another
+   worker owns the delivery now: the result is discarded (`worker.lease_lost`).
+6. **Retry schedule.** `delay = uniform(0, min(DELIVERY_BACKOFF_MAX_S, DELIVERY_BACKOFF_BASE_S ×
+   2^(attempt-1)))` (full jitter), raised to the receiver's `Retry-After` (seconds or HTTP date,
+   capped at `DELIVERY_RETRY_AFTER_MAX_S`). After `DELIVERY_MAX_ATTEMPTS`, or when the next attempt
+   would be later than `created_at + DELIVERY_MAX_AGE_S` (`max_age_exceeded`), the delivery is `failed`.
+7. **Leases stay honest.** In-flight leases are renewed every `WORKER_LEASE_RENEW_INTERVAL_S`; a lease
+   that could not be renewed cancels its attempt. A reaper (every `WORKER_RECLAIM_INTERVAL_S`) turns
+   leases that expired (crashed or stalled worker) into a `lease_expired` attempt and a retry, or
+   `failed` if attempts are exhausted.
+8. **Shutdown.** `SIGTERM` / `SIGINT` stop leasing, give in-flight attempts `WORKER_DRAIN_TIMEOUT_S`
+   to finish, then cancel the rest and release their leases back to `pending` with the attempt
+   refunded (nothing was recorded, so it does not count against `DELIVERY_MAX_ATTEMPTS`).
+
+Next (M4): per-endpoint circuit breakers, rate limits and concurrency caps, `dead` after exhausted
+retries, endpoint auto-disable and the replay API.
 
 ## Design decisions and trade-offs
 
@@ -399,6 +480,47 @@ flowchart LR
   (`python -m hookrelay.relay --healthcheck`) checks that the loop touched its heartbeat within
   `RELAY_HEARTBEAT_MAX_AGE_S`. A wedged loop is restarted even if the process is alive.
 
+### Milestone 3 decisions
+
+- **Fencing tokens, not "the lease probably did not expire".** A worker can stall (GC pause, network
+  partition) past its lease while another worker re-leases the delivery. Every lease mints a new
+  `lease_token`, and renew / complete / release all match it, so the stale worker's late write is a
+  no-op instead of overwriting the newer attempt's outcome. Tests take a lease over by hand and
+  check the old token can neither complete, renew nor release.
+- **Attempts are counted when leased.** `attempt_count` increments in the lease statement, so a worker
+  that crashes mid-attempt still spends the attempt (the reaper writes a `lease_expired` attempt row);
+  a poison delivery that crashes workers cannot loop forever. A *graceful* drain refunds the attempt,
+  because nothing reached the attempt log.
+- **At-least-once, deduplicated by `webhook-id`.** A worker can crash after the receiver answered
+  but before the result commits; the next attempt sends the same `webhook-id` (the event id) and
+  a fresh signature. Receivers dedupe on `webhook-id`; hookrelay never claims exactly-once.
+- **Lease only what can be sent now.** The lease size is capped by free semaphore slots, so a busy
+  worker never holds leases it cannot work on (and that would expire while queued).
+- **Paused, not failed.** Deliveries of a disabled or deleted endpoint or a suspended tenant are simply
+  not leased; re-enabling resumes them. Their max age still applies when they are next attempted.
+- **Retry decisions in Python, timestamps from Postgres.** The policy (classification, full jitter,
+  `Retry-After`, max attempts / age) is a pure, unit-tested module; the lease and completion SQL use
+  the database clock, so worker clock skew cannot make deliveries early or late.
+- **`Retry-After` is a floor with a cap.** A receiver asking for 120 s is never retried sooner, but
+  a hostile `Retry-After: 99999999` cannot park a delivery for years (`DELIVERY_RETRY_AFTER_MAX_S`).
+- **`failed`, not `dead`, for now.** `failed` is terminal and has `completed_at`; `dead` stays reserved
+  for the M4 dead-letter queue, which will move exhausted deliveries there with replay support.
+  The 0007 downgrade maps `failed` back to `dead` so older code still sees a valid state.
+- **The SSRF guard lives in the connection, not in a pre-check.** Validating the URL at config time
+  (M1) and resolving before the request both lose to DNS rebinding: a name can resolve to a public
+  IP for the check and to `169.254.169.254` for the connect. hookrelay's httpcore network backend
+  resolves, vets every returned address (a mixed public/private answer is refused) and connects to
+  the vetted IP itself, on every new connection. Redirects are never followed and proxies from the
+  environment are ignored, so neither can bounce a request inward.
+- **Dev escape hatch with a hard stop.** `DELIVERY_ALLOW_PRIVATE_NETWORKS` unlocks loopback, RFC 1918
+  and CGNAT ranges for local receivers; configuration refuses it when `APP_ENV=production`, and
+  link-local / metadata addresses stay blocked even when it is on.
+- **Attempt logs are debuggable but not leaky.** Stored request headers mask custom header values
+  (`********`) and redact the signature (`v1,[redacted]`); bodies are cut at `DELIVERY_RESPONSE_MAX_BYTES`
+  and stored as valid UTF-8; logs carry ids, status and error class, never URLs, secrets or bodies.
+- **Secret decryption failures are retryable.** If `SECRETS_ENCRYPTION_KEY` is misconfigured nothing
+  has been sent yet; retrying lets an operator fix the key without losing deliveries.
+
 ## Getting started
 
 ### Prerequisites
@@ -456,12 +578,23 @@ EVENT=$(curl -s -X POST localhost:8000/v1/events -H "Authorization: Bearer $KEY"
   -d '{"event_type": "invoice.paid", "payload": {"invoice_id": "inv_1042", "amount": 4200}}' | jq -r .id)
 uv run hookrelay-relay --once     # or run `uv run hookrelay-relay` continuously
 curl -s localhost:8000/v1/events/$EVENT/deliveries -H "Authorization: Bearer $KEY"
+
+# 4. Deliver it (signed POST to the endpoint) and inspect the attempt log
+uv run hookrelay-worker --once    # or run `uv run hookrelay-worker` continuously
+DELIVERY=$(curl -s localhost:8000/v1/events/$EVENT/deliveries -H "Authorization: Bearer $KEY" | jq -r '.data[0].id')
+curl -s localhost:8000/v1/deliveries/$DELIVERY -H "Authorization: Bearer $KEY"
+curl -s localhost:8000/v1/deliveries/$DELIVERY/attempts -H "Authorization: Bearer $KEY"
 ```
+
+To deliver to a receiver on your machine (for example `http://127.0.0.1:9000/hook`), run the API
+with `ENDPOINT_ALLOW_HTTP=true ENDPOINT_ALLOW_PRIVATE_NETWORKS=true` and the worker with
+`ENDPOINT_ALLOW_HTTP=true DELIVERY_ALLOW_PRIVATE_NETWORKS=true` and the port in
+`DELIVERY_ALLOWED_PORTS`; production refuses the private-network switch.
 
 ### Docker Compose
 
 ```bash
-docker compose up --build   # postgres:16 + redis:7 + one-shot migrate job + api on :8000 + relay
+docker compose up --build   # postgres:16 + redis:7 + one-shot migrate job + api on :8000 + relay + worker
 curl -i localhost:8000/ready
 docker compose down -v
 ```
@@ -470,7 +603,10 @@ Compose ships local-only defaults for `OPERATOR_TOKEN` and `SECRETS_ENCRYPTION_K
 values to override them). The `migrate` service runs `alembic upgrade head` and exits. `api` starts only after it completes
 successfully. The image runs as UID 10001 and has a stdlib-only `HEALTHCHECK`. The `relay` service
 reuses the same image with `python -m hookrelay.relay` and overrides the health check with the
-relay's heartbeat probe; scale it with `docker compose up --scale relay=3`.
+relay's heartbeat probe; scale it with `docker compose up --scale relay=3`. The `worker` service
+runs `python -m hookrelay.worker` the same way (heartbeat health check, `stop_grace_period: 30s`
+above the 25 s drain) and scales with `--scale worker=4`. Compose runs in production mode, so the
+worker only delivers to public addresses.
 
 ## Configuration
 
@@ -504,6 +640,20 @@ All settings are environment variables (or `.env`), validated at startup. See
 | `RELAY_RETRY_MAX_S` | `300` | cap of the exponential backoff for a failing outbox row |
 | `RELAY_HOUSEKEEPING_INTERVAL_S` / `RELAY_OUTBOX_RETENTION_S` | `60` / `3600` | purge cadence; how long processed outbox rows are kept |
 | `RELAY_HEARTBEAT_FILE` / `RELAY_HEARTBEAT_MAX_AGE_S` | `/tmp/hookrelay-relay.heartbeat` / `60` | liveness file for `--healthcheck` |
+| `WORKER_ID` | `host:pid:random` | recorded on leases and attempt rows (1 to 128 printable chars) |
+| `WORKER_CONCURRENCY` / `WORKER_BATCH_SIZE` | `16` / `50` | max in-flight requests per worker; max leases per poll (never more than free slots) |
+| `WORKER_POLL_MIN_MS` / `WORKER_POLL_MAX_MS` | `100` / `2000` | idle polling backoff bounds (min ≤ max enforced) |
+| `WORKER_LEASE_S` / `WORKER_LEASE_RENEW_INTERVAL_S` | `60` / `15` | lease length and renewal cadence (renewal ≤ half the lease, enforced) |
+| `WORKER_RECLAIM_INTERVAL_S` | `10` | how often expired leases are reaped |
+| `WORKER_DRAIN_TIMEOUT_S` | `25` | `SIGTERM` grace for in-flight attempts before leases are released |
+| `WORKER_HEARTBEAT_FILE` / `WORKER_HEARTBEAT_MAX_AGE_S` | `/tmp/hookrelay-worker.heartbeat` / `60` | liveness file for `--healthcheck` |
+| `DELIVERY_CONNECT_TIMEOUT_MS` | `5000` | TCP + TLS handshake deadline (the endpoint's `timeout_ms` bounds the whole request) |
+| `DELIVERY_RESPONSE_MAX_BYTES` | `4096` | response bytes read and kept in the attempt log (0 to 65536) |
+| `DELIVERY_MAX_ATTEMPTS` / `DELIVERY_MAX_AGE_S` | `8` / `259200` | then the delivery is `failed` |
+| `DELIVERY_BACKOFF_BASE_S` / `DELIVERY_BACKOFF_MAX_S` | `5` / `3600` | full-jitter exponential backoff (base ≤ max enforced) |
+| `DELIVERY_RETRY_AFTER_MAX_S` | `3600` | cap on a receiver's `Retry-After` |
+| `DELIVERY_ALLOWED_PORTS` | `80,443,8080,8443` | SSRF guard port allow-list |
+| `DELIVERY_ALLOW_PRIVATE_NETWORKS` | `false` | loopback / RFC 1918 / CGNAT receivers for development; **refused in production** |
 
 ## API
 
@@ -548,7 +698,9 @@ Interactive docs: `/docs` (Swagger UI), `/redoc`, schema at `/openapi.json` (dis
 | `POST` | `/v1/events` | Publish an event (`202`, `Location`); optional `Idempotency-Key` header | publisher |
 | `GET` | `/v1/events` | List events, newest first (`?event_type=`, `?created_after=`, `?created_before=`), without payloads | reader |
 | `GET` | `/v1/events/{event_id}` | Get an event with its payload and `payload_size` | reader |
-| `GET` | `/v1/events/{event_id}/deliveries` | Deliveries created for the event (status, attempts, next attempt) | reader |
+| `GET` | `/v1/events/{event_id}/deliveries` | Deliveries created for the event (status, attempts, next attempt, last result) | reader |
+| `GET` | `/v1/deliveries/{delivery_id}` | One delivery: status, `attempt_count`, `next_attempt_at`, `last_status_code`, `last_error_class` | reader |
+| `GET` | `/v1/deliveries/{delivery_id}/attempts` | Attempt log, newest first: outcome, status code, error class, latency, masked request headers, truncated response | reader |
 
 List responses share one shape: `{"data": [...], "next_cursor": "...", "has_more": true}`; pass
 `?cursor=<next_cursor>&limit=<1..100>` for the next page.
@@ -599,7 +751,7 @@ Sending the same request again with the same key returns the same body and statu
 `Idempotent-Replayed: true`; a different body with that key gets `422 idempotency_key_mismatch`.
 
 Common error codes: `unauthorized`, `api_key_revoked`, `api_key_expired` (401); `insufficient_role`,
-`tenant_suspended`, `operator_api_disabled` (403); `*_not_found` (404); `tenant_slug_taken`,
+`tenant_suspended`, `operator_api_disabled` (403); `*_not_found` (404, e.g. `delivery_not_found`); `tenant_slug_taken`,
 `endpoint_url_taken`, `event_type_exists`, `subscription_exists`, `api_key_already_rotated`,
 `event_exists`, `idempotency_key_in_progress` (409); `precondition_failed` (412);
 `request_too_large`, `payload_too_large` (413); `unsupported_media_type` (415);
@@ -620,6 +772,55 @@ Error format (all non-2xx responses):
 }
 ```
 
+## Verifying webhook signatures
+
+Every delivery follows [Standard Webhooks](https://www.standardwebhooks.com/):
+
+```http
+POST /webhooks/hookrelay HTTP/1.1
+Content-Type: application/json
+User-Agent: hookrelay-webhooks/1.0
+webhook-id: 7b1e9a52-6c1f-4f0e-9a51-2f3c8f1f4c11
+webhook-timestamp: 1793594207
+webhook-signature: v1,K5oZfzN95Z9UVu1EsfQmfVNQhnkZ2pj9o9NDN/H/pI4=
+
+{"data":{"amount":4200,"invoice_id":"inv_1042"},"timestamp":"2026-11-02T09:30:00Z","type":"invoice.paid"}
+```
+
+The signature is `base64(HMAC-SHA256(secret, "{webhook-id}.{webhook-timestamp}.{raw body}"))`, where
+`secret` is the base64 part of the endpoint's `whsec_...` signing secret. Receivers should verify the
+**raw** bytes (never a re-serialised body), compare in constant time, reject timestamps more than
+5 minutes away, accept any of several space-separated signatures (secret rotation in M5), and
+dedupe on `webhook-id` (delivery is at-least-once). `hookrelay.core.signing` is dependency-free
+(stdlib only) so receivers can vendor it:
+
+```python
+from fastapi import FastAPI, HTTPException, Request
+
+from hookrelay.core.signing import WebhookVerificationError, verify
+
+SECRET = "whsec_..."  # GET /v1/endpoints/{id}/secret (admin), keep it in your secret store
+app = FastAPI()
+seen: set[str] = set()  # use your database in production
+
+
+@app.post("/webhooks/hookrelay")
+async def receive(request: Request) -> dict[str, str]:
+    body = await request.body()
+    try:
+        webhook_id = verify(SECRET, request.headers, body)
+    except WebhookVerificationError as exc:
+        raise HTTPException(status_code=400, detail="invalid signature") from exc
+    if webhook_id not in seen:  # a retry of something already processed is acknowledged again
+        seen.add(webhook_id)
+        ...  # handle json.loads(body)["type"] / ["data"]
+    return {"status": "ok"}
+```
+
+Answer `2xx` quickly and do slow work asynchronously: anything else, or no answer within the
+endpoint's `timeout_ms`, is retried (`429` / `503` with `Retry-After` are honoured). Redirects are
+not followed and count as failures, so point the endpoint at the final URL.
+
 ## Project layout
 
 ```
@@ -628,21 +829,29 @@ src/hookrelay/
   __main__.py           `hookrelay` / `python -m hookrelay` (uvicorn)
   healthcheck.py        container HEALTHCHECK probe (stdlib only)
   relay.py              fan-out relay process (`python -m hookrelay.relay` / `hookrelay-relay`)
+  worker.py             delivery worker process (`python -m hookrelay.worker` / `hookrelay-worker`)
   api/
     deps.py             auth dependencies (operator token, API key → Principal, roles)
     contracts/          request/response models with OpenAPI examples
     routers/            thin HTTP layer: admin_tenants, api_keys, endpoints, event_types, subscriptions,
-                        events, me, health
+                        events, deliveries, me, health
     body.py             bounded body reading, strict JSON parsing, canonical JSON
     etag.py             ETag / If-Match parsing
-  core/                 config, logging (redaction), errors, request context, security (keys, SecretBox)
+  core/                 config, logging (redaction), errors, request context, security (keys, SecretBox),
+                        signing (Standard Webhooks sign / verify, stdlib only)
   db/                   engine/session lifecycle, declarative base, models, integrity-error mapping
   services/             business logic (framework-free): tenants, api_keys, endpoints, endpoint_rules,
-                        event_types, subscriptions, pagination, events, idempotency, fanout, housekeeping
-alembic/                async env + versioned migrations (0001 tenants ... 0006 deliveries)
-tests/unit/             fast tests (fake database): config, security, rules, pagination, auth wiring audit
+                        event_types, subscriptions, pagination, events, idempotency, fanout, housekeeping,
+                        delivery_queue (lease / renew / complete / reclaim / release SQL), delivery_policy
+                        (classification, backoff, Retry-After), ssrf (address vetting + guarded backend),
+                        webhook_client (httpx), deliveries (read API)
+alembic/                async env + versioned migrations (0001 tenants ... 0007 delivery_attempts)
+tests/receiver.py       raw-asyncio HTTP receiver + fake resolver used by delivery tests
+tests/unit/             fast tests (fake database): config, security, rules, pagination, auth wiring audit,
+                        signing vectors, backoff / Retry-After, SSRF ranges, HTTP client, worker helpers
 tests/integration/      real Postgres: migrations, schema constraints, full HTTP flows per resource,
-                        idempotency races, concurrent relays and crash/replay
+                        idempotency races, concurrent relays and crash/replay, concurrent workers,
+                        fencing, lease expiry, retries, SIGTERM drain, end-to-end signed delivery
 ```
 
 ## Scaling notes
@@ -657,8 +866,16 @@ tests/integration/      real Postgres: migrations, schema constraints, full HTTP
 - Ingest is a handful of indexed writes in one transaction (event, outbox row, idempotency row).
   Idempotency keys live in Postgres so the guarantee survives a Redis outage; expired keys are purged
   in batches by the relay, and the table is keyed `(tenant_id, key)`.
-- Workers (M3+) scale independently. `SKIP LOCKED` leasing lets N workers share the queue without
-  coordination, and per-endpoint concurrency caps keep one slow receiver from starving the others.
+- Delivery workers scale independently of the API and relays: `SKIP LOCKED` leasing hands each worker a
+  disjoint set (tests run 5 workers over 40 deliveries: every delivery sent exactly once, one attempt
+  row each). The lease query is served by the partial `ix_deliveries_due` index (`WHERE status =
+  'pending'`) and the reaper by `ix_deliveries_lease_expiry` (`WHERE status = 'delivering'`), so both
+  cost O(due rows). Throughput per worker is roughly `WORKER_CONCURRENCY / receiver latency`; raise
+  concurrency for slow receivers (it is I/O wait, not CPU) and add replicas for more. Each worker holds
+  one Postgres connection per lease / complete transaction, never during the HTTP call, so
+  `DB_POOL_SIZE` can stay far below `WORKER_CONCURRENCY`.
+- One slow endpoint can still occupy many slots in M3 (bounded by its `timeout_ms`); M4's per-endpoint
+  concurrency caps and circuit breakers isolate it.
 - Authentication costs one indexed lookup (`api_keys.prefix` unique) joined to `tenants`, plus at most one
   throttled `last_used_at` write per key per minute, so hot keys do not turn reads into write load.
   A short-TTL in-process or Redis cache of `prefix → (hash, role, tenant status)` is the next step if

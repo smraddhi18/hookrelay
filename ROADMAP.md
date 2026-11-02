@@ -40,15 +40,15 @@ Legend: `[x]` done, `[ ]` planned.
 - [x] Fan-out relay: outbox → one `delivery` row per matching subscription, exactly once per (event, endpoint)
 - [x] Event retrieval and listing APIs; retention column for later partitioning
 
-## Milestone 3: Delivery workers
+## Milestone 3: Delivery workers ✅
 
-- [ ] Separate worker process; leasing with `FOR UPDATE SKIP LOCKED`, lease expiry, heartbeats, fencing tokens
-- [ ] Standard-Webhooks signing (`webhook-id`, `webhook-timestamp`, `webhook-signature` = HMAC-SHA256), verification helper + docs
-- [ ] httpx client with connect/read/total timeouts, response size cap, no redirects by default
-- [ ] Retries with exponential backoff + full jitter, `Retry-After` support, max attempts / max age
-- [ ] SSRF guard: resolve-then-connect, block private/link-local/metadata ranges, scheme/port allow-list, DNS rebinding protection
-- [ ] Delivery-attempt log (status, latency, truncated response, error class)
-- [ ] Graceful drain on SIGTERM (finish or release in-flight leases)
+- [x] Separate worker process; leasing with `FOR UPDATE SKIP LOCKED`, lease expiry, heartbeats, fencing tokens
+- [x] Standard-Webhooks signing (`webhook-id`, `webhook-timestamp`, `webhook-signature` = HMAC-SHA256), verification helper + docs
+- [x] httpx client with connect/read/total timeouts, response size cap, no redirects by default
+- [x] Retries with exponential backoff + full jitter, `Retry-After` support, max attempts / max age
+- [x] SSRF guard: resolve-then-connect, block private/link-local/metadata ranges, scheme/port allow-list, DNS rebinding protection
+- [x] Delivery-attempt log (status, latency, truncated response, error class)
+- [x] Graceful drain on SIGTERM (finish or release in-flight leases)
 
 ## Milestone 4: Back-pressure and failure isolation
 
@@ -117,3 +117,16 @@ Legend: `[x]` done, `[ ]` planned.
 - New env vars `EVENT_*`, `IDEMPOTENCY_*`, `RELAY_*`; compose gains a `relay` service with a heartbeat health check; CI's docker smoke test now publishes an event, checks the idempotent replay, runs the relay from the image and asserts one delivery, then runs the relay loop, probes its health check and stops it with `SIGTERM`.
 - 476 tests (340 unit, 136 integration on Postgres 16), 97% line+branch coverage; ruff, ruff format, mypy strict, Alembic roundtrip + `alembic check` pass; the OpenAPI deny-by-default audit covers the new routes.
 - Next: Milestone 3 (delivery workers: leasing, Standard-Webhooks signing, retries with jitter, SSRF guard, attempt log).
+
+### 2026-11-02: Milestone 3 complete
+
+- Delivery worker `python -m hookrelay.worker` / `hookrelay-worker`: one statement leases `min(WORKER_BATCH_SIZE, free slots)` due deliveries (`FOR UPDATE OF d SKIP LOCKED`, enabled endpoint + active tenant only) and sets `delivering`, a fresh `lease_token`, `leased_until`, `leased_by` and `attempt_count + 1`; complete / renew / release all match the token (fencing), so a stalled worker's late result is discarded (`worker.lease_lost`). Lease renewal every `WORKER_LEASE_RENEW_INTERVAL_S` cancels attempts whose lease was lost; a reaper turns expired leases into `lease_expired` attempts and a retry (or `failed` on the last attempt). Concurrency semaphore, adaptive idle polling, heartbeat file + `--healthcheck`, `--once`, `SIGTERM`/`SIGINT` drain (`WORKER_DRAIN_TIMEOUT_S`, then unfinished leases are released with the attempt refunded). 5 concurrent workers over 40 deliveries → each delivered exactly once with one attempt row.
+- Standard-Webhooks signing (`webhook-id` = event id, `webhook-timestamp`, `webhook-signature: v1,<base64 HMAC-SHA256>`) with a stdlib-only `verify()` helper (constant-time compare, multiple signatures, 5-minute tolerance), test vectors, and a receiver example in the README.
+- httpx client: endpoint `timeout_ms` as the total deadline + `DELIVERY_CONNECT_TIMEOUT_MS`, response body capped at `DELIVERY_RESPONSE_MAX_BYTES`, `follow_redirects=False`, `trust_env=False`, connection reuse.
+- Retry policy: 2xx succeeded; 408/409/425/429, 5xx, timeouts, connect/DNS/TLS/protocol errors retryable; other 4xx, 3xx and blocked destinations terminal. Full-jitter exponential backoff (`DELIVERY_BACKOFF_BASE_S`/`_MAX_S`), `Retry-After` (seconds or HTTP date) as a floor capped by `DELIVERY_RETRY_AFTER_MAX_S`, `DELIVERY_MAX_ATTEMPTS` and `DELIVERY_MAX_AGE_S` (`max_age_exceeded`) → terminal `failed`; DB clock throughout.
+- SSRF guard as a custom httpcore network backend: resolve, vet every address (loopback, RFC 1918, CGNAT, link-local, cloud metadata, multicast, reserved, IPv4-mapped/compatible IPv6, NAT64 / 6to4 embeddings), connect to the vetted IP while Host/SNI keep the name, re-resolved per connection (DNS-rebinding safe); scheme (`https`, `http` only with `ENDPOINT_ALLOW_HTTP`) and port allow-list (`DELIVERY_ALLOWED_PORTS`); `DELIVERY_ALLOW_PRIVATE_NETWORKS` dev switch refused in production.
+- Migration `0007`: `delivery_attempts` (append-only, unique per delivery + number, same-tenant FK, outcome/status/latency/size CHECKs, masked request headers, truncated response), delivery `failed` status with `completed_at`, lease columns + fencing token with a "delivering iff leased" CHECK, `last_status_code` / `last_error_class`, lease-expiry partial index; downgrade maps `failed` → `dead` and in-flight → `pending` (roundtrip test).
+- Read APIs (reader role, tenant-scoped): `GET /v1/deliveries/{id}` and `GET /v1/deliveries/{id}/attempts` (newest first, keyset pagination); event deliveries list gains last status / error class.
+- New env vars `WORKER_*` and `DELIVERY_*`; compose gains a `worker` service with a heartbeat health check and a 30 s stop grace period; CI's docker smoke test now starts a mock receiver, runs the worker from the image, asserts a `succeeded` delivery with one attempt, verifies the received signature with `hookrelay.core.signing.verify`, then runs the worker loop, probes its health check and stops it with `SIGTERM`.
+- 732 tests (565 unit, 167 integration on Postgres 16), 98% line+branch coverage; ruff, ruff format, mypy strict, Alembic roundtrip + `alembic check` pass; the OpenAPI deny-by-default audit covers the new routes.
+- Next: Milestone 4 (back-pressure and failure isolation: per-endpoint circuit breakers, rate limits and concurrency caps, dead-letter state, replay API).
