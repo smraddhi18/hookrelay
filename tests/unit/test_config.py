@@ -203,3 +203,75 @@ def test_empty_redis_url_means_disabled() -> None:
 def test_rejects_invalid_request_id_header(value: str) -> None:
     with pytest.raises(ValidationError, match="REQUEST_ID_HEADER"):
         make_settings(request_id_header=value)
+
+
+# -- M3: worker and delivery settings -------------------------------------------------------
+
+
+def test_worker_and_delivery_defaults() -> None:
+    s = make_settings()
+    assert s.worker_id is None
+    assert s.worker_concurrency == 16
+    assert s.worker_lease_renew_interval_s * 2 <= s.worker_lease_s
+    assert s.delivery_allowed_ports == frozenset({80, 443, 8080, 8443})
+    assert s.delivery_max_attempts == 8
+    assert not s.delivery_allow_private_networks
+
+
+def test_allowed_ports_parse_from_a_comma_separated_env_var(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("DELIVERY_ALLOWED_PORTS", " 443, 9000 ,443")
+    monkeypatch.setenv("WORKER_CONCURRENCY", "4")
+    s = Settings(_env_file=None)
+    assert s.delivery_allowed_ports == frozenset({443, 9000})
+    assert s.worker_concurrency == 4
+
+
+@pytest.mark.parametrize("value", ["", " , ", "0", "65536", "https", "-1"])
+def test_rejects_bad_allowed_ports(monkeypatch: pytest.MonkeyPatch, value: str) -> None:
+    monkeypatch.setenv("DELIVERY_ALLOWED_PORTS", value)
+    with pytest.raises(ValidationError, match="DELIVERY_ALLOWED_PORTS"):
+        Settings(_env_file=None)
+
+
+def test_allowed_ports_accept_an_iterable() -> None:
+    assert make_settings(delivery_allowed_ports=[443]).delivery_allowed_ports == frozenset({443})
+
+
+def test_blank_worker_id_means_generated() -> None:
+    assert make_settings(worker_id="  ").worker_id is None
+    assert make_settings(worker_id=" worker-1 ").worker_id == "worker-1"
+
+
+@pytest.mark.parametrize("value", ["x" * 129, "bad\nid"])
+def test_rejects_bad_worker_id(value: str) -> None:
+    with pytest.raises(ValidationError, match="WORKER_ID"):
+        make_settings(worker_id=value)
+
+
+@pytest.mark.parametrize(
+    ("overrides", "message"),
+    [
+        ({"worker_poll_min_ms": 500, "worker_poll_max_ms": 100}, "WORKER_POLL_MIN_MS"),
+        ({"worker_lease_s": 20, "worker_lease_renew_interval_s": 15}, "LEASE_RENEW"),
+        ({"delivery_backoff_base_s": 10, "delivery_backoff_max_s": 5}, "BACKOFF"),
+        ({"worker_concurrency": 0}, "worker_concurrency"),
+        ({"worker_lease_s": 1}, "worker_lease_s"),
+        ({"delivery_max_attempts": 0}, "delivery_max_attempts"),
+        ({"delivery_response_max_bytes": 70_000}, "delivery_response_max_bytes"),
+    ],
+)
+def test_rejects_bad_worker_values(overrides: dict[str, object], message: str) -> None:
+    with pytest.raises(ValidationError, match=message):
+        make_settings(**overrides)
+
+
+def test_private_delivery_networks_are_refused_in_production() -> None:
+    with pytest.raises(ValidationError, match="DELIVERY_ALLOW_PRIVATE_NETWORKS"):
+        make_settings(
+            app_env="production",
+            secrets_encryption_key=TEST_ENCRYPTION_KEY,
+            delivery_allow_private_networks=True,
+        )
+    assert make_settings(app_env="development", delivery_allow_private_networks=True)
