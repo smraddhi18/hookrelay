@@ -1,5 +1,5 @@
 # Thin wrappers over the exact commands CI runs.
-.PHONY: install lint format typecheck test test-unit test-integration migrate migrations-roundtrip run relay check up down
+.PHONY: install lint format typecheck test test-unit test-integration migrate migrations-roundtrip run relay worker check up down
 
 install:
 	uv sync --locked
@@ -39,6 +39,9 @@ run:
 
 relay:
 	uv run hookrelay-relay
+
+worker:
+	uv run hookrelay-worker
 
 check: lint typecheck migrations-roundtrip test
 

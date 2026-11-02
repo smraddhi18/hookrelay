@@ -350,6 +350,8 @@ dependencies = [
     { name = "asyncpg" },
     { name = "cryptography" },
     { name = "fastapi" },
+    { name = "httpcore" },
+    { name = "httpx" },
     { name = "pydantic" },
     { name = "pydantic-settings" },
     { name = "sqlalchemy", extra = ["asyncio"] },
@@ -360,7 +362,6 @@ dependencies = [
 [package.dev-dependencies]
 dev = [
     { name = "asyncpg-stubs" },
-    { name = "httpx" },
     { name = "mypy" },
     { name = "pytest" },
     { name = "pytest-asyncio" },
@@ -374,6 +375,8 @@ requires-dist = [
     { name = "asyncpg", specifier = ">=0.31" },
     { name = "cryptography", specifier = ">=46" },
     { name = "fastapi", specifier = ">=0.160,<1" },
+    { name = "httpcore", specifier = ">=1.0.9" },
+    { name = "httpx", specifier = ">=0.28" },
     { name = "pydantic", specifier = ">=2.12,<3" },
     { name = "pydantic-settings", specifier = ">=2.12" },
     { name = "sqlalchemy", extras = ["asyncio"], specifier = ">=2.1,<2.2" },
@@ -384,7 +387,6 @@ requires-dist = [
 [package.metadata.requires-dev]
 dev = [
     { name = "asyncpg-stubs", specifier = ">=0.31" },
-    { name = "httpx", specifier = ">=0.28" },
     { name = "mypy", specifier = "==2.4.1" },
     { name = "pytest", specifier = ">=9.0" },
     { name = "pytest-asyncio", specifier = ">=1.3" },

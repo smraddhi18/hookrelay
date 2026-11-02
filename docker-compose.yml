@@ -1,4 +1,5 @@
-# Local stack: Postgres 16 + Redis 7 + a one-shot migration job + the API + the fan-out relay.
+# Local stack: Postgres 16 + Redis 7 + a one-shot migration job + the API + the fan-out relay
+# + the delivery worker.
 #   docker compose up --build        -> http://localhost:8000/docs
 #   docker compose down -v           -> stop and wipe data
 name: hookrelay
@@ -21,6 +22,12 @@ x-app-env: &app-env
   RELAY_BATCH_SIZE: ${RELAY_BATCH_SIZE:-100}
   RELAY_POLL_MIN_MS: ${RELAY_POLL_MIN_MS:-100}
   RELAY_POLL_MAX_MS: ${RELAY_POLL_MAX_MS:-2000}
+  WORKER_CONCURRENCY: ${WORKER_CONCURRENCY:-16}
+  WORKER_LEASE_S: ${WORKER_LEASE_S:-60}
+  WORKER_DRAIN_TIMEOUT_S: ${WORKER_DRAIN_TIMEOUT_S:-25}
+  DELIVERY_MAX_ATTEMPTS: ${DELIVERY_MAX_ATTEMPTS:-8}
+  DELIVERY_MAX_AGE_S: ${DELIVERY_MAX_AGE_S:-259200}
+  DELIVERY_ALLOWED_PORTS: ${DELIVERY_ALLOWED_PORTS:-80,443,8080,8443}
 
 services:
   postgres:
@@ -93,6 +100,26 @@ services:
       start_period: 10s
       retries: 3
     restart: unless-stopped
+    stop_grace_period: 30s
+
+  # Leases due deliveries (SKIP LOCKED + fencing tokens), signs and POSTs them, records every
+  # attempt and schedules retries. Scale out freely (`docker compose up --scale worker=4`).
+  # Production mode keeps the SSRF guard strict: only public addresses on allowed ports.
+  worker:
+    image: hookrelay:local
+    command: ["python", "-m", "hookrelay.worker"]
+    environment: *app-env
+    depends_on:
+      migrate:
+        condition: service_completed_successfully
+    healthcheck:
+      test: ["CMD", "python", "-m", "hookrelay.worker", "--healthcheck"]
+      interval: 10s
+      timeout: 3s
+      start_period: 10s
+      retries: 3
+    restart: unless-stopped
+    # SIGTERM drains in-flight attempts for WORKER_DRAIN_TIMEOUT_S (25 s), then releases leases.
     stop_grace_period: 30s
 
 volumes:
