@@ -2,6 +2,7 @@
 
 from hookrelay.db.models.api_key import ApiKey, ApiKeyRole, ApiKeyStatus
 from hookrelay.db.models.delivery import Delivery, DeliveryStatus
+from hookrelay.db.models.delivery_attempt import AttemptOutcome, DeliveryAttempt
 from hookrelay.db.models.endpoint import Endpoint
 from hookrelay.db.models.event import Event, OutboxEntry
 from hookrelay.db.models.event_type import EventType
@@ -13,7 +14,9 @@ __all__ = [
     "ApiKey",
     "ApiKeyRole",
     "ApiKeyStatus",
+    "AttemptOutcome",
     "Delivery",
+    "DeliveryAttempt",
     "DeliveryStatus",
     "Endpoint",
     "Event",
