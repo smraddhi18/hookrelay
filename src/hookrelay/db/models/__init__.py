@@ -4,9 +4,12 @@ from hookrelay.db.models.api_key import ApiKey, ApiKeyRole, ApiKeyStatus
 from hookrelay.db.models.delivery import Delivery, DeliveryStatus
 from hookrelay.db.models.delivery_attempt import AttemptOutcome, DeliveryAttempt
 from hookrelay.db.models.endpoint import Endpoint
+from hookrelay.db.models.endpoint_state import BreakerState, EndpointState
 from hookrelay.db.models.event import Event, OutboxEntry
 from hookrelay.db.models.event_type import EventType
 from hookrelay.db.models.idempotency_key import IdempotencyKey
+from hookrelay.db.models.notification import Notification, NotificationStatus
+from hookrelay.db.models.replay_request import ReplayRequest, ReplayScope
 from hookrelay.db.models.subscription import Subscription
 from hookrelay.db.models.tenant import Tenant, TenantStatus
 
@@ -15,14 +18,20 @@ __all__ = [
     "ApiKeyRole",
     "ApiKeyStatus",
     "AttemptOutcome",
+    "BreakerState",
     "Delivery",
     "DeliveryAttempt",
     "DeliveryStatus",
     "Endpoint",
+    "EndpointState",
     "Event",
     "EventType",
     "IdempotencyKey",
+    "Notification",
+    "NotificationStatus",
     "OutboxEntry",
+    "ReplayRequest",
+    "ReplayScope",
     "Subscription",
     "Tenant",
     "TenantStatus",

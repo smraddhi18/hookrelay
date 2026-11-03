@@ -1,18 +1,27 @@
 """Deliveries: one row per (event, endpoint), created by the fan-out relay.
 
-State machine (Milestone 3)::
+State machine (Milestone 4)::
 
     pending --lease--> delivering --2xx--> succeeded
-       ^                   |
-       |                   +--terminal error, attempts or age exhausted--> failed
-       |                   |
-       +--retryable error--+   (also: lease expired, or released on drain)
+       ^  ^                |
+       |  |                +--permanent error (4xx, redirect, blocked)--> failed
+       |  |                |
+       |  |                +--retryable error, attempts or age exhausted--> dead
+       |  |                |
+       |  +--retryable error (also: lease expired, or released on drain)
+       |
+       +--replay (API) from succeeded / failed / dead
 
 A worker owns a ``delivering`` row only while it holds the row's current ``lease_token``
 (a fencing token minted on every lease): every state transition is
 ``UPDATE ... WHERE lease_token = :mine``, so a worker whose lease expired and was taken over
-can never overwrite the new owner's result. ``dead`` is reserved for the Milestone 4
-dead-letter queue; ``failed`` rows stay replayable.
+can never overwrite the new owner's result.
+
+``failed`` and ``dead`` are both terminal and both replayable, but they mean different things:
+``failed`` is "the receiver said no" (retrying cannot help until someone fixes something),
+``dead`` is the dead-letter queue: "we kept trying and ran out of attempts or time". A replay
+starts a new *run*: ``attempt_offset`` and ``run_started_at`` reset the retry budget without
+renumbering the attempt log.
 """
 
 from __future__ import annotations
@@ -98,6 +107,11 @@ class Delivery(TimestampMixin, Base):
             "last_status_code IS NULL OR last_status_code BETWEEN 100 AND 599",
             name="last_status_code_range",
         ),
+        CheckConstraint(
+            "attempt_offset >= 0 AND attempt_offset <= attempt_count",
+            name="attempt_offset_range",
+        ),
+        CheckConstraint("replay_count >= 0", name="replay_count_non_negative"),
         # Worker queue: due pending deliveries, oldest first.
         Index(
             "ix_deliveries_due",
@@ -108,6 +122,19 @@ class Delivery(TimestampMixin, Base):
         Index(
             "ix_deliveries_lease_expiry",
             "leased_until",
+            postgresql_where=text("status = 'delivering'"),
+        ),
+        # Per-endpoint lease (Milestone 4): an endpoint's due rows, and its in-flight count.
+        Index(
+            "ix_deliveries_endpoint_due",
+            "endpoint_id",
+            "next_attempt_at",
+            "id",
+            postgresql_where=text("status = 'pending'"),
+        ),
+        Index(
+            "ix_deliveries_endpoint_delivering",
+            "endpoint_id",
             postgresql_where=text("status = 'delivering'"),
         ),
         Index("ix_deliveries_endpoint_created", "endpoint_id", "created_at", "id"),
@@ -140,6 +167,13 @@ class Delivery(TimestampMixin, Base):
     leased_by: Mapped[str | None] = mapped_column(String(MAX_WORKER_ID_LENGTH))
     last_status_code: Mapped[int | None] = mapped_column(Integer)
     last_error_class: Mapped[str | None] = mapped_column(String(MAX_ERROR_CLASS_LENGTH))
+    # Replay bookkeeping: attempts before the current run, when the run began, and how often
+    # the delivery was replayed. Retry limits count from these, not from creation.
+    attempt_offset: Mapped[int] = mapped_column(Integer, nullable=False, server_default=text("0"))
+    run_started_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), nullable=False
+    )
+    replay_count: Mapped[int] = mapped_column(Integer, nullable=False, server_default=text("0"))
 
     def __repr__(self) -> str:
         return f"Delivery(id={self.id!s}, status={self.status!r})"
