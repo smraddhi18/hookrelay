@@ -120,6 +120,11 @@ class PreconditionRequiredError(AppError):
     code = "precondition_required"
 
 
+class TooManyRequestsError(AppError):
+    status_code = HTTPStatus.TOO_MANY_REQUESTS
+    code = "rate_limited"
+
+
 class ServiceUnavailableError(AppError):
     status_code = HTTPStatus.SERVICE_UNAVAILABLE
     code = "service_unavailable"

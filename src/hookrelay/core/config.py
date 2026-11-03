@@ -184,6 +184,31 @@ class Settings(BaseSettings):
     # development). Refused in production; cloud metadata addresses stay blocked regardless.
     delivery_allow_private_networks: bool = False
 
+    # Back-pressure and failure isolation (Milestone 4). Per-endpoint limits are enforced in
+    # Postgres at lease time, so they hold across any number of workers.
+    # In-flight cap for endpoints that do not set max_in_flight, and the most one may ask for.
+    endpoint_default_max_in_flight: Annotated[int, Field(ge=1, le=1_000)] = 10
+    endpoint_max_in_flight: Annotated[int, Field(ge=1, le=1_000)] = 100
+    # Highest rate_limit_per_s (deliveries per second, token bucket) an endpoint may configure.
+    endpoint_max_rate_limit_per_s: Annotated[int, Field(ge=1, le=10_000)] = 1_000
+    # Circuit breaker: consecutive availability failures that open it, and the open cooldown
+    # (doubles on every re-trip, capped) before a single half-open probe is let through.
+    breaker_failure_threshold: Annotated[int, Field(ge=1, le=1_000)] = 5
+    breaker_cooldown_base_s: Annotated[float, Field(gt=0, le=3_600)] = 30.0
+    breaker_cooldown_max_s: Annotated[float, Field(gt=0, le=86_400)] = 600.0
+    # Disable an endpoint whose breaker has seen only failures for this long (0 = never).
+    endpoint_auto_disable_after_s: Annotated[int, Field(ge=0, le=30 * 86_400)] = 3 * 86_400
+
+    # Replay API: per-tenant request budget, rows requeued per request, widest time window.
+    replay_rate_limit_per_minute: Annotated[int, Field(ge=1, le=10_000)] = 30
+    replay_max_deliveries: Annotated[int, Field(ge=1, le=10_000)] = 1_000
+    replay_max_window_s: Annotated[int, Field(ge=60, le=90 * 86_400)] = 7 * 86_400
+
+    # Operator notifications (endpoint auto-disabled, ...), dispatched by the relay.
+    notification_poll_interval_s: Annotated[float, Field(gt=0, le=3_600)] = 5.0
+    notification_max_attempts: Annotated[int, Field(ge=1, le=100)] = 10
+    notification_retention_s: Annotated[int, Field(ge=0, le=90 * 86_400)] = 7 * 86_400
+
     @field_validator("database_url", mode="before")
     @classmethod
     def _normalize_db_url(cls, value: object) -> object:
@@ -274,6 +299,16 @@ class Settings(BaseSettings):
             raise ValueError("WORKER_LEASE_RENEW_INTERVAL_S must be at most WORKER_LEASE_S / 2")
         if self.delivery_backoff_base_s > self.delivery_backoff_max_s:
             raise ValueError("DELIVERY_BACKOFF_BASE_S must not exceed DELIVERY_BACKOFF_MAX_S")
+        return self
+
+    @model_validator(mode="after")
+    def _check_backpressure(self) -> Self:
+        if self.endpoint_default_max_in_flight > self.endpoint_max_in_flight:
+            raise ValueError(
+                "ENDPOINT_DEFAULT_MAX_IN_FLIGHT must not exceed ENDPOINT_MAX_IN_FLIGHT"
+            )
+        if self.breaker_cooldown_base_s > self.breaker_cooldown_max_s:
+            raise ValueError("BREAKER_COOLDOWN_BASE_S must not exceed BREAKER_COOLDOWN_MAX_S")
         return self
 
     @model_validator(mode="after")
