@@ -15,13 +15,20 @@ from hookrelay.api.contracts.common import (
     error_responses,
 )
 from hookrelay.api.contracts.endpoints import (
+    CircuitOut,
     EndpointCreate,
     EndpointCreated,
     EndpointOut,
     EndpointSecret,
     EndpointUpdate,
 )
-from hookrelay.api.deps import AdminDep, EndpointPolicyDep, ReaderDep, SecretBoxDep
+from hookrelay.api.deps import (
+    AdminDep,
+    EndpointPolicyDep,
+    ReaderDep,
+    SecretBoxDep,
+    SettingsDep,
+)
 from hookrelay.api.etag import IfMatchHeader, parse_if_match, set_etag
 from hookrelay.db.models import ApiKeyRole
 from hookrelay.db.session import SessionDep
@@ -75,6 +82,8 @@ async def create_endpoint(
         enabled=body.enabled,
         headers=body.headers,
         timeout_ms=body.timeout_ms,
+        rate_limit_per_s=body.rate_limit_per_s,
+        max_in_flight=body.max_in_flight,
     )
     endpoint = created.endpoint
     response.headers["Location"] = f"/v1/endpoints/{endpoint.id}"
@@ -103,7 +112,7 @@ async def get_endpoint(
 @router.patch(
     "/{endpoint_id}",
     response_model=EndpointOut,
-    summary="Update an endpoint (requires If-Match)",
+    summary="Update an endpoint (requires If-Match); re-enabling resets its circuit breaker",
     responses=error_responses(404, 409, 412, 422, 428),
 )
 async def update_endpoint(
@@ -164,3 +173,21 @@ async def get_endpoint_secret(
     secret = await service.reveal_signing_secret(session, principal.tenant_id, endpoint_id, box=box)
     response.headers["Cache-Control"] = "no-store"
     return EndpointSecret(endpoint_id=endpoint_id, signing_secret=secret)
+
+
+@router.get(
+    "/{endpoint_id}/circuit",
+    response_model=CircuitOut,
+    summary="Circuit-breaker state, in-flight load and limits of an endpoint",
+    responses=error_responses(404),
+)
+async def get_endpoint_circuit(
+    endpoint_id: uuid.UUID, principal: ReaderDep, session: SessionDep, settings: SettingsDep
+) -> CircuitOut:
+    status_ = await service.get_circuit(
+        session,
+        principal.tenant_id,
+        endpoint_id,
+        default_max_in_flight=settings.endpoint_default_max_in_flight,
+    )
+    return CircuitOut.from_status(status_)
