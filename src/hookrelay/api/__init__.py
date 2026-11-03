@@ -18,6 +18,7 @@ from hookrelay.api.routers import (
     events,
     health,
     me,
+    replays,
     subscriptions,
 )
 
@@ -33,6 +34,7 @@ v1_router.include_router(event_types.router)
 v1_router.include_router(subscriptions.router)
 v1_router.include_router(events.router)
 v1_router.include_router(deliveries.router)
+v1_router.include_router(replays.router)
 
 api_router = APIRouter()
 api_router.include_router(health.router)
