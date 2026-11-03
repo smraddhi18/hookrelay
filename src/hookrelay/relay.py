@@ -12,6 +12,10 @@ A separate process that drains the transactional outbox:
 Polling backs off exponentially from ``RELAY_POLL_MIN_MS`` to ``RELAY_POLL_MAX_MS`` while the
 outbox is empty and drops back to the minimum (or does not sleep at all when a batch was
 full) as soon as there is work. ``SIGTERM``/``SIGINT`` finish the current batch and exit.
+
+On its own interval the relay also dispatches operator notifications (Milestone 4: e.g.
+``endpoint.disabled``) through a pluggable :class:`~hookrelay.services.notifications.Notifier`
+and runs batched housekeeping.
 A heartbeat file is touched every loop; ``--healthcheck`` checks its age (container probe).
 """
 
@@ -33,12 +37,13 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from hookrelay.core.config import Settings, get_settings
 from hookrelay.core.logging import configure_logging, redact_text
 from hookrelay.db.engine import Database
-from hookrelay.services import fanout, housekeeping
+from hookrelay.services import fanout, housekeeping, notifications
 
 logger = structlog.stdlib.get_logger("hookrelay.relay")
 
 HOUSEKEEPING_BATCH_SIZE = 1_000
 HOUSEKEEPING_MAX_ROUNDS = 10
+NOTIFICATION_BATCH_SIZE = 100
 
 
 @dataclass(slots=True)
@@ -55,6 +60,11 @@ class RelayStats:
     purged_idempotency_keys: int = 0
     purged_outbox_rows: int = 0
     purged_events: int = 0
+    purged_notifications: int = 0
+    purged_replay_requests: int = 0
+    notifications_sent: int = 0
+    notifications_failed: int = 0
+    notifications_abandoned: int = 0
 
 
 @dataclass(frozen=True, slots=True)
@@ -66,9 +76,16 @@ class BatchResult:
 
 
 class Relay:
-    def __init__(self, database: Database, settings: Settings) -> None:
+    def __init__(
+        self,
+        database: Database,
+        settings: Settings,
+        *,
+        notifier: notifications.Notifier | None = None,
+    ) -> None:
         self.database = database
         self.settings = settings
+        self.notifier: notifications.Notifier = notifier or notifications.LoggingNotifier()
         self.stats = RelayStats()
         self._stop = asyncio.Event()
         self._heartbeat = Path(settings.relay_heartbeat_file)
@@ -148,32 +165,50 @@ class Relay:
         )
 
     async def housekeep(self) -> housekeeping.SweepResult:
-        """Purge expired idempotency keys, old processed outbox rows and expired events."""
-        keys = rows = events = 0
+        """Purge expired idempotency keys, old processed outbox rows, expired events, old
+        dispatched notifications and old replay audit rows."""
+        totals = dict.fromkeys(
+            ("idempotency_keys", "outbox_rows", "events", "notifications", "replay_requests"), 0
+        )
         for _ in range(HOUSEKEEPING_MAX_ROUNDS):
             async with self.database.session() as session:
                 swept = await housekeeping.sweep(
                     session,
                     outbox_retention_s=self.settings.relay_outbox_retention_s,
                     batch_size=HOUSEKEEPING_BATCH_SIZE,
+                    notification_retention_s=self.settings.notification_retention_s,
+                    replay_retention_s=self.settings.event_retention_days * 86_400,
                 )
-            keys += swept.idempotency_keys
-            rows += swept.outbox_rows
-            events += swept.events
-            if (
-                self.stopping
-                or max(swept.idempotency_keys, swept.outbox_rows, swept.events)
-                < HOUSEKEEPING_BATCH_SIZE
-            ):
+            for name in totals:
+                totals[name] += getattr(swept, name)
+            if self.stopping or max(asdict(swept).values()) < HOUSEKEEPING_BATCH_SIZE:
                 break
-        total = housekeeping.SweepResult(idempotency_keys=keys, outbox_rows=rows, events=events)
+        total = housekeeping.SweepResult(**totals)
         self.stats.housekeeping_runs += 1
-        self.stats.purged_idempotency_keys += keys
-        self.stats.purged_outbox_rows += rows
-        self.stats.purged_events += events
+        self.stats.purged_idempotency_keys += total.idempotency_keys
+        self.stats.purged_outbox_rows += total.outbox_rows
+        self.stats.purged_events += total.events
+        self.stats.purged_notifications += total.notifications
+        self.stats.purged_replay_requests += total.replay_requests
         if total.total:
             logger.info("relay.housekeeping", **asdict(total))
         return total
+
+    async def notify_once(self) -> notifications.DispatchResult:
+        """Dispatch one batch of due operator notifications."""
+        async with self.database.session() as session:
+            result = await notifications.dispatch_due(
+                session,
+                self.notifier,
+                batch_size=NOTIFICATION_BATCH_SIZE,
+                max_attempts=self.settings.notification_max_attempts,
+            )
+        self.stats.notifications_sent += result.sent
+        self.stats.notifications_failed += result.failed
+        self.stats.notifications_abandoned += result.abandoned
+        if result.total:
+            logger.info("relay.notifications", **asdict(result))
+        return result
 
     def touch_heartbeat(self) -> None:
         try:
@@ -202,7 +237,7 @@ class Relay:
         min_s = self.settings.relay_poll_min_ms / 1000
         max_s = self.settings.relay_poll_max_ms / 1000
         delay = min_s
-        next_housekeeping = time.monotonic()
+        next_housekeeping = next_notify = time.monotonic()
         logger.info(
             "relay.started",
             batch_size=self.settings.relay_batch_size,
@@ -218,6 +253,13 @@ class Relay:
                     self.stats.loop_errors += 1
                     logger.exception("relay.iteration_failed", error=type(exc).__name__)
                 self.touch_heartbeat()
+                if not self.stopping and time.monotonic() >= next_notify:
+                    try:
+                        await self.notify_once()
+                    except Exception as exc:
+                        self.stats.loop_errors += 1
+                        logger.exception("relay.notify_failed", error=type(exc).__name__)
+                    next_notify = time.monotonic() + self.settings.notification_poll_interval_s
                 if not self.stopping and time.monotonic() >= next_housekeeping:
                     try:
                         await self.housekeep()
@@ -252,6 +294,7 @@ async def serve(settings: Settings, *, once: bool = False) -> RelayStats:
     try:
         if once:
             await relay.run_once()
+            await relay.notify_once()
         else:
             await relay.run()
     finally:

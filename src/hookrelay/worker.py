@@ -5,11 +5,13 @@ requests:
 
 1. **lease** due deliveries with ``FOR UPDATE SKIP LOCKED`` (only as many as there are free
    concurrency slots, so one worker never hoards work it cannot start), each with a fresh
-   fencing token;
+   fencing token, and only within each endpoint's circuit breaker, ``max_in_flight`` cap and
+   ``rate_limit_per_s`` token bucket (enforced in Postgres across all workers);
 2. **deliver** each one in its own task, bounded by a semaphore of ``WORKER_CONCURRENCY``:
    decrypt the endpoint secret, sign (Standard Webhooks), POST through the SSRF-guarded client;
 3. **complete** under the fence: success, retry with jittered backoff (honouring a capped
-   ``Retry-After``) or ``failed``, plus an attempt-log row, in one transaction.
+   ``Retry-After``), ``failed`` (permanent error) or ``dead`` (budget exhausted), plus an
+   attempt-log row and the endpoint's circuit-breaker update, in one transaction.
 
 Background loops renew in-flight leases every ``WORKER_LEASE_RENEW_INTERVAL_S`` (a task whose
 lease was lost is cancelled) and reclaim leases that expired on crashed workers.
@@ -44,8 +46,10 @@ from hookrelay.core.logging import configure_logging, redact_text
 from hookrelay.core.security import SecretBox, SecretDecryptionError
 from hookrelay.core.signing import HEADER_SIGNATURE, sign
 from hookrelay.db.engine import Database
+from hookrelay.db.models import DeliveryStatus
 from hookrelay.relay import heartbeat_is_fresh
 from hookrelay.services import delivery_queue
+from hookrelay.services.circuit_breaker import BreakerPolicy
 from hookrelay.services.clock import db_now
 from hookrelay.services.delivery_policy import (
     ErrorClass,
@@ -79,7 +83,8 @@ class WorkerStats:
     leased: int = 0
     succeeded: int = 0
     retried: int = 0
-    failed: int = 0
+    failed: int = 0  # ended the run: permanent error (failed) or budget exhausted (dead)
+    dead_lettered: int = 0  # the subset of ``failed`` that went to the dead-letter queue
     lease_lost: int = 0
     released: int = 0
     reclaimed_retried: int = 0
@@ -147,6 +152,7 @@ class Worker:
             backoff_max_s=settings.delivery_backoff_max_s,
             retry_after_max_s=settings.delivery_retry_after_max_s,
         )
+        self.breaker = BreakerPolicy.from_settings(settings)
         self.sender = sender or WebhookSender(
             SenderConfig(
                 allow_http=settings.endpoint_allow_http,
@@ -202,6 +208,7 @@ class Worker:
                 worker_id=self.worker_id,
                 limit=free,
                 lease_s=self.settings.worker_lease_s,
+                default_max_in_flight=self.settings.endpoint_default_max_in_flight,
             )
         for delivery in leased:
             await self._slots.acquire()  # never blocks: we leased at most `free`
@@ -292,7 +299,13 @@ class Worker:
         async with self.database.session() as session:
             now = await db_now(session)
             completion = await delivery_queue.complete(
-                session, delivery, record, worker_id=self.worker_id, now=now, policy=self.policy
+                session,
+                delivery,
+                record,
+                worker_id=self.worker_id,
+                now=now,
+                policy=self.policy,
+                breaker=self.breaker,
             )
         flight = self._inflight.get(delivery.id)
         if flight is not None:
@@ -318,9 +331,12 @@ class Worker:
                 self.stats.retried += 1
             case _:
                 self.stats.failed += 1
+                if completion.status is DeliveryStatus.DEAD:
+                    self.stats.dead_lettered += 1
         logger.info(
             "worker.attempt",
             outcome=completion.outcome.value,
+            status=completion.status.value,
             next_attempt_at=None
             if completion.next_attempt_at is None
             else completion.next_attempt_at.isoformat(),
