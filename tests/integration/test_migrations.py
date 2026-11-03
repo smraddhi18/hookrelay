@@ -139,6 +139,7 @@ def test_each_revision_downgrades_one_step(scratch_database_url: str) -> None:
     script = ScriptDirectory.from_config(cfg)
     command.upgrade(cfg, "head")
     expected_removed = {
+        "0008": {"endpoint_states", "notifications", "replay_requests"},
         "0007": {"delivery_attempts"},
         "0006": {"deliveries"},
         "0005": {"events", "event_outbox", "idempotency_keys"},
@@ -214,5 +215,64 @@ def test_m3_downgrade_maps_failed_and_in_flight_rows(scratch_database_url: str) 
     rows = asyncio.run(_fetch(scratch_database_url, "SELECT status FROM deliveries ORDER BY 1"))
     assert [r["status"] for r in rows] == ["dead", "pending"]
     assert "delivery_attempts" not in _tables(scratch_database_url)
+    command.upgrade(cfg, "head")
+    assert _schema_diff(scratch_database_url) == []
+
+
+async def _seed_m4_rows(url: str) -> None:
+    """Terminal ``failed`` rows as 0007 left them: two exhausted retries, one permanent 4xx."""
+    from tests.integration.test_m1_schema import _endpoint, _event_type, _tenant  # noqa: PLC0415
+    from tests.integration.test_m2_schema import _event  # noqa: PLC0415
+
+    conn = await asyncpg.connect(_asyncpg_dsn(url))
+    try:
+        tenant = await _tenant(conn, "m4-upgrade")
+        await _event_type(conn, tenant, "x.y")
+        endpoint = await _endpoint(conn, tenant, "https://a.example.com/")
+        for error_class, status_code in (
+            ("http_status", 503),
+            ("timeout", None),
+            ("http_status", 410),
+        ):
+            await conn.execute(
+                "INSERT INTO deliveries (tenant_id, event_id, endpoint_id, retain_until, status, "
+                "completed_at, attempt_count, last_error_class, last_status_code) "
+                "VALUES ($1, $2, $3, now() + interval '1 day', 'failed', now(), 1, $4, $5)",
+                tenant,
+                await _event(conn, tenant, "x.y"),
+                endpoint,
+                error_class,
+                status_code,
+            )
+    finally:
+        await conn.close()
+
+
+def test_m4_upgrade_dead_letters_exhausted_rows_and_backfills_state(
+    scratch_database_url: str,
+) -> None:
+    cfg = alembic_config(scratch_database_url)
+    command.upgrade(cfg, "0007")
+    asyncio.run(_seed_m4_rows(scratch_database_url))
+    command.upgrade(cfg, "head")
+    rows = asyncio.run(
+        _fetch(
+            scratch_database_url,
+            "SELECT status, last_error_class, run_started_at = created_at AS backfilled "
+            "FROM deliveries ORDER BY last_status_code NULLS LAST",
+        )
+    )
+    assert [(r["status"], r["last_error_class"]) for r in rows] == [
+        ("failed", "http_status"),  # 410: permanent, not a dead letter
+        ("dead", "http_status"),
+        ("dead", "timeout"),
+    ]
+    assert all(r["backfilled"] for r in rows)
+    states = asyncio.run(_fetch(scratch_database_url, "SELECT breaker_state FROM endpoint_states"))
+    assert [s["breaker_state"] for s in states] == ["closed"]
+
+    command.downgrade(cfg, "0007")
+    rows = asyncio.run(_fetch(scratch_database_url, "SELECT DISTINCT status FROM deliveries"))
+    assert [r["status"] for r in rows] == ["failed"]
     command.upgrade(cfg, "head")
     assert _schema_diff(scratch_database_url) == []

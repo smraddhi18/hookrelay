@@ -328,7 +328,7 @@ async def test_retryable_failure_is_rescheduled_then_succeeds(
     ] * 2  # same id on every retry, so receivers can dedupe
 
 
-async def test_max_attempts_ends_in_failed(
+async def test_max_attempts_ends_in_dead(
     api: httpx.AsyncClient, settings_for: Any, receiver: Receiver, make_worker: Any, db_url: str
 ) -> None:
     receiver.handler = lambda _r: Reply(500, b"boom")
@@ -339,12 +339,13 @@ async def test_max_attempts_ends_in_failed(
         await _make_due(db_url)
     assert (await worker.run_once()).leased == 3  # nothing left to lease
     delivery = await _delivery(db_url)
-    assert delivery["status"] == "failed"
+    assert delivery["status"] == "dead"  # retryable but exhausted: the dead-letter queue
     assert delivery["attempt_count"] == 3
     assert delivery["completed_at"] is not None
     assert [a["outcome"] for a in await _attempts(db_url)] == ["retrying", "retrying", "failed"]
     assert len(receiver.requests) == 3
     assert worker.stats.failed == 1
+    assert worker.stats.dead_lettered == 1
 
 
 async def test_terminal_4xx_fails_immediately(
@@ -387,19 +388,20 @@ async def test_blocked_destination_fails_without_a_request(
     assert receiver.requests == []
 
 
-async def test_max_age_ends_in_failed(
+async def test_max_age_ends_in_dead(
     api: httpx.AsyncClient, settings_for: Any, receiver: Receiver, make_worker: Any, db_url: str
 ) -> None:
     receiver.handler = lambda _r: Reply(503)
     await _setup(api, settings_for(), receiver)
     conn = await asyncpg.connect(_asyncpg_dsn(db_url))
     try:
-        await conn.execute("UPDATE deliveries SET created_at = now() - interval '2 hours'")
+        # Max age counts from the start of the current run (created_at unless replayed).
+        await conn.execute("UPDATE deliveries SET run_started_at = now() - interval '2 hours'")
     finally:
         await conn.close()
     await make_worker(delivery_max_age_s=3600).run_once()
     delivery = await _delivery(db_url)
-    assert delivery["status"] == "failed"
+    assert delivery["status"] == "dead"
     assert delivery["last_error_class"] == "max_age_exceeded"
     [attempt] = await _attempts(db_url)
     assert attempt["outcome"] == "failed"
@@ -556,7 +558,7 @@ async def test_expired_lease_is_reclaimed_and_released(
     assert len(receiver.requests) == 1
 
 
-async def test_expired_lease_on_the_last_attempt_fails(
+async def test_expired_lease_on_the_last_attempt_is_dead_lettered(
     api: httpx.AsyncClient, settings_for: Any, receiver: Receiver, make_worker: Any, db_url: str
 ) -> None:
     await _setup(api, settings_for(), receiver)
@@ -570,7 +572,7 @@ async def test_expired_lease_on_the_last_attempt_fails(
         await conn.close()
     assert (await worker.reclaim_once()).failed == 1
     delivery = await _delivery(db_url)
-    assert delivery["status"] == "failed"
+    assert delivery["status"] == "dead"
     assert delivery["completed_at"] is not None
     [attempt] = await _attempts(db_url)
     assert attempt["outcome"] == "failed"
