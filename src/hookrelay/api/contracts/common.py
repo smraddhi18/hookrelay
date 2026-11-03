@@ -45,6 +45,7 @@ _ERROR_DESCRIPTIONS: dict[int, str] = {
     415: "Content-Type must be application/json",
     422: "Validation error",
     428: "If-Match header is required",
+    429: "Rate limited; retry after the number of seconds in Retry-After",
 }
 
 

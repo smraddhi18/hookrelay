@@ -132,6 +132,8 @@ class DeliveryOut(BaseModel):
                     "last_status_code": 503,
                     "last_error_class": "http_status",
                     "completed_at": None,
+                    "replay_count": 0,
+                    "run_started_at": "2026-11-01T09:30:00.300Z",
                     "created_at": "2026-11-01T09:30:00.300Z",
                     "updated_at": "2026-11-01T09:30:00.690Z",
                 }
@@ -144,7 +146,9 @@ class DeliveryOut(BaseModel):
     endpoint_id: uuid.UUID
     status: str = Field(
         description="`pending`, `delivering` (a worker holds it), `succeeded`, `failed` "
-        "(terminal error, or attempts / max age exhausted) or `dead` (reserved for the DLQ)."
+        "(permanent error, e.g. 4xx or a blocked destination) or `dead` (dead-letter queue: "
+        "retryable errors until attempts or max age ran out). `failed` and `dead` deliveries "
+        "(and `succeeded` ones) can be replayed."
     )
     attempt_count: int = Field(description="Attempts started so far (including an in-flight one).")
     next_attempt_at: datetime = Field(description="When a `pending` delivery is next due.")
@@ -154,6 +158,11 @@ class DeliveryOut(BaseModel):
         description="Error class of the latest unsuccessful attempt (see the attempt log)."
     )
     completed_at: datetime | None
+    replay_count: int = Field(description="Times this delivery was replayed.")
+    run_started_at: datetime = Field(
+        description="Start of the current run (creation, or the latest replay); the retry "
+        "budget counts from here."
+    )
     created_at: datetime
     updated_at: datetime
 
@@ -170,6 +179,8 @@ class DeliveryOut(BaseModel):
             last_status_code=delivery.last_status_code,
             last_error_class=delivery.last_error_class,
             completed_at=delivery.completed_at,
+            replay_count=delivery.replay_count,
+            run_started_at=delivery.run_started_at,
             created_at=delivery.created_at,
             updated_at=delivery.updated_at,
         )
