@@ -1,4 +1,4 @@
-"""``Idempotency-Key`` support for unsafe requests (today: ``POST /v1/events``).
+"""``Idempotency-Key`` support for unsafe requests (``POST /v1/events`` and the replay API).
 
 Protocol, all inside the request's own transaction:
 
@@ -154,8 +154,8 @@ async def complete(
     *,
     tenant_id: uuid.UUID,
     key: str,
-    event_id: uuid.UUID,
     response: StoredResponse,
+    event_id: uuid.UUID | None = None,
 ) -> None:
     await session.execute(
         update(IdempotencyKey)
