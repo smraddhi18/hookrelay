@@ -14,14 +14,18 @@ It is built milestone by milestone with production habits: typed config, structu
 migrations with downgrade paths, tests against real Postgres, containers and CI from day one.
 See the **[roadmap](ROADMAP.md)** for the plan and progress log.
 
-> **Status:** Milestones 0 (foundation), 1 (tenancy), 2 (ingestion) and 3 (delivery workers) are
-> complete. Tenants authenticate with hashed, role-scoped API keys, manage endpoints, event types
+> **Status:** Milestones 0 (foundation), 1 (tenancy), 2 (ingestion), 3 (delivery workers) and
+> 4 (back-pressure and failure isolation) are complete. Tenants authenticate with hashed, role-scoped API keys, manage endpoints, event types
 > and wildcard subscriptions, and publish events through `POST /v1/events` with `Idempotency-Key`
 > support. Each event and its outbox row commit in one transaction; a relay process fans the
 > outbox out into exactly one `delivery` per (event, endpoint); and delivery workers lease due
 > deliveries with `SKIP LOCKED` + fencing tokens, POST them signed (Standard Webhooks) through an
 > SSRF-guarded HTTP client, record every attempt and retry with full-jitter backoff until the
-> delivery succeeds or ends `failed`. Circuit breakers, DLQ and replay come in Milestone 4.
+> delivery succeeds, fails permanently (`failed`) or exhausts its retries (`dead`, the dead-letter
+> state). Every endpoint has a Postgres-persisted circuit breaker, an in-flight cap and an
+> optional rate limit enforced at lease time, so one broken receiver cannot starve the others;
+> endpoints failing for days are auto-disabled with an operator notification, and finished
+> deliveries can be replayed singly, per event or in bulk.
 
 ## Features
 
@@ -50,7 +54,11 @@ See the **[roadmap](ROADMAP.md)** for the plan and progress log.
 | Delivery | Retries: 5xx / 408 / 409 / 425 / 429 / timeouts / connection errors, full-jitter exponential backoff, capped `Retry-After` floor, max attempts and max age → terminal `failed` | ✅ M3 |
 | Delivery | SSRF guard: resolve-then-connect to a vetted, pinned IP (every resolved address checked, re-resolved per connection), private / loopback / CGNAT / link-local / metadata / IPv4-mapped IPv6 blocked, scheme and port allow-list; dev opt-in refused in production | ✅ M3 |
 | Delivery | Attempt log (`delivery_attempts`: status, latency, truncated response, error class, worker, masked request headers) and `GET /v1/deliveries/{id}` / `.../attempts` | ✅ M3 |
-| Isolation | Per-endpoint circuit breakers, rate limits, concurrency caps, DLQ, replay | 🔜 M4 |
+| Isolation | Per-endpoint circuit breaker (closed / open / half-open) persisted in `endpoint_states`: consecutive availability failures open it with exponential cooldown, one half-open probe closes or re-opens it; deliveries wait in `pending` without spending attempts; `GET /v1/endpoints/{id}/circuit` | ✅ M4 |
+| Isolation | Per-endpoint `max_in_flight` (deployment default + cap) and `rate_limit_per_s` token bucket, enforced in the lease statement across all workers; round-robin allocation with least-recently-leased fairness | ✅ M4 |
+| Isolation | Dead-letter state: retries exhausted (attempts or age, per run) → `dead`; permanent errors stay `failed`; the reaper dead-letters expired leases on the last attempt | ✅ M4 |
+| Isolation | Auto-disable after sustained failure (`ENDPOINT_AUTO_DISABLE_AFTER_S`) with an `endpoint.disabled` notification in a transactional notification outbox, dispatched by the relay with retries; re-enabling resets the breaker | ✅ M4 |
+| Isolation | Replay API: one delivery, an event's deliveries, or a bulk time window + filters (admin); fresh retry budget, same `webhook-id`; `Idempotency-Key`, per-tenant rate limit (`429` + `Retry-After`), capped batches with `has_more`, audit trail `GET /v1/replays` | ✅ M4 |
 | Operability | Secret rotation (dual signing), delivery log search, endpoint health | 🔜 M5 |
 | Redis | Worker wake-ups, cached lookups, token buckets | 🔜 M6 |
 | Observability | Prometheus metrics, OpenTelemetry tracing, dashboard API | 🔜 M7 |
@@ -252,6 +260,48 @@ flowchart LR
     API --> DA
 ```
 
+### Back-pressure and failure isolation (Milestone 4)
+
+```mermaid
+flowchart LR
+    subgraph PG["Postgres 16"]
+        DL[(deliveries<br/>pending / delivering / succeeded /<br/>failed / dead)]
+        ES[(endpoint_states<br/>breaker + token bucket)]
+        EPT[(endpoints<br/>max_in_flight, rate_limit_per_s,<br/>enabled, auto_disabled_at)]
+        NT[(notifications<br/>outbox)]
+        RR[(replay_requests<br/>audit + rate ledger)]
+    end
+
+    subgraph Worker["Delivery worker"]
+        EL["1 eligible endpoints<br/>FOR UPDATE OF state SKIP LOCKED<br/>in-flight < cap, breaker allows,<br/>tokens ≥ 1, least recently leased first"]
+        AL["2 allocate free slots<br/>round-robin, ≤ per-endpoint limit<br/>(1 probe if half-open)"]
+        LS["3 lease per endpoint<br/>SKIP LOCKED LIMIT quota"]
+        SP["4 spend tokens,<br/>open → half_open"]
+        CP["complete (fenced)<br/>→ record_outcome"]
+        EL --> AL --> LS --> SP
+    end
+
+    subgraph Relay["Fan-out relay"]
+        ND["notify_once<br/>SKIP LOCKED, retry, abandon"]
+    end
+
+    subgraph API["API"]
+        RP["POST /v1/deliveries/{id}/replay<br/>POST /v1/events/{id}/replay<br/>POST /v1/replays (admin)"]
+        CI["GET /v1/endpoints/{id}/circuit"]
+    end
+
+    ES --> EL
+    DL --> LS
+    SP --> ES
+    CP -->|"success → closed<br/>failure ≥ threshold → open"| ES
+    CP -->|"sustained failure"| EPT
+    CP -->|"endpoint.disabled"| NT
+    NT --> ND --> OPS["Notifier<br/>(log / pager / email)"]
+    RP -->|"advisory lock + 60 s count"| RR
+    RP -->|"pending, fresh run budget"| DL
+    CI --> ES
+```
+
 ### Request flow (with auth)
 
 1. `RequestContextMiddleware` (pure ASGI) reads `X-Request-ID`. A caller-supplied ID is kept only
@@ -350,8 +400,38 @@ flowchart LR
    to finish, then cancel the rest and release their leases back to `pending` with the attempt
    refunded (nothing was recorded, so it does not count against `DELIVERY_MAX_ATTEMPTS`).
 
-Next (M4): per-endpoint circuit breakers, rate limits and concurrency caps, `dead` after exhausted
-retries, endpoint auto-disable and the replay API.
+### Back-pressure flow (Milestone 4)
+
+1. **Who may be leased.** One statement locks the `endpoint_states` rows of endpoints with due work
+   (`FOR UPDATE OF s SKIP LOCKED`, so two workers never plan for the same endpoint at once) and
+   keeps those where in-flight deliveries `< COALESCE(max_in_flight, ENDPOINT_DEFAULT_MAX_IN_FLIGHT)`,
+   the breaker is `closed` (or `open` past `open_until` / `half_open` with nothing in flight), and the
+   lazily refilled token bucket holds at least one token. Endpoints are ordered by `last_leased_at
+   NULLS FIRST`, so a tenant with a deep backlog cannot starve a quiet one.
+2. **How many.** A pure `allocate()` shares the worker's free slots round-robin, never above an
+   endpoint's limit: `min(free capacity, due rows, floor(tokens))`, and exactly 1 for a probe.
+3. **Lease.** `unnest(endpoint_ids, quotas)` + `LATERAL (... FOR UPDATE SKIP LOCKED LIMIT quota)` takes
+   each endpoint's oldest due rows (served by `ix_deliveries_endpoint_due`), all in the same
+   transaction that then spends the tokens and moves `open → half_open`.
+4. **Outcome.** After the fenced completion, the attempt is classified: 2xx and "receiver answered"
+   4xx / redirects count as success (the endpoint is up), 5xx / 408 / 429 / timeouts / connection,
+   DNS and TLS errors as failure, our own problems (secret unavailable, lease expired) as neutral.
+   `BREAKER_FAILURE_THRESHOLD` consecutive failures open the breaker for `BREAKER_COOLDOWN_BASE_S ×
+   2^trips` (capped); a half-open probe's success closes it, its failure re-opens it for longer.
+5. **Dead letters.** A retryable error with the run's budget spent (attempts since the last replay
+   ≥ `DELIVERY_MAX_ATTEMPTS`, or the next try later than `run_started_at + DELIVERY_MAX_AGE_S`) ends
+   `dead`; a permanent error ends `failed`.
+6. **Auto-disable.** When failures have lasted `ENDPOINT_AUTO_DISABLE_AFTER_S`, the same transaction
+   sets `enabled = false, auto_disabled_at = now()` and queues an `endpoint.disabled` notification;
+   the relay dispatches it (exponential retry, `abandoned` after `NOTIFICATION_MAX_ATTEMPTS`). The
+   backlog waits in `pending`; `PATCH {"enabled": true}` resets the breaker and resumes it.
+7. **Replay.** A replay sets finished deliveries back to `pending` (same id, so the same
+   `webhook-id`), with `attempt_offset = attempt_count` and `run_started_at = now()` so the new run
+   has a full budget while attempt numbers keep increasing. Each request takes a per-tenant
+   advisory lock, counts the tenant's `replay_requests` in the last minute (`429` past
+   `REPLAY_RATE_LIMIT_PER_MINUTE`), replays at most `REPLAY_MAX_DELIVERIES` (`has_more` says
+   whether to call again) and writes its audit row, all in one transaction with the
+   `Idempotency-Key` record.
 
 ## Design decisions and trade-offs
 
@@ -503,8 +583,8 @@ retries, endpoint auto-disable and the replay API.
   the database clock, so worker clock skew cannot make deliveries early or late.
 - **`Retry-After` is a floor with a cap.** A receiver asking for 120 s is never retried sooner, but
   a hostile `Retry-After: 99999999` cannot park a delivery for years (`DELIVERY_RETRY_AFTER_MAX_S`).
-- **`failed`, not `dead`, for now.** `failed` is terminal and has `completed_at`; `dead` stays reserved
-  for the M4 dead-letter queue, which will move exhausted deliveries there with replay support.
+- **`failed`, not `dead`, in M3.** `failed` was terminal with `completed_at`; `dead` was reserved for
+  the M4 dead-letter queue (which now holds exhausted retries; `failed` means a permanent error).
   The 0007 downgrade maps `failed` back to `dead` so older code still sees a valid state.
 - **The SSRF guard lives in the connection, not in a pre-check.** Validating the URL at config time
   (M1) and resolving before the request both lose to DNS rebinding: a name can resolve to a public
@@ -520,6 +600,45 @@ retries, endpoint auto-disable and the replay API.
   and stored as valid UTF-8; logs carry ids, status and error class, never URLs, secrets or bodies.
 - **Secret decryption failures are retryable.** If `SECRETS_ENCRYPTION_KEY` is misconfigured nothing
   has been sent yet; retrying lets an operator fix the key without losing deliveries.
+
+### Milestone 4 decisions
+
+- **Breaker state in Postgres, not in worker memory.** With N workers an in-memory breaker sees 1/N of
+  the failures and each worker probes on its own. `endpoint_states` is one row per endpoint, locked
+  `SKIP LOCKED` in the lease and `FOR UPDATE` on completion (lock order: delivery → state → endpoint),
+  so every worker sees the same state and exactly one probe runs. The cost is one small row update
+  per attempt; Redis (M6) can take the hot counters later without changing the semantics.
+- **Limits enforced where work is claimed.** `max_in_flight` and the token bucket are checked inside
+  the lease transaction, against `count(*) WHERE status = 'delivering'` (a partial index), so they
+  hold across all workers and survive restarts; there is no separate counter that can drift. The
+  bucket refills lazily (`tokens + elapsed × rate`, capped at one second's worth) so there is no
+  ticker process.
+- **Open breakers defer, they do not fail.** While the breaker is open, due deliveries stay `pending`
+  and spend no attempts, so a receiver that is down for an hour does not burn its retry budget;
+  their max age still applies, measured from the start of the run.
+- **Availability vs. correctness signals.** A `400` or `410` means the receiver is up and rejecting
+  this message, so it fails the delivery but counts as a *success* for the breaker; otherwise one
+  bad payload could open the circuit for every other message. Lease expiry and secret problems are
+  ours, so they are neutral.
+- **`dead` vs `failed`.** Both are terminal; `dead` (retries exhausted) is what operators replay after
+  fixing a receiver, `failed` (permanent 4xx, blocked destination) usually needs a payload or config
+  fix first. The 0008 migration reclassifies old rows by their last error and its downgrade maps
+  `dead` back to `failed`.
+- **Replay reuses the delivery.** A new row would need its own `webhook-id`, breaking receivers'
+  dedupe. Reusing it keeps the id and the full attempt history; `attempt_offset` / `run_started_at`
+  give the new run a fresh budget. Only terminal deliveries can be replayed (`409` otherwise), and
+  deliveries of disabled endpoints are skipped (`409` for a single replay).
+- **The audit table is the rate limiter.** Replay rate limits count `replay_requests` rows from the
+  last 60 s under a per-tenant transaction-scoped advisory lock, so concurrent API replicas agree
+  and an idempotent retry (stored response) costs nothing. A sliding-window count is exact and
+  cheap at this volume; M6's Redis token buckets are the step for hot APIs.
+- **Bulk replay is bounded.** It needs an explicit, bounded window (`REPLAY_MAX_WINDOW_S`), is
+  admin-only, and replays at most `REPLAY_MAX_DELIVERIES` per call with `has_more`, so a click
+  cannot rewrite millions of rows in one transaction. Rows already being replayed are skipped
+  (`SKIP LOCKED`) rather than waited on.
+- **Notifications are an outbox too.** Auto-disable and its notification commit together; the relay
+  delivers it later with retries. The default notifier logs a structured `WARNING`; a pager or
+  email notifier implements one `send()` method.
 
 ## Getting started
 
@@ -649,11 +768,20 @@ All settings are environment variables (or `.env`), validated at startup. See
 | `WORKER_HEARTBEAT_FILE` / `WORKER_HEARTBEAT_MAX_AGE_S` | `/tmp/hookrelay-worker.heartbeat` / `60` | liveness file for `--healthcheck` |
 | `DELIVERY_CONNECT_TIMEOUT_MS` | `5000` | TCP + TLS handshake deadline (the endpoint's `timeout_ms` bounds the whole request) |
 | `DELIVERY_RESPONSE_MAX_BYTES` | `4096` | response bytes read and kept in the attempt log (0 to 65536) |
-| `DELIVERY_MAX_ATTEMPTS` / `DELIVERY_MAX_AGE_S` | `8` / `259200` | then the delivery is `failed` |
+| `DELIVERY_MAX_ATTEMPTS` / `DELIVERY_MAX_AGE_S` | `8` / `259200` | per run (a replay starts a new run); then the delivery is `dead` |
 | `DELIVERY_BACKOFF_BASE_S` / `DELIVERY_BACKOFF_MAX_S` | `5` / `3600` | full-jitter exponential backoff (base ≤ max enforced) |
 | `DELIVERY_RETRY_AFTER_MAX_S` | `3600` | cap on a receiver's `Retry-After` |
 | `DELIVERY_ALLOWED_PORTS` | `80,443,8080,8443` | SSRF guard port allow-list |
 | `DELIVERY_ALLOW_PRIVATE_NETWORKS` | `false` | loopback / RFC 1918 / CGNAT receivers for development; **refused in production** |
+| `ENDPOINT_DEFAULT_MAX_IN_FLIGHT` / `ENDPOINT_MAX_IN_FLIGHT` | `10` / `100` | in-flight attempts per endpoint across all workers when unset / the most a tenant may set (default ≤ max enforced) |
+| `ENDPOINT_MAX_RATE_LIMIT_PER_S` | `1000` | highest `rate_limit_per_s` a tenant may set (unset = unlimited) |
+| `BREAKER_FAILURE_THRESHOLD` | `5` | consecutive availability failures that open an endpoint's breaker |
+| `BREAKER_COOLDOWN_BASE_S` / `BREAKER_COOLDOWN_MAX_S` | `30` / `600` | open duration `base × 2^trips`, capped (base ≤ max enforced) |
+| `ENDPOINT_AUTO_DISABLE_AFTER_S` | `259200` | failing this long → endpoint disabled + `endpoint.disabled` notification (`0` = never) |
+| `REPLAY_RATE_LIMIT_PER_MINUTE` | `30` | replay requests per tenant per minute (`429` + `Retry-After` beyond) |
+| `REPLAY_MAX_DELIVERIES` / `REPLAY_MAX_WINDOW_S` | `1000` / `604800` | deliveries per replay request (`has_more`) / widest bulk window |
+| `NOTIFICATION_POLL_INTERVAL_S` / `NOTIFICATION_MAX_ATTEMPTS` | `5` / `10` | relay dispatch cadence / attempts before a notification is `abandoned` |
+| `NOTIFICATION_RETENTION_S` | `604800` | dispatched / abandoned notifications and replay audit rows are purged after this |
 
 ## API
 
@@ -687,7 +815,7 @@ Interactive docs: `/docs` (Swagger UI), `/redoc`, schema at `/openapi.json` (dis
 | `GET` | `/v1/endpoints` | List endpoints (`?enabled=`), header values masked below admin | reader |
 | `POST` | `/v1/endpoints` | Create; returns `signing_secret` once, `Location`, `ETag` | admin |
 | `GET` | `/v1/endpoints/{endpoint_id}` | Get (`ETag` header) | reader |
-| `PATCH` | `/v1/endpoints/{endpoint_id}` | Partial update, **requires `If-Match`** | admin |
+| `PATCH` | `/v1/endpoints/{endpoint_id}` | Partial update, **requires `If-Match`**; incl. `max_in_flight` / `rate_limit_per_s` (`null` = default / unlimited); re-enabling an auto-disabled endpoint resets its breaker | admin |
 | `DELETE` | `/v1/endpoints/{endpoint_id}` | Soft delete + remove subscriptions (`If-Match` optional) | admin |
 | `GET` | `/v1/endpoints/{endpoint_id}/secret` | Reveal the signing secret (audited, `no-store`) | admin |
 | `GET` / `POST` | `/v1/event-types` | List (`?include_archived=`) / register | reader / publisher |
@@ -701,6 +829,11 @@ Interactive docs: `/docs` (Swagger UI), `/redoc`, schema at `/openapi.json` (dis
 | `GET` | `/v1/events/{event_id}/deliveries` | Deliveries created for the event (status, attempts, next attempt, last result) | reader |
 | `GET` | `/v1/deliveries/{delivery_id}` | One delivery: status, `attempt_count`, `next_attempt_at`, `last_status_code`, `last_error_class` | reader |
 | `GET` | `/v1/deliveries/{delivery_id}/attempts` | Attempt log, newest first: outcome, status code, error class, latency, masked request headers, truncated response | reader |
+| `GET` | `/v1/endpoints/{endpoint_id}/circuit` | Breaker state, failure streak, `open_until`, trips, in-flight vs. effective `max_in_flight`, `rate_limit_per_s`, `auto_disabled_at` | reader |
+| `POST` | `/v1/deliveries/{delivery_id}/replay` | Replay one `succeeded` / `failed` / `dead` delivery (`202`, the delivery); optional `Idempotency-Key` | publisher |
+| `POST` | `/v1/events/{event_id}/replay` | Replay an event's deliveries (body optional: `statuses`, default `failed` + `dead`; `endpoint_id`) | publisher |
+| `POST` | `/v1/replays` | Bulk replay: `created_after` / `created_before` (required, bounded), `statuses`, `endpoint_id`, `event_type`; `{"replayed", "has_more"}` | admin |
+| `GET` | `/v1/replays` | Replay audit trail, newest first (scope, filters, count, key) | reader |
 
 List responses share one shape: `{"data": [...], "next_cursor": "...", "has_more": true}`; pass
 `?cursor=<next_cursor>&limit=<1..100>` for the next page.
@@ -750,14 +883,36 @@ Location: /v1/events/7b1e9a52-...
 Sending the same request again with the same key returns the same body and status plus
 `Idempotent-Replayed: true`; a different body with that key gets `422 idempotency_key_mismatch`.
 
+Example: replaying yesterday's dead letters for one endpoint after fixing it.
+
+```http
+POST /v1/replays
+Authorization: Bearer hrk_3k9x0q7m2p1a_...
+Content-Type: application/json
+Idempotency-Key: replay-billing-2026-11-02
+
+{"created_after": "2026-11-02T00:00:00Z", "created_before": "2026-11-03T00:00:00Z",
+ "endpoint_id": "0d3c8a6e-...", "statuses": ["dead"]}
+```
+
+```http
+HTTP/1.1 202 Accepted
+
+{"id": "5f0a...", "scope": "filter", "filters": {"statuses": ["dead"], ...}, "replayed": 1000,
+ "has_more": true, "created_at": "2026-11-03T09:00:00Z"}
+```
+
+`has_more: true` means the cap was hit; call again (with a new key) for the next batch.
+
 Common error codes: `unauthorized`, `api_key_revoked`, `api_key_expired` (401); `insufficient_role`,
 `tenant_suspended`, `operator_api_disabled` (403); `*_not_found` (404, e.g. `delivery_not_found`); `tenant_slug_taken`,
 `endpoint_url_taken`, `event_type_exists`, `subscription_exists`, `api_key_already_rotated`,
-`event_exists`, `idempotency_key_in_progress` (409); `precondition_failed` (412);
+`event_exists`, `idempotency_key_in_progress`, `delivery_not_replayable`, `endpoint_unavailable` (409); `precondition_failed` (412);
 `request_too_large`, `payload_too_large` (413); `unsupported_media_type` (415);
 `invalid_endpoint_url`, `timeout_too_large`, `unknown_event_type`, `event_type_archived`,
-`occurred_at_in_future`, `idempotency_key_mismatch`, `validation_error` (422);
-`precondition_required` (428); `secret_unavailable` (500). `invalid_idempotency_key` is a `400`.
+`occurred_at_in_future`, `idempotency_key_mismatch`, `max_in_flight_too_high`, `rate_limit_too_high`,
+`replay_window_required`, `invalid_replay_window`, `replay_window_too_large`, `validation_error` (422);
+`precondition_required` (428); `replay_rate_limited` (429, with `Retry-After`); `secret_unavailable` (500). `invalid_idempotency_key` is a `400`.
 
 Error format (all non-2xx responses):
 
@@ -834,7 +989,7 @@ src/hookrelay/
     deps.py             auth dependencies (operator token, API key → Principal, roles)
     contracts/          request/response models with OpenAPI examples
     routers/            thin HTTP layer: admin_tenants, api_keys, endpoints, event_types, subscriptions,
-                        events, deliveries, me, health
+                        events, deliveries, replays, me, health
     body.py             bounded body reading, strict JSON parsing, canonical JSON
     etag.py             ETag / If-Match parsing
   core/                 config, logging (redaction), errors, request context, security (keys, SecretBox),
@@ -844,14 +999,16 @@ src/hookrelay/
                         event_types, subscriptions, pagination, events, idempotency, fanout, housekeeping,
                         delivery_queue (lease / renew / complete / reclaim / release SQL), delivery_policy
                         (classification, backoff, Retry-After), ssrf (address vetting + guarded backend),
-                        webhook_client (httpx), deliveries (read API)
-alembic/                async env + versioned migrations (0001 tenants ... 0007 delivery_attempts)
+                        webhook_client (httpx), deliveries (read API), circuit_breaker (breaker state
+                        machine + outcome recording), notifications (outbox + notifier), replays
+alembic/                async env + versioned migrations (0001 tenants ... 0008 back-pressure)
 tests/receiver.py       raw-asyncio HTTP receiver + fake resolver used by delivery tests
 tests/unit/             fast tests (fake database): config, security, rules, pagination, auth wiring audit,
                         signing vectors, backoff / Retry-After, SSRF ranges, HTTP client, worker helpers
 tests/integration/      real Postgres: migrations, schema constraints, full HTTP flows per resource,
                         idempotency races, concurrent relays and crash/replay, concurrent workers,
-                        fencing, lease expiry, retries, SIGTERM drain, end-to-end signed delivery
+                        fencing, lease expiry, retries, SIGTERM drain, end-to-end signed delivery,
+                        breaker lifecycle, in-flight / rate limits, fairness, auto-disable, replays
 ```
 
 ## Scaling notes
@@ -874,8 +1031,19 @@ tests/integration/      real Postgres: migrations, schema constraints, full HTTP
   concurrency for slow receivers (it is I/O wait, not CPU) and add replicas for more. Each worker holds
   one Postgres connection per lease / complete transaction, never during the HTTP call, so
   `DB_POOL_SIZE` can stay far below `WORKER_CONCURRENCY`.
-- One slow endpoint can still occupy many slots in M3 (bounded by its `timeout_ms`); M4's per-endpoint
-  concurrency caps and circuit breakers isolate it.
+- One slow or broken endpoint is isolated: it holds at most `max_in_flight` slots across the whole
+  fleet, its open breaker stops leasing entirely, and least-recently-leased ordering hands free slots
+  to other endpoints first. The eligibility query scans `endpoint_states` rows with due work (one row
+  per endpoint, locked `SKIP LOCKED`, so concurrent workers plan for disjoint endpoints) and counts
+  in-flight / due rows through the partial `ix_deliveries_endpoint_delivering` and
+  `ix_deliveries_endpoint_due` indexes; a fleet with tens of thousands of active endpoints would
+  move the due set into a per-endpoint queue table or Redis (M6).
+- The breaker row is a hot spot only for a single very busy endpoint (one short `UPDATE` per attempt);
+  that is the trade for fleet-wide, restart-safe state. Batch outcome recording or Redis counters
+  are the next step if it shows up in `pg_stat_activity`.
+- Bulk replay touches at most `REPLAY_MAX_DELIVERIES` rows per transaction via
+  `ix_deliveries_tenant_created`, and replay rate limiting is a count over
+  `ix_replay_requests_tenant_created` in the last minute.
 - Authentication costs one indexed lookup (`api_keys.prefix` unique) joined to `tenants`, plus at most one
   throttled `last_used_at` write per key per minute, so hot keys do not turn reads into write load.
   A short-TTL in-process or Redis cache of `prefix → (hash, role, tenant status)` is the next step if
