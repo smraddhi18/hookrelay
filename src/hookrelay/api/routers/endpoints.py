@@ -18,9 +18,12 @@ from hookrelay.api.contracts.endpoints import (
     CircuitOut,
     EndpointCreate,
     EndpointCreated,
+    EndpointHealthOut,
     EndpointOut,
     EndpointSecret,
     EndpointUpdate,
+    SecretRotate,
+    SecretRotated,
 )
 from hookrelay.api.deps import (
     AdminDep,
@@ -32,6 +35,7 @@ from hookrelay.api.deps import (
 from hookrelay.api.etag import IfMatchHeader, parse_if_match, set_etag
 from hookrelay.db.models import ApiKeyRole
 from hookrelay.db.session import SessionDep
+from hookrelay.services import endpoint_health, endpoint_secrets
 from hookrelay.services import endpoints as service
 
 router = APIRouter(prefix="/endpoints", tags=["endpoints"])
@@ -191,3 +195,98 @@ async def get_endpoint_circuit(
         default_max_in_flight=settings.endpoint_default_max_in_flight,
     )
     return CircuitOut.from_status(status_)
+
+
+@router.post(
+    "/{endpoint_id}/secret/rotate",
+    response_model=SecretRotated,
+    summary="Rotate the signing secret (requires If-Match); the old one keeps signing during "
+    "the overlap window",
+    responses=error_responses(404, 412, 422, 428),
+)
+async def rotate_endpoint_secret(
+    *,
+    endpoint_id: uuid.UUID,
+    principal: AdminDep,
+    session: SessionDep,
+    box: SecretBoxDep,
+    settings: SettingsDep,
+    response: Response,
+    body: SecretRotate | None = None,
+    if_match: IfMatchHeader = None,
+) -> SecretRotated:
+    expected = parse_if_match(if_match, required=True)
+    request = body or SecretRotate()
+    rotated = await endpoint_secrets.rotate_signing_secret(
+        session,
+        principal.tenant_id,
+        endpoint_id,
+        box=box,
+        policy=endpoint_secrets.SecretRotationPolicy.from_settings(settings),
+        expected_version=expected,
+        overlap_s=request.overlap_s,
+        secret=request.secret,
+    )
+    endpoint = rotated.endpoint
+    set_etag(response, endpoint.version)
+    response.headers["Cache-Control"] = "no-store"
+    return SecretRotated(
+        endpoint_id=endpoint.id,
+        signing_secret=rotated.signing_secret,
+        rotated_at=endpoint.secret_rotated_at or endpoint.updated_at,
+        previous_secret_expires_at=endpoint.previous_secret_expires_at,
+        version=endpoint.version,
+    )
+
+
+@router.delete(
+    "/{endpoint_id}/secret/previous",
+    response_model=EndpointOut,
+    summary="Stop signing with the previous secret now (idempotent; If-Match optional)",
+    responses=error_responses(404, 412),
+)
+async def end_endpoint_secret_overlap(
+    endpoint_id: uuid.UUID,
+    principal: AdminDep,
+    session: SessionDep,
+    response: Response,
+    if_match: IfMatchHeader = None,
+) -> EndpointOut:
+    endpoint = await endpoint_secrets.end_secret_overlap(
+        session,
+        principal.tenant_id,
+        endpoint_id,
+        expected_version=parse_if_match(if_match, required=False),
+    )
+    set_etag(response, endpoint.version)
+    return EndpointOut.from_model(endpoint, reveal_headers=True)
+
+
+@router.get(
+    "/{endpoint_id}/health",
+    response_model=EndpointHealthOut,
+    summary="Delivery health: success rate, latency percentiles, errors, breaker, backlog",
+    responses=error_responses(404, 422),
+)
+async def get_endpoint_health(
+    endpoint_id: uuid.UUID,
+    principal: ReaderDep,
+    session: SessionDep,
+    settings: SettingsDep,
+    window_s: Annotated[
+        int | None,
+        Query(
+            ge=60,
+            description="Look-back window in seconds. Default "
+            "ENDPOINT_HEALTH_DEFAULT_WINDOW_S, at most ENDPOINT_HEALTH_MAX_WINDOW_S.",
+        ),
+    ] = None,
+) -> EndpointHealthOut:
+    health = await endpoint_health.get_endpoint_health(
+        session,
+        principal.tenant_id,
+        endpoint_id,
+        policy=endpoint_health.HealthPolicy.from_settings(settings),
+        window_s=window_s,
+    )
+    return EndpointHealthOut.from_health(health)
