@@ -139,6 +139,7 @@ def test_each_revision_downgrades_one_step(scratch_database_url: str) -> None:
     script = ScriptDirectory.from_config(cfg)
     command.upgrade(cfg, "head")
     expected_removed = {
+        "0009": set(),  # columns, indexes and triggers only
         "0008": {"endpoint_states", "notifications", "replay_requests"},
         "0007": {"delivery_attempts"},
         "0006": {"deliveries"},
