@@ -75,6 +75,8 @@ class LeasedDelivery:
     # Replay bookkeeping: attempts before this run, and when the run started.
     attempt_offset: int = 0
     run_started_at: datetime | None = None
+    # The replaced signing secret while its rotation overlap window is open (else None).
+    previous_secret_ciphertext: str | None = None
 
     @property
     def lease(self) -> Lease:
@@ -184,7 +186,9 @@ _LEASE_SQL = text(
     RETURNING d.id, d.tenant_id, d.event_id, d.endpoint_id, d.lease_token, d.attempt_count,
               d.created_at, d.attempt_offset, d.run_started_at,
               ev.event_type, ev.payload, ev.occurred_at,
-              e.url, e.headers, e.timeout_ms, e.secret_ciphertext
+              e.url, e.headers, e.timeout_ms, e.secret_ciphertext,
+              CASE WHEN e.previous_secret_expires_at > now()
+                   THEN e.previous_secret_ciphertext END AS previous_secret_ciphertext
     """
 )
 
@@ -291,7 +295,7 @@ _RELEASE_SQL = text(
 
 _EXPIRED_SQL = text(
     """
-    SELECT d.id, d.tenant_id, d.attempt_count, d.attempt_offset, d.run_started_at,
+    SELECT d.id, d.tenant_id, d.endpoint_id, d.attempt_count, d.attempt_offset, d.run_started_at,
            d.leased_by, d.last_attempt_at, e.url, now() AS now
     FROM deliveries AS d
     JOIN endpoints AS e ON e.tenant_id = d.tenant_id AND e.id = d.endpoint_id
@@ -368,6 +372,7 @@ async def lease_due(
             secret_ciphertext=r.secret_ciphertext,
             attempt_offset=r.attempt_offset,
             run_started_at=r.run_started_at,
+            previous_secret_ciphertext=r.previous_secret_ciphertext,
         )
         for r in leased_rows
     ]
@@ -485,6 +490,7 @@ async def complete(
         DeliveryAttempt(
             tenant_id=delivery.tenant_id,
             delivery_id=delivery.id,
+            endpoint_id=delivery.endpoint_id,
             attempt_number=delivery.attempt_number,
             outcome=completion.outcome.value,
             status_code=record.status_code,
@@ -569,6 +575,7 @@ async def reclaim_expired(
             DeliveryAttempt(
                 tenant_id=r.tenant_id,
                 delivery_id=r.id,
+                endpoint_id=r.endpoint_id,
                 attempt_number=r.attempt_count,
                 outcome=(
                     AttemptOutcome.RETRYING if decision.retry else AttemptOutcome.FAILED

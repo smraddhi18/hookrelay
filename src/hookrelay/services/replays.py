@@ -16,6 +16,9 @@ Rules:
 * Every accepted replay writes one ``replay_requests`` row in the same transaction (audit trail),
   and those rows are also the rate limiter's ledger: under a per-tenant advisory lock the
   tenant's rows in the last 60 s are counted. Postgres-only, exact across API replicas.
+* A delivery whose event payload was purged by the retention policy cannot be replayed (there
+  is nothing to send): single and per-event replays answer ``409 payload_purged`` and bulk
+  replays skip such deliveries. See :mod:`hookrelay.services.retention` for the locking.
 * A bulk replay is capped at ``REPLAY_MAX_DELIVERIES`` per request (oldest first) and reports
   ``has_more``; the caller pages by narrowing ``created_after``.
 """
@@ -184,6 +187,15 @@ async def _audit(
     return request
 
 
+def _raise_if_purged(purged_at: datetime | None, event_id: uuid.UUID) -> None:
+    if purged_at is not None:
+        raise ConflictError(
+            "The event's payload was purged by the retention policy; it cannot be replayed",
+            code="payload_purged",
+            details={"event_id": str(event_id), "payload_purged_at": purged_at.isoformat()},
+        )
+
+
 def _candidates(tenant_id: uuid.UUID, flt: ReplayFilter, limit: int) -> Any:
     """Terminal deliveries of live endpoints matching ``flt``, oldest first, locked."""
     stmt = (
@@ -208,15 +220,17 @@ def _candidates(tenant_id: uuid.UUID, flt: ReplayFilter, limit: int) -> Any:
     if flt.event_id is not None:
         stmt = stmt.where(Delivery.event_id == flt.event_id)
     if flt.event_type is not None:
-        stmt = stmt.where(
-            select(Event.id)
-            .where(
-                Event.tenant_id == Delivery.tenant_id,
-                Event.id == Delivery.event_id,
-                Event.event_type == flt.event_type,
-            )
-            .exists()
+        stmt = stmt.where(Delivery.event_type == flt.event_type)
+    # Purged payloads cannot be sent again.
+    stmt = stmt.where(
+        select(Event.id)
+        .where(
+            Event.tenant_id == Delivery.tenant_id,
+            Event.id == Delivery.event_id,
+            Event.payload_purged_at.is_(None),
         )
+        .exists()
+    )
     return (
         stmt.order_by(Delivery.created_at, Delivery.id)
         .limit(limit)
@@ -246,6 +260,16 @@ async def replay_delivery(
             code="delivery_not_replayable",
             details={"status": delivery.status},
         )
+    # Read after the delivery lock: a concurrent payload purge holds a share lock on the row
+    # until it commits, so this sees its result.
+    _raise_if_purged(
+        await session.scalar(
+            select(Event.payload_purged_at).where(
+                Event.tenant_id == tenant_id, Event.id == delivery.event_id
+            )
+        ),
+        delivery.event_id,
+    )
     endpoint = await session.scalar(
         select(Endpoint).where(Endpoint.tenant_id == tenant_id, Endpoint.id == delivery.endpoint_id)
     )
@@ -280,11 +304,16 @@ async def replay_event(
     limits: ReplayLimits,
 ) -> ReplayResult:
     """Replay an event's terminal deliveries (optionally one endpoint's, or some statuses)."""
-    exists = await session.scalar(
-        select(Event.id).where(Event.tenant_id == tenant_id, Event.id == event_id)
-    )
-    if exists is None:
+    event = (
+        await session.execute(
+            select(Event.id, Event.payload_purged_at).where(
+                Event.tenant_id == tenant_id, Event.id == event_id
+            )
+        )
+    ).one_or_none()
+    if event is None:
         raise NotFoundError("Event not found", code="event_not_found")
+    _raise_if_purged(event.payload_purged_at, event_id)
     flt = ReplayFilter(statuses=statuses, endpoint_id=endpoint_id, event_id=event_id)
     return await _replay_matching(
         session,

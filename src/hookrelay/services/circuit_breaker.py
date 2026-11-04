@@ -52,7 +52,9 @@ logger = structlog.stdlib.get_logger("hookrelay.circuit")
 # Status codes that say "the receiver is unavailable or overloaded", not "bad request".
 AVAILABILITY_STATUSES: Final = frozenset({408, 429})
 # Signals that say nothing about the receiver: our own key, or our own worker dying.
-_NEUTRAL_ERRORS: Final = frozenset({ErrorClass.SECRET_UNAVAILABLE, ErrorClass.LEASE_EXPIRED})
+_NEUTRAL_ERRORS: Final = frozenset(
+    {ErrorClass.SECRET_UNAVAILABLE, ErrorClass.LEASE_EXPIRED, ErrorClass.PAYLOAD_PURGED}
+)
 _MAX_COOLDOWN_EXPONENT: Final = 30
 ENDPOINT_DISABLED: Final = "endpoint.disabled"
 

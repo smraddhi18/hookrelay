@@ -39,6 +39,7 @@ class ErrorClass(StrEnum):
     SECRET_UNAVAILABLE = "secret_unavailable"  # noqa: S105 - signing secret could not be decrypted
     LEASE_EXPIRED = "lease_expired"  # the worker died or stalled past its lease
     MAX_AGE_EXCEEDED = "max_age_exceeded"  # not delivered within DELIVERY_MAX_AGE_S
+    PAYLOAD_PURGED = "payload_purged"  # the retention policy dropped the event payload
 
 
 # Transport/infrastructure failures worth retrying; HTTP status codes are classified separately.
