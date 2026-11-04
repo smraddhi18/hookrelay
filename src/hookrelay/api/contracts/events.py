@@ -99,6 +99,11 @@ class EventSummary(EventAccepted):
     fanned_out_at: datetime | None = Field(
         description="When the relay created this event's deliveries; null while queued."
     )
+    payload_purged_at: datetime | None = Field(
+        default=None,
+        description="When the payload retention policy dropped the payload (the event and its "
+        "delivery log stay until `retain_until`); a purged event cannot be replayed.",
+    )
 
     @classmethod
     def from_model(cls, event: Event) -> EventSummary:
@@ -106,11 +111,14 @@ class EventSummary(EventAccepted):
             **EventAccepted.from_model(event).model_dump(),
             payload_size=event.payload_size,
             fanned_out_at=event.fanned_out_at,
+            payload_purged_at=event.payload_purged_at,
         )
 
 
 class EventOut(EventSummary):
-    payload: dict[str, Any]
+    payload: dict[str, Any] | None = Field(
+        description="The event payload; null once purged (see `payload_purged_at`)."
+    )
 
     @classmethod
     def from_model(cls, event: Event) -> EventOut:
@@ -125,6 +133,7 @@ class DeliveryOut(BaseModel):
                     "id": "5d2c8e7a-1b3f-4e9a-8c6d-7f0a1b2c3d4e",
                     "event_id": _EVENT_EXAMPLE_ID,
                     "endpoint_id": "9a8b7c6d-5e4f-4a3b-9c2d-1e0f9a8b7c6d",
+                    "event_type": "invoice.paid",
                     "status": "pending",
                     "attempt_count": 1,
                     "next_attempt_at": "2026-11-01T09:30:04.120Z",
@@ -144,6 +153,7 @@ class DeliveryOut(BaseModel):
     id: uuid.UUID
     event_id: uuid.UUID
     endpoint_id: uuid.UUID
+    event_type: str = Field(description="The event's type (copied from the event).")
     status: str = Field(
         description="`pending`, `delivering` (a worker holds it), `succeeded`, `failed` "
         "(permanent error, e.g. 4xx or a blocked destination) or `dead` (dead-letter queue: "
@@ -172,6 +182,7 @@ class DeliveryOut(BaseModel):
             id=delivery.id,
             event_id=delivery.event_id,
             endpoint_id=delivery.endpoint_id,
+            event_type=delivery.event_type,
             status=delivery.status,
             attempt_count=delivery.attempt_count,
             next_attempt_at=delivery.next_attempt_at,
