@@ -41,6 +41,7 @@ dev = [
 hookrelay = "hookrelay.__main__:main"
 hookrelay-relay = "hookrelay.relay:main"
 hookrelay-worker = "hookrelay.worker:main"
+hookrelay-retention = "hookrelay.retention:main"
 
 [build-system]
 requires = ["hatchling>=1.25"]
@@ -77,6 +78,9 @@ known-third-party = ["alembic"]
 # Worker-style modules share test_worker's per-test database fixtures by import.
 "tests/integration/test_backpressure.py" = ["F811"]
 "tests/integration/test_replays.py" = ["F811"]
+"tests/integration/test_retention.py" = ["F811"]
+"tests/integration/test_secret_rotation.py" = ["F811"]
+"tests/integration/test_delivery_search_and_health.py" = ["F811"]
 "alembic/**" = ["ANN"]
 
 [tool.ruff.lint.flake8-bugbear]

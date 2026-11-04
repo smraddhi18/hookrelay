@@ -1,5 +1,5 @@
 # Local stack: Postgres 16 + Redis 7 + a one-shot migration job + the API + the fan-out relay
-# + the delivery worker.
+# + the delivery worker (+ an on-demand retention job, profile "ops").
 #   docker compose up --build        -> http://localhost:8000/docs
 #   docker compose down -v           -> stop and wipe data
 name: hookrelay
@@ -33,6 +33,11 @@ x-app-env: &app-env
   BREAKER_COOLDOWN_BASE_S: ${BREAKER_COOLDOWN_BASE_S:-30}
   ENDPOINT_AUTO_DISABLE_AFTER_S: ${ENDPOINT_AUTO_DISABLE_AFTER_S:-259200}
   REPLAY_RATE_LIMIT_PER_MINUTE: ${REPLAY_RATE_LIMIT_PER_MINUTE:-30}
+  ENDPOINT_SECRET_ROTATION_OVERLAP_S: ${ENDPOINT_SECRET_ROTATION_OVERLAP_S:-86400}
+  ENDPOINT_HEALTH_MAX_WINDOW_S: ${ENDPOINT_HEALTH_MAX_WINDOW_S:-604800}
+  EVENT_PAYLOAD_RETENTION_DAYS: ${EVENT_PAYLOAD_RETENTION_DAYS:-0}
+  RETENTION_BATCH_SIZE: ${RETENTION_BATCH_SIZE:-500}
+  RETENTION_MAX_BATCHES: ${RETENTION_MAX_BATCHES:-200}
 
 services:
   postgres:
@@ -126,6 +131,19 @@ services:
     restart: unless-stopped
     # SIGTERM drains in-flight attempts for WORKER_DRAIN_TIMEOUT_S (25 s), then releases leases.
     stop_grace_period: 30s
+
+  # One-shot retention run (expired events, payload purge, ended secret overlaps), for a cron
+  # or Kubernetes CronJob: `docker compose run --rm retention`. The relay already runs one
+  # bounded pass per housekeeping interval, so this is optional; concurrent runs are safe.
+  retention:
+    image: hookrelay:local
+    command: ["python", "-m", "hookrelay.retention"]
+    environment: *app-env
+    profiles: ["ops"]
+    depends_on:
+      migrate:
+        condition: service_completed_successfully
+    restart: "no"
 
 volumes:
   pgdata:
