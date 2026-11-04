@@ -48,6 +48,14 @@ class Endpoint(TimestampMixin, Base):
         CheckConstraint("deleted_at IS NULL OR NOT enabled", name="deleted_is_disabled"),
         CheckConstraint("secret_ciphertext LIKE 'v1.%'", name="secret_encrypted"),
         CheckConstraint(
+            "previous_secret_ciphertext IS NULL OR previous_secret_ciphertext LIKE 'v1.%'",
+            name="previous_secret_encrypted",
+        ),
+        CheckConstraint(
+            "(previous_secret_ciphertext IS NULL) = (previous_secret_expires_at IS NULL)",
+            name="previous_secret_iff_expiry",
+        ),
+        CheckConstraint(
             f"rate_limit_per_s IS NULL OR rate_limit_per_s BETWEEN 1 AND {MAX_RATE_LIMIT_PER_S}",
             name="rate_limit_range",
         ),
@@ -73,6 +81,12 @@ class Endpoint(TimestampMixin, Base):
             "id",
             postgresql_where=text("deleted_at IS NULL"),
         ),
+        # Retention clears previous secrets whose overlap window ended.
+        Index(
+            "ix_endpoints_previous_secret_expiry",
+            "previous_secret_expires_at",
+            postgresql_where=text("previous_secret_expires_at IS NOT NULL"),
+        ),
     )
     __mapper_args__ = {"eager_defaults": True}  # noqa: RUF012
 
@@ -91,6 +105,11 @@ class Endpoint(TimestampMixin, Base):
     timeout_ms: Mapped[int] = mapped_column(Integer, nullable=False, server_default=text("10000"))
     # AES-256-GCM ciphertext (see hookrelay.core.security.SecretBox), bound to tenant+endpoint.
     secret_ciphertext: Mapped[str] = mapped_column(Text, nullable=False)
+    # Secret rotation (Milestone 5): the replaced secret keeps signing (as a second ``v1,``
+    # signature) until previous_secret_expires_at; same AAD, moved rather than re-encrypted.
+    previous_secret_ciphertext: Mapped[str | None] = mapped_column(Text)
+    previous_secret_expires_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    secret_rotated_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     version: Mapped[int] = mapped_column(Integer, nullable=False, server_default=text("1"))
     deleted_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     # Back-pressure (Milestone 4): NULL means "no rate limit" / "the deployment default cap".

@@ -52,7 +52,13 @@ class Event(Base):
             ["event_types.tenant_id", "event_types.name"],
             name="fk_events_event_type_same_tenant",
         ),
-        CheckConstraint("jsonb_typeof(payload) = 'object'", name="payload_object"),
+        CheckConstraint(
+            "payload IS NULL OR jsonb_typeof(payload) = 'object'", name="payload_object"
+        ),
+        # The retention job drops payloads (Milestone 5); NULL exactly when it did.
+        CheckConstraint(
+            "(payload IS NULL) = (payload_purged_at IS NOT NULL)", name="payload_iff_not_purged"
+        ),
         CheckConstraint("payload_size >= 2", name="payload_size_positive"),
         CheckConstraint(f"external_id ~ '{EXTERNAL_ID_PATTERN}'", name="external_id_format"),
         CheckConstraint("retain_until > created_at", name="retain_after_created"),
@@ -68,6 +74,13 @@ class Event(Base):
         Index("ix_events_tenant_type_created", "tenant_id", "event_type", "created_at", "id"),
         # Retention sweeps (and later time partitioning) walk this index.
         Index("ix_events_retain_until", "retain_until"),
+        # Payload retention scans unpurged events oldest first.
+        Index(
+            "ix_events_payload_unpurged",
+            "created_at",
+            "id",
+            postgresql_where=text("payload_purged_at IS NULL"),
+        ),
     )
     __mapper_args__ = {"eager_defaults": True}  # noqa: RUF012
 
@@ -79,7 +92,9 @@ class Event(Base):
     )
     event_type: Mapped[str] = mapped_column(String(MAX_EVENT_TYPE_LENGTH), nullable=False)
     external_id: Mapped[str | None] = mapped_column(String(MAX_EXTERNAL_ID_LENGTH))
-    payload: Mapped[dict[str, Any]] = mapped_column(JSONB, nullable=False)
+    # NULL once EVENT_PAYLOAD_RETENTION_DAYS passed and the retention job purged it.
+    payload: Mapped[dict[str, Any] | None] = mapped_column(JSONB)
+    payload_purged_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     payload_size: Mapped[int] = mapped_column(Integer, nullable=False)
     idempotency_key: Mapped[str | None] = mapped_column(String(MAX_IDEMPOTENCY_KEY_LENGTH))
     occurred_at: Mapped[datetime] = mapped_column(

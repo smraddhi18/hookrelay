@@ -55,6 +55,12 @@ class DeliveryAttempt(Base):
             ondelete="CASCADE",
             name="fk_delivery_attempts_delivery_same_tenant",
         ),
+        ForeignKeyConstraint(
+            ["tenant_id", "endpoint_id"],
+            ["endpoints.tenant_id", "endpoints.id"],
+            ondelete="CASCADE",
+            name="fk_delivery_attempts_endpoint_same_tenant",
+        ),
         UniqueConstraint("delivery_id", "attempt_number", name="uq_delivery_attempts_number"),
         CheckConstraint(f"outcome IN ({_OUTCOMES})", name="outcome_valid"),
         CheckConstraint("attempt_number >= 1", name="attempt_number_positive"),
@@ -83,6 +89,20 @@ class DeliveryAttempt(Base):
         # GET /v1/deliveries/{id}/attempts: keyset pages within one delivery.
         Index("ix_delivery_attempts_delivery_created", "delivery_id", "created_at", "id"),
         Index("ix_delivery_attempts_tenant_created", "tenant_id", "created_at", "id"),
+        # Endpoint health summary (Milestone 5): an index-only scan of the newest attempts, and
+        # "last error" without walking past every success.
+        Index(
+            "ix_delivery_attempts_endpoint_created",
+            "endpoint_id",
+            "created_at",
+            postgresql_include=["outcome", "latency_ms", "error_class"],
+        ),
+        Index(
+            "ix_delivery_attempts_endpoint_errors",
+            "endpoint_id",
+            "created_at",
+            postgresql_where=text("outcome <> 'succeeded'"),
+        ),
     )
     __mapper_args__ = {"eager_defaults": True}  # noqa: RUF012
 
@@ -93,6 +113,8 @@ class DeliveryAttempt(Base):
         UUID(as_uuid=True), ForeignKey("tenants.id", ondelete="CASCADE"), nullable=False
     )
     delivery_id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), nullable=False)
+    # Copied from the parent delivery by a BEFORE INSERT trigger (migration 0009).
+    endpoint_id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), nullable=False)
     attempt_number: Mapped[int] = mapped_column(Integer, nullable=False)
     outcome: Mapped[str] = mapped_column(String(16), nullable=False)
     status_code: Mapped[int | None] = mapped_column(Integer)

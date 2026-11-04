@@ -46,6 +46,7 @@ from sqlalchemy.dialects.postgresql import UUID
 from sqlalchemy.orm import Mapped, mapped_column
 
 from hookrelay.db.base import Base, TimestampMixin
+from hookrelay.db.models.event_type import MAX_EVENT_TYPE_LENGTH
 
 
 class DeliveryStatus(StrEnum):
@@ -140,6 +141,10 @@ class Delivery(TimestampMixin, Base):
         Index("ix_deliveries_endpoint_created", "endpoint_id", "created_at", "id"),
         Index("ix_deliveries_tenant_created", "tenant_id", "created_at", "id"),
         Index("ix_deliveries_retain_until", "retain_until"),
+        # GET /v1/deliveries search (Milestone 5); the endpoint filter uses
+        # ix_deliveries_endpoint_created.
+        Index("ix_deliveries_tenant_status_created", "tenant_id", "status", "created_at", "id"),
+        Index("ix_deliveries_tenant_type_created", "tenant_id", "event_type", "created_at", "id"),
     )
     __mapper_args__ = {"eager_defaults": True}  # noqa: RUF012
 
@@ -151,6 +156,9 @@ class Delivery(TimestampMixin, Base):
     )
     event_id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), nullable=False)
     endpoint_id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), nullable=False)
+    # Copied from the (immutable) event by a BEFORE INSERT trigger (migration 0009), so delivery
+    # search can filter on it without a join; whatever a writer passes is overwritten.
+    event_type: Mapped[str] = mapped_column(String(MAX_EVENT_TYPE_LENGTH), nullable=False)
     status: Mapped[str] = mapped_column(
         String(16), nullable=False, server_default=text("'pending'")
     )
