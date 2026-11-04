@@ -8,7 +8,8 @@ Every delivery carries three headers:
   ones, which bounds replay of a captured request);
 * ``webhook-signature``: ``v1,<base64(HMAC-SHA256(key, "{id}.{timestamp}.{body}"))>``, where
   ``key`` is the base64-decoded part of the ``whsec_...`` endpoint secret. Several
-  space-separated signatures may be present (secret rotation in a later milestone).
+  space-separated signatures may be present: during a secret rotation's overlap window the
+  sender signs with the new and the previous secret, and a receiver holding either verifies.
 
 This module has no hookrelay dependencies beyond the standard library, so a receiver written in
 Python can vendor it as-is; :func:`verify` is the receiver-side helper.
@@ -70,14 +71,19 @@ def compute_signature(key: bytes, webhook_id: str, timestamp: int, body: bytes) 
     return base64.b64encode(hmac.new(key, to_sign, hashlib.sha256).digest()).decode()
 
 
-def sign(secret: str, webhook_id: str, timestamp: int, body: bytes) -> SignedHeaders:
-    """Headers for one delivery attempt of ``body`` signed with ``secret``."""
+def sign(
+    secret: str, webhook_id: str, timestamp: int, body: bytes, *extra_secrets: str
+) -> SignedHeaders:
+    """Headers for one delivery attempt of ``body`` signed with ``secret`` (and, space-separated
+    after it, with every secret in ``extra_secrets``, e.g. the previous one during a
+    rotation's overlap window)."""
     if not webhook_id or any(c in webhook_id for c in " .,\r\n"):
         raise ValueError("webhook id must be non-empty and contain no spaces, dots or commas")
-    signature = compute_signature(decode_secret(secret), webhook_id, timestamp, body)
-    return SignedHeaders(
-        webhook_id=webhook_id, timestamp=timestamp, signature=f"{SIGNATURE_VERSION},{signature}"
-    )
+    signatures = [
+        f"{SIGNATURE_VERSION},{compute_signature(decode_secret(s), webhook_id, timestamp, body)}"
+        for s in (secret, *extra_secrets)
+    ]
+    return SignedHeaders(webhook_id=webhook_id, timestamp=timestamp, signature=" ".join(signatures))
 
 
 def _header(headers: Mapping[str, str], name: str) -> str:

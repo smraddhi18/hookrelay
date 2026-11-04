@@ -209,6 +209,25 @@ class Settings(BaseSettings):
     notification_max_attempts: Annotated[int, Field(ge=1, le=100)] = 10
     notification_retention_s: Annotated[int, Field(ge=0, le=90 * 86_400)] = 7 * 86_400
 
+    # Operability for tenants (Milestone 5).
+    # Signing-secret rotation: how long the replaced secret keeps signing alongside the new
+    # one (a second v1 signature) by default, and the longest overlap a tenant may ask for.
+    endpoint_secret_rotation_overlap_s: Annotated[int, Field(ge=0, le=30 * 86_400)] = 86_400
+    endpoint_secret_max_overlap_s: Annotated[int, Field(ge=0, le=30 * 86_400)] = 7 * 86_400
+    # Endpoint health summary: default and widest window, and the most recent attempts it
+    # reads at most (bounded work per request; the response says when it sampled).
+    endpoint_health_default_window_s: Annotated[int, Field(ge=60, le=30 * 86_400)] = 86_400
+    endpoint_health_max_window_s: Annotated[int, Field(ge=60, le=30 * 86_400)] = 7 * 86_400
+    endpoint_health_max_attempts: Annotated[int, Field(ge=100, le=1_000_000)] = 10_000
+    # Payload retention: drop event payloads (and stored response bodies) this many days after
+    # the event once every delivery is terminal; 0 keeps them until EVENT_RETENTION_DAYS.
+    event_payload_retention_days: Annotated[int, Field(ge=0, le=3_650)] = 0
+    # Retention job (python -m hookrelay.retention, and one bounded pass per relay
+    # housekeeping run): rows per batch transaction, batches per task per run, pause between.
+    retention_batch_size: Annotated[int, Field(ge=1, le=10_000)] = 500
+    retention_max_batches: Annotated[int, Field(ge=1, le=100_000)] = 200
+    retention_batch_pause_ms: Annotated[int, Field(ge=0, le=60_000)] = 50
+
     @field_validator("database_url", mode="before")
     @classmethod
     def _normalize_db_url(cls, value: object) -> object:
@@ -310,6 +329,29 @@ class Settings(BaseSettings):
         if self.breaker_cooldown_base_s > self.breaker_cooldown_max_s:
             raise ValueError("BREAKER_COOLDOWN_BASE_S must not exceed BREAKER_COOLDOWN_MAX_S")
         return self
+
+    @model_validator(mode="after")
+    def _check_operability(self) -> Self:
+        if self.endpoint_secret_rotation_overlap_s > self.endpoint_secret_max_overlap_s:
+            raise ValueError(
+                "ENDPOINT_SECRET_ROTATION_OVERLAP_S must not exceed ENDPOINT_SECRET_MAX_OVERLAP_S"
+            )
+        if self.endpoint_health_default_window_s > self.endpoint_health_max_window_s:
+            raise ValueError(
+                "ENDPOINT_HEALTH_DEFAULT_WINDOW_S must not exceed ENDPOINT_HEALTH_MAX_WINDOW_S"
+            )
+        days = self.event_payload_retention_days
+        if days and days >= self.event_retention_days:
+            raise ValueError(
+                "EVENT_PAYLOAD_RETENTION_DAYS must be less than EVENT_RETENTION_DAYS "
+                "(or 0 to keep payloads until the event expires)"
+            )
+        return self
+
+    @property
+    def event_payload_retention_s(self) -> int | None:
+        """Payload retention in seconds, or None when payloads live as long as the event."""
+        return self.event_payload_retention_days * 86_400 or None
 
     @model_validator(mode="after")
     def _check_relay_polling(self) -> Self:
