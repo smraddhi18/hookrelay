@@ -110,6 +110,19 @@ def render_body(delivery: LeasedDelivery) -> bytes:
     ).encode()
 
 
+def _local_failure(error_class: ErrorClass, message: str) -> SendResult:
+    """An attempt that failed before any request was sent."""
+    return SendResult(
+        status_code=None,
+        error_class=error_class,
+        error_message=truncate_message(message),
+        latency_ms=None,
+        response_body=None,
+        response_truncated=False,
+        retry_after_s=None,
+    )
+
+
 def loggable_headers(headers: dict[str, str], custom: dict[str, str]) -> dict[str, str]:
     """What the attempt log stores: custom header values masked, the signature redacted."""
     custom_names = {name.lower() for name in custom}
@@ -239,9 +252,34 @@ class Worker:
 
     # -- one attempt ------------------------------------------------------------------------
 
-    def _build_request(self, delivery: LeasedDelivery, secret: str) -> WebhookRequest:
+    def _previous_secret(self, delivery: LeasedDelivery) -> tuple[str, ...]:
+        """The replaced secret during a rotation's overlap window, as extra signing keys.
+
+        Best effort: if it cannot be decrypted (e.g. its encryption key was retired) the
+        attempt is still signed with the current secret, which receivers must move to anyway.
+        """
+        if delivery.previous_secret_ciphertext is None:
+            return ()
+        try:
+            return (
+                self._secrets.decrypt(
+                    delivery.previous_secret_ciphertext,
+                    aad=secret_aad(delivery.tenant_id, delivery.endpoint_id),
+                ),
+            )
+        except SecretDecryptionError as exc:
+            logger.warning(
+                "worker.previous_secret_unavailable",
+                endpoint_id=str(delivery.endpoint_id),
+                error=str(exc),
+            )
+            return ()
+
+    def _build_request(
+        self, delivery: LeasedDelivery, secret: str, *previous: str
+    ) -> WebhookRequest:
         body = render_body(delivery)
-        signed = sign(secret, str(delivery.event_id), int(time.time()), body)
+        signed = sign(secret, str(delivery.event_id), int(time.time()), body, *previous)
         headers = {
             **delivery.headers,
             "content-type": CONTENT_TYPE,
@@ -255,25 +293,33 @@ class Worker:
     async def attempt(self, delivery: LeasedDelivery) -> AttemptRecord:
         """Sign and send one attempt; never raises for receiver or network failures."""
         started = datetime.now(UTC)
+        if delivery.payload is None:
+            # The retention policy purged the payload (a replay raced the purge): there is
+            # nothing to send, and retrying cannot help.
+            result = _local_failure(ErrorClass.PAYLOAD_PURGED, "event payload was purged")
+            return self._record(delivery, result, {}, started)
         try:
             secret = self._secrets.decrypt(
                 delivery.secret_ciphertext, aad=secret_aad(delivery.tenant_id, delivery.endpoint_id)
             )
         except SecretDecryptionError as exc:
-            result = SendResult(
-                status_code=None,
-                error_class=ErrorClass.SECRET_UNAVAILABLE,
-                error_message=truncate_message(f"signing secret unavailable: {exc}"),
-                latency_ms=None,
-                response_body=None,
-                response_truncated=False,
-                retry_after_s=None,
+            result = _local_failure(
+                ErrorClass.SECRET_UNAVAILABLE, f"signing secret unavailable: {exc}"
             )
             headers: dict[str, str] = {}
         else:
-            request = self._build_request(delivery, secret)
+            request = self._build_request(delivery, secret, *self._previous_secret(delivery))
             headers = loggable_headers(dict(request.headers), delivery.headers)
             result = await self.sender.send(request, now=started)
+        return self._record(delivery, result, headers, started)
+
+    def _record(
+        self,
+        delivery: LeasedDelivery,
+        result: SendResult,
+        headers: dict[str, str],
+        started: datetime,
+    ) -> AttemptRecord:
         retryable = result.error_class is not None and is_retryable_error(
             result.error_class, result.status_code
         )

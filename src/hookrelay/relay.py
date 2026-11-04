@@ -38,6 +38,7 @@ from hookrelay.core.config import Settings, get_settings
 from hookrelay.core.logging import configure_logging, redact_text
 from hookrelay.db.engine import Database
 from hookrelay.services import fanout, housekeeping, notifications
+from hookrelay.services.retention import RetentionPolicy, RetentionRunner
 
 logger = structlog.stdlib.get_logger("hookrelay.relay")
 
@@ -62,6 +63,8 @@ class RelayStats:
     purged_events: int = 0
     purged_notifications: int = 0
     purged_replay_requests: int = 0
+    purged_payloads: int = 0
+    cleared_previous_secrets: int = 0
     notifications_sent: int = 0
     notifications_failed: int = 0
     notifications_abandoned: int = 0
@@ -166,7 +169,8 @@ class Relay:
 
     async def housekeep(self) -> housekeeping.SweepResult:
         """Purge expired idempotency keys, old processed outbox rows, expired events, old
-        dispatched notifications and old replay audit rows."""
+        dispatched notifications and old replay audit rows; then one bounded retention pass
+        (payloads past EVENT_PAYLOAD_RETENTION_DAYS, ended secret overlaps)."""
         totals = dict.fromkeys(
             ("idempotency_keys", "outbox_rows", "events", "notifications", "replay_requests"), 0
         )
@@ -190,8 +194,26 @@ class Relay:
         self.stats.purged_events += total.events
         self.stats.purged_notifications += total.notifications
         self.stats.purged_replay_requests += total.replay_requests
-        if total.total:
-            logger.info("relay.housekeeping", **asdict(total))
+        retention = await RetentionRunner(
+            self.database,
+            RetentionPolicy(
+                batch_size=self.settings.retention_batch_size,
+                max_batches=HOUSEKEEPING_MAX_ROUNDS,
+                payload_retention_s=self.settings.event_payload_retention_s,
+                expire_events=False,  # the sweep above already did
+            ),
+            should_stop=lambda: self.stopping,
+        ).run()
+        self.stats.purged_payloads += retention.payloads
+        self.stats.cleared_previous_secrets += retention.previous_secrets
+        if total.total or retention.total:
+            logger.info(
+                "relay.housekeeping",
+                **asdict(total),
+                payloads=retention.payloads,
+                responses_scrubbed=retention.responses_scrubbed,
+                previous_secrets=retention.previous_secrets,
+            )
         return total
 
     async def notify_once(self) -> notifications.DispatchResult:
