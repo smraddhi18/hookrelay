@@ -14,8 +14,8 @@ It is built milestone by milestone with production habits: typed config, structu
 migrations with downgrade paths, tests against real Postgres, containers and CI from day one.
 See the **[roadmap](ROADMAP.md)** for the plan and progress log.
 
-> **Status:** Milestones 0 (foundation), 1 (tenancy), 2 (ingestion), 3 (delivery workers) and
-> 4 (back-pressure and failure isolation) are complete. Tenants authenticate with hashed, role-scoped API keys, manage endpoints, event types
+> **Status:** Milestones 0 (foundation), 1 (tenancy), 2 (ingestion), 3 (delivery workers),
+> 4 (back-pressure and failure isolation) and 5 (operability for tenants) are complete. Tenants authenticate with hashed, role-scoped API keys, manage endpoints, event types
 > and wildcard subscriptions, and publish events through `POST /v1/events` with `Idempotency-Key`
 > support. Each event and its outbox row commit in one transaction; a relay process fans the
 > outbox out into exactly one `delivery` per (event, endpoint); and delivery workers lease due
@@ -25,7 +25,9 @@ See the **[roadmap](ROADMAP.md)** for the plan and progress log.
 > state). Every endpoint has a Postgres-persisted circuit breaker, an in-flight cap and an
 > optional rate limit enforced at lease time, so one broken receiver cannot starve the others;
 > endpoints failing for days are auto-disabled with an operator notification, and finished
-> deliveries can be replayed singly, per event or in bulk.
+> deliveries can be replayed singly, per event or in bulk. Tenants rotate signing secrets with a
+> dual-signing overlap window, search their delivery log, read a per-endpoint health summary, and
+> a bounded, concurrent-safe retention job drops old payloads and ended secret overlaps.
 
 ## Features
 
@@ -59,7 +61,10 @@ See the **[roadmap](ROADMAP.md)** for the plan and progress log.
 | Isolation | Dead-letter state: retries exhausted (attempts or age, per run) → `dead`; permanent errors stay `failed`; the reaper dead-letters expired leases on the last attempt | ✅ M4 |
 | Isolation | Auto-disable after sustained failure (`ENDPOINT_AUTO_DISABLE_AFTER_S`) with an `endpoint.disabled` notification in a transactional notification outbox, dispatched by the relay with retries; re-enabling resets the breaker | ✅ M4 |
 | Isolation | Replay API: one delivery, an event's deliveries, or a bulk time window + filters (admin); fresh retry budget, same `webhook-id`; `Idempotency-Key`, per-tenant rate limit (`429` + `Retry-After`), capped batches with `has_more`, audit trail `GET /v1/replays` | ✅ M4 |
-| Operability | Secret rotation (dual signing), delivery log search, endpoint health | 🔜 M5 |
+| Operability | Signing-secret rotation with a dual-signing overlap window (both secrets sign, space-separated `v1,` signatures), `If-Match` required, bring-your-own secret, early end of the overlap; the previous secret stays AES-256-GCM-encrypted | ✅ M5 |
+| Operability | Delivery log search `GET /v1/deliveries`: status (any of several), event type, endpoint, `[created_after, created_before)`; keyset pagination served by dedicated indexes | ✅ M5 |
+| Operability | Endpoint health `GET /v1/endpoints/{id}/health`: success rate, p50 / p95 / p99 latency, errors by class, last error, breaker state, backlog; bounded window and sample | ✅ M5 |
+| Operability | Payload retention (`EVENT_PAYLOAD_RETENTION_DAYS`) + cleanup job: batched, budgeted, `SKIP LOCKED`, never purges a payload still being delivered; runs in relay housekeeping or as `hookrelay-retention` | ✅ M5 |
 | Redis | Worker wake-ups, cached lookups, token buckets | 🔜 M6 |
 | Observability | Prometheus metrics, OpenTelemetry tracing, dashboard API | 🔜 M7 |
 | Scale | k6/locust load tests, chaos tests, capacity plan | 🔜 M8 |
@@ -302,6 +307,47 @@ flowchart LR
     CI --> ES
 ```
 
+### Operability for tenants (Milestone 5)
+
+```mermaid
+flowchart LR
+    subgraph API["API"]
+        RS["POST /v1/endpoints/{id}/secret/rotate<br/>(admin, If-Match)"]
+        EO["DELETE /v1/endpoints/{id}/secret/previous"]
+        SR["GET /v1/deliveries<br/>status, event_type, endpoint, time"]
+        HL["GET /v1/endpoints/{id}/health<br/>window_s"]
+    end
+
+    subgraph PG["Postgres 16"]
+        EPT[(endpoints<br/>secret + previous secret<br/>+ overlap expiry)]
+        DL[(deliveries<br/>+ event_type via trigger)]
+        DA[(delivery_attempts<br/>+ endpoint_id via trigger)]
+        EV[(events<br/>payload / payload_purged_at)]
+        ES[(endpoint_states)]
+    end
+
+    subgraph Worker["Delivery worker"]
+        LS["lease: secret + unexpired<br/>previous secret"]
+        SG["sign with both:<br/>v1,new v1,old"]
+    end
+
+    subgraph Ret["Retention (relay housekeeping<br/>or hookrelay-retention)"]
+        PP["purge payloads<br/>SKIP LOCKED events,<br/>FOR SHARE deliveries"]
+        XS["clear ended overlaps"]
+    end
+
+    RS -->|"version = If-Match:<br/>current → previous"| EPT
+    EO --> EPT
+    EPT --> LS --> SG --> RCV["Receiver<br/>(either secret verifies)"]
+    SR -->|"(tenant, status or type, created_at, id)<br/>or (endpoint, created_at, id) indexes"| DL
+    HL -->|"index-only scan,<br/>capped sample"| DA
+    HL --> ES
+    HL -->|"capped count"| DL
+    PP -->|"all deliveries settled"| EV
+    PP -->|"scrub response bodies"| DA
+    XS --> EPT
+```
+
 ### Request flow (with auth)
 
 1. `RequestContextMiddleware` (pure ASGI) reads `X-Request-ID`. A caller-supplied ID is kept only
@@ -432,6 +478,38 @@ flowchart LR
    `REPLAY_RATE_LIMIT_PER_MINUTE`), replays at most `REPLAY_MAX_DELIVERIES` (`has_more` says
    whether to call again) and writes its audit row, all in one transaction with the
    `Idempotency-Key` record.
+
+### Operability flows (Milestone 5)
+
+1. **Rotate.** `POST /v1/endpoints/{id}/secret/rotate` (admin, `If-Match` required, body optional:
+   `overlap_s`, `secret`) is one conditional `UPDATE ... WHERE version = :expected RETURNING`: the
+   current ciphertext moves to `previous_secret_ciphertext` (moved, never decrypted; it stays bound
+   to the tenant + endpoint AAD), the new secret is encrypted in the same statement, and
+   `previous_secret_expires_at = now() + overlap_s`. The response shows the new secret once
+   (`Cache-Control: no-store`) with the new `ETag`.
+2. **Dual signing.** The lease returns the previous ciphertext only while it is unexpired; the
+   worker signs each attempt with both secrets (`webhook-signature: v1,<new> v1,<old>`), so a
+   receiver holding either verifies. The attempt log stores `v1,[redacted]` per signature. If the
+   old secret cannot be decrypted the attempt is signed with the new one only (logged).
+3. **End the overlap.** When the receiver has deployed the new secret, `DELETE
+   .../secret/previous` stops dual signing at once (idempotent, `If-Match` optional); otherwise the
+   lease ignores it after `previous_secret_expires_at` and retention clears the ciphertext.
+4. **Search.** `GET /v1/deliveries?status=failed&status=dead&event_type=invoice.paid&endpoint_id=...
+   &created_after=...&created_before=...` (reader) returns deliveries newest first with the same
+   keyset cursor as every list. The tenant predicate is always applied, so another tenant's
+   endpoint id simply matches nothing.
+5. **Health.** `GET /v1/endpoints/{id}/health?window_s=3600` (reader) aggregates the newest
+   `ENDPOINT_HEALTH_MAX_ATTEMPTS` attempts of the window in one statement (`count FILTER`,
+   `percentile_cont`), adds the most recent failed attempt (any time), the breaker row and the
+   pending backlog (counted up to a cap).
+6. **Retention.** For events older than `EVENT_PAYLOAD_RETENTION_DAYS`, a batch takes up to
+   `RETENTION_BATCH_SIZE` unpurged events in `(created_at, id)` order with `FOR UPDATE SKIP LOCKED`,
+   share-locks their deliveries (waiting for workers and replays that hold them), skips events with
+   a delivery still `pending` / `delivering` or not yet fanned out, sets `payload = NULL,
+   payload_purged_at = now()` and scrubs stored response bodies of their attempts. Each batch is its
+   own short transaction; the cursor moves past skipped rows, the run stops at a short batch, at
+   `RETENTION_MAX_BATCHES` (exit code 3 for the CLI) or on `SIGTERM`. Ended secret overlaps are
+   cleared the same way. Deliveries and attempts themselves still live until `retain_until`.
 
 ## Design decisions and trade-offs
 
@@ -640,6 +718,45 @@ flowchart LR
   delivers it later with retries. The default notifier logs a structured `WARNING`; a pager or
   email notifier implements one `send()` method.
 
+### Milestone 5 decisions
+
+- **Dual signing over "accept both" on our side.** The receiver is the verifier, so the only way to
+  rotate without dropping messages is to sign with both secrets for a while (Standard Webhooks
+  allows several signatures). The window is bounded (`ENDPOINT_SECRET_MAX_OVERLAP_S`, 7 days by
+  default) and at most two secrets ever sign: rotating during an overlap replaces the previous one.
+- **`If-Match` is required on rotate.** A blindly retried rotate would replace the secret the client
+  just received and push the one the receiver still uses out of the overlap. `If-Match: *` opts out
+  explicitly; concurrent rotations with one ETag yield exactly one `200` and `412` for the rest.
+- **Expiry is enforced at read time, cleanup is lazy.** The lease ignores an expired previous secret,
+  so correctness never depends on the cleanup job; retention clears the ciphertext later without a
+  version bump (a dead secret signs nothing, so the representation did not change).
+- **Denormalised `event_type` and `endpoint_id`, set by triggers.** Search by event type and health per
+  endpoint would otherwise join `events` / `deliveries` for every row. Both are immutable, so a
+  `BEFORE INSERT` trigger copies them and writers cannot get them wrong; same-tenant composite FKs
+  still reject cross-tenant rows. The cost is a PK lookup per insert.
+- **One index per filter, not one per combination.** `(tenant_id, status, created_at, id)`,
+  `(tenant_id, event_type, created_at, id)` and `(endpoint_id, created_at, id)` each give an ordered
+  walk without a sort; combined filters use the most selective one and filter the rest. Covering
+  every combination would cost write amplification on the hottest table.
+- **Health is computed on read, bounded.** No rollup table to keep consistent: a covering index
+  `(endpoint_id, created_at) INCLUDE (outcome, latency_ms, error_class)` makes the aggregate an
+  index-only scan, the window is capped (`ENDPOINT_HEALTH_MAX_WINDOW_S`), the sample is capped
+  (`ENDPOINT_HEALTH_MAX_ATTEMPTS`, newest first, flagged `sampled`) and the backlog count is capped.
+  M7's dashboard rollups are the step for fleet-wide views.
+- **Retention never races a delivery.** Events are claimed `SKIP LOCKED` (concurrent runners split the
+  work) and their deliveries share-locked through a `MATERIALIZED` CTE, so a worker completing or a
+  replay re-queueing a delivery is waited for and then seen. Without the CTE the planner pushes the
+  status filter into the locking scan and a `dead` delivery being replayed is neither locked nor
+  waited for; a concurrency test caught exactly that. A purged event cannot be replayed (`409
+  payload_purged`; bulk replays skip it), and a worker that still meets one fails it
+  `payload_purged`: terminal, no request sent, neutral for the breaker.
+- **Payload, not history.** Retention drops payloads and response bodies (the potentially sensitive
+  part) but keeps events, deliveries and attempt metadata until `retain_until`, so the delivery log
+  and health stay accurate. `EVENT_PAYLOAD_RETENTION_DAYS` must be below `EVENT_RETENTION_DAYS`.
+- **Bounded batches over one big `UPDATE`.** Short transactions keep row locks and WAL bursts small,
+  a pause between batches gives replicas and autovacuum room, and a batch budget makes every run
+  finish; the CLI exits `3` when there is more to do so a CronJob can alert or run again.
+
 ## Getting started
 
 ### Prerequisites
@@ -782,6 +899,11 @@ All settings are environment variables (or `.env`), validated at startup. See
 | `REPLAY_MAX_DELIVERIES` / `REPLAY_MAX_WINDOW_S` | `1000` / `604800` | deliveries per replay request (`has_more`) / widest bulk window |
 | `NOTIFICATION_POLL_INTERVAL_S` / `NOTIFICATION_MAX_ATTEMPTS` | `5` / `10` | relay dispatch cadence / attempts before a notification is `abandoned` |
 | `NOTIFICATION_RETENTION_S` | `604800` | dispatched / abandoned notifications and replay audit rows are purged after this |
+| `ENDPOINT_SECRET_ROTATION_OVERLAP_S` / `ENDPOINT_SECRET_MAX_OVERLAP_S` | `86400` / `604800` | default dual-signing overlap after a secret rotation / the most a tenant may ask for (default ≤ max enforced) |
+| `ENDPOINT_HEALTH_DEFAULT_WINDOW_S` / `ENDPOINT_HEALTH_MAX_WINDOW_S` | `86400` / `604800` | health summary look-back default / cap (default ≤ max enforced) |
+| `ENDPOINT_HEALTH_MAX_ATTEMPTS` | `10000` | newest attempts aggregated per health request (`sampled: true` beyond) |
+| `EVENT_PAYLOAD_RETENTION_DAYS` | `0` | drop event payloads (and stored response bodies) this long after the event once every delivery is settled; must be `< EVENT_RETENTION_DAYS`; `0` = keep until the event expires |
+| `RETENTION_BATCH_SIZE` / `RETENTION_MAX_BATCHES` / `RETENTION_BATCH_PAUSE_MS` | `500` / `200` / `50` | rows per retention transaction / batches per task per run / pause between batches |
 
 ## API
 
@@ -818,6 +940,9 @@ Interactive docs: `/docs` (Swagger UI), `/redoc`, schema at `/openapi.json` (dis
 | `PATCH` | `/v1/endpoints/{endpoint_id}` | Partial update, **requires `If-Match`**; incl. `max_in_flight` / `rate_limit_per_s` (`null` = default / unlimited); re-enabling an auto-disabled endpoint resets its breaker | admin |
 | `DELETE` | `/v1/endpoints/{endpoint_id}` | Soft delete + remove subscriptions (`If-Match` optional) | admin |
 | `GET` | `/v1/endpoints/{endpoint_id}/secret` | Reveal the signing secret (audited, `no-store`) | admin |
+| `POST` | `/v1/endpoints/{endpoint_id}/secret/rotate` | Rotate the signing secret, **requires `If-Match`**; body optional: `overlap_s` (dual signing, `0` = cutover), `secret` (bring your own `whsec_`); returns the new secret once, `previous_secret_expires_at`, `ETag` | admin |
+| `DELETE` | `/v1/endpoints/{endpoint_id}/secret/previous` | End the overlap now: stop signing with the previous secret (idempotent, `If-Match` optional) | admin |
+| `GET` | `/v1/endpoints/{endpoint_id}/health` | Health over `?window_s=` (default `ENDPOINT_HEALTH_DEFAULT_WINDOW_S`): attempts by outcome, `success_rate`, p50 / p95 / p99 latency, `errors_by_class`, `last_error`, `last_success_at`, breaker, backlog | reader |
 | `GET` / `POST` | `/v1/event-types` | List (`?include_archived=`) / register | reader / publisher |
 | `GET` / `PATCH` | `/v1/event-types/{name}` | Get / update description or archive (`If-Match`) | reader / publisher |
 | `GET` / `POST` | `/v1/endpoints/{endpoint_id}/subscriptions` | List / subscribe to `invoice.paid`, `invoice.*` or `*` | reader / admin |
@@ -827,6 +952,7 @@ Interactive docs: `/docs` (Swagger UI), `/redoc`, schema at `/openapi.json` (dis
 | `GET` | `/v1/events` | List events, newest first (`?event_type=`, `?created_after=`, `?created_before=`), without payloads | reader |
 | `GET` | `/v1/events/{event_id}` | Get an event with its payload and `payload_size` | reader |
 | `GET` | `/v1/events/{event_id}/deliveries` | Deliveries created for the event (status, attempts, next attempt, last result) | reader |
+| `GET` | `/v1/deliveries` | Search the delivery log, newest first: `?status=` (repeatable), `?event_type=`, `?endpoint_id=`, `?created_after=` (inclusive), `?created_before=` (exclusive); keyset cursor | reader |
 | `GET` | `/v1/deliveries/{delivery_id}` | One delivery: status, `attempt_count`, `next_attempt_at`, `last_status_code`, `last_error_class` | reader |
 | `GET` | `/v1/deliveries/{delivery_id}/attempts` | Attempt log, newest first: outcome, status code, error class, latency, masked request headers, truncated response | reader |
 | `GET` | `/v1/endpoints/{endpoint_id}/circuit` | Breaker state, failure streak, `open_until`, trips, in-flight vs. effective `max_in_flight`, `rate_limit_per_s`, `auto_disabled_at` | reader |
@@ -904,14 +1030,45 @@ HTTP/1.1 202 Accepted
 
 `has_more: true` means the cap was hit; call again (with a new key) for the next batch.
 
+Example: rotating an endpoint's signing secret with a one-day overlap.
+
+```http
+POST /v1/endpoints/0d3c8a6e-.../secret/rotate
+Authorization: Bearer hrk_3k9x0q7m2p1a_...
+If-Match: "3"
+Content-Type: application/json
+
+{"overlap_s": 86400}
+```
+
+```http
+HTTP/1.1 200 OK
+ETag: "4"
+Cache-Control: no-store
+
+{"endpoint_id": "0d3c8a6e-...", "signing_secret": "whsec_...", "rotated_at": "2026-11-04T10:00:00Z",
+ "previous_secret_expires_at": "2026-11-05T10:00:00Z", "version": 4}
+```
+
+Until `previous_secret_expires_at` every attempt carries `webhook-signature: v1,<new> v1,<old>`.
+Deploy the new secret to the receiver, then optionally `DELETE .../secret/previous`.
+
+Example: yesterday's failed and dead `invoice.paid` deliveries.
+
+```http
+GET /v1/deliveries?status=failed&status=dead&event_type=invoice.paid&created_after=2026-11-03T00:00:00Z&created_before=2026-11-04T00:00:00Z&limit=50
+Authorization: Bearer hrk_3k9x0q7m2p1a_...
+```
+
 Common error codes: `unauthorized`, `api_key_revoked`, `api_key_expired` (401); `insufficient_role`,
 `tenant_suspended`, `operator_api_disabled` (403); `*_not_found` (404, e.g. `delivery_not_found`); `tenant_slug_taken`,
 `endpoint_url_taken`, `event_type_exists`, `subscription_exists`, `api_key_already_rotated`,
-`event_exists`, `idempotency_key_in_progress`, `delivery_not_replayable`, `endpoint_unavailable` (409); `precondition_failed` (412);
+`event_exists`, `idempotency_key_in_progress`, `delivery_not_replayable`, `endpoint_unavailable`, `payload_purged` (409); `precondition_failed` (412);
 `request_too_large`, `payload_too_large` (413); `unsupported_media_type` (415);
 `invalid_endpoint_url`, `timeout_too_large`, `unknown_event_type`, `event_type_archived`,
 `occurred_at_in_future`, `idempotency_key_mismatch`, `max_in_flight_too_high`, `rate_limit_too_high`,
-`replay_window_required`, `invalid_replay_window`, `replay_window_too_large`, `validation_error` (422);
+`replay_window_required`, `invalid_replay_window`, `replay_window_too_large`, `overlap_too_long`,
+`invalid_signing_secret`, `invalid_time_range`, `window_too_large`, `validation_error` (422);
 `precondition_required` (428); `replay_rate_limited` (429, with `Retry-After`); `secret_unavailable` (500). `invalid_idempotency_key` is a `400`.
 
 Error format (all non-2xx responses):
@@ -945,7 +1102,8 @@ webhook-signature: v1,K5oZfzN95Z9UVu1EsfQmfVNQhnkZ2pj9o9NDN/H/pI4=
 The signature is `base64(HMAC-SHA256(secret, "{webhook-id}.{webhook-timestamp}.{raw body}"))`, where
 `secret` is the base64 part of the endpoint's `whsec_...` signing secret. Receivers should verify the
 **raw** bytes (never a re-serialised body), compare in constant time, reject timestamps more than
-5 minutes away, accept any of several space-separated signatures (secret rotation in M5), and
+5 minutes away, accept any of several space-separated signatures (during a secret rotation each
+attempt is signed with the new and the previous secret, so either verifies), and
 dedupe on `webhook-id` (delivery is at-least-once). `hookrelay.core.signing` is dependency-free
 (stdlib only) so receivers can vendor it:
 
@@ -985,6 +1143,7 @@ src/hookrelay/
   healthcheck.py        container HEALTHCHECK probe (stdlib only)
   relay.py              fan-out relay process (`python -m hookrelay.relay` / `hookrelay-relay`)
   worker.py             delivery worker process (`python -m hookrelay.worker` / `hookrelay-worker`)
+  retention.py          one bounded retention run (`python -m hookrelay.retention` / `hookrelay-retention`)
   api/
     deps.py             auth dependencies (operator token, API key → Principal, roles)
     contracts/          request/response models with OpenAPI examples
@@ -1000,15 +1159,18 @@ src/hookrelay/
                         delivery_queue (lease / renew / complete / reclaim / release SQL), delivery_policy
                         (classification, backoff, Retry-After), ssrf (address vetting + guarded backend),
                         webhook_client (httpx), deliveries (read API), circuit_breaker (breaker state
-                        machine + outcome recording), notifications (outbox + notifier), replays
-alembic/                async env + versioned migrations (0001 tenants ... 0008 back-pressure)
+                        machine + outcome recording), notifications (outbox + notifier), replays,
+                        endpoint_secrets (rotation), endpoint_health (summary), retention (payload
+                        purge + ended secret overlaps, batched runner); deliveries also holds search
+alembic/                async env + versioned migrations (0001 tenants ... 0009 tenant operability)
 tests/receiver.py       raw-asyncio HTTP receiver + fake resolver used by delivery tests
 tests/unit/             fast tests (fake database): config, security, rules, pagination, auth wiring audit,
                         signing vectors, backoff / Retry-After, SSRF ranges, HTTP client, worker helpers
 tests/integration/      real Postgres: migrations, schema constraints, full HTTP flows per resource,
                         idempotency races, concurrent relays and crash/replay, concurrent workers,
                         fencing, lease expiry, retries, SIGTERM drain, end-to-end signed delivery,
-                        breaker lifecycle, in-flight / rate limits, fairness, auto-disable, replays
+                        breaker lifecycle, in-flight / rate limits, fairness, auto-disable, replays,
+                        secret rotation, delivery search + health, retention races
 ```
 
 ## Scaling notes
@@ -1052,8 +1214,18 @@ tests/integration/      real Postgres: migrations, schema constraints, full HTTP
   for endpoints), so pagination stays O(page size) no matter how many rows a tenant has.
 - The fan-out lookup (`/v1/subscriptions/match` and the relay's fan-out query) uses `(tenant_id, event_type_pattern)` for
   exact matches; wildcard rows per tenant are few, and M6 caches the resolved set in Redis.
-- Hot tables (`deliveries`, `delivery_attempts`) are designed for time-based partitioning and
-  retention (M5/M8). Redis (M6) only accelerates. Losing it degrades latency, not correctness.
+- Delivery search walks one `(tenant_id, <filter>, created_at, id)` index in order, so a page costs
+  O(page size) for single filters; a combination with a rare second filter can scan more of the
+  first index (bounded by the time range). The health summary is an index-only scan over at most
+  `ENDPOINT_HEALTH_MAX_ATTEMPTS` rows of `ix_delivery_attempts_endpoint_created` plus a capped
+  backlog count; at very high attempt rates a per-minute rollup (M7) replaces it.
+- Retention cost is O(batch) per transaction: the candidate scan uses the partial
+  `ix_events_payload_unpurged` index, runners split the work with `SKIP LOCKED`, and the batch budget
+  and pause keep it from competing with deliveries. Purging payloads keeps `events` rows small
+  (TOASTed `jsonb` is most of their size) long before the rows themselves expire.
+- Hot tables (`deliveries`, `delivery_attempts`) are designed for time-based partitioning (M8), which
+  would turn expiry into dropping partitions. Redis (M6) only accelerates. Losing it degrades
+  latency, not correctness.
 
 ## Roadmap
 

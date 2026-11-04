@@ -50,19 +50,19 @@ Legend: `[x]` done, `[ ]` planned.
 - [x] Delivery-attempt log (status, latency, truncated response, error class)
 - [x] Graceful drain on SIGTERM (finish or release in-flight leases)
 
-## Milestone 4: Back-pressure and failure isolation
+## Milestone 4: Back-pressure and failure isolation ✅
 
 - [x] Per-endpoint circuit breaker (closed / open / half-open) persisted in Postgres
 - [x] Per-endpoint rate limits and max in-flight concurrency
 - [x] Dead-letter state after exhausted retries; endpoint auto-disable after sustained failure with notification hook
 - [x] Replay API: single delivery, by event, by time range / filter (rate-limited, idempotent)
 
-## Milestone 5: Operability for tenants
+## Milestone 5: Operability for tenants ✅
 
-- [ ] Endpoint secret rotation with dual-signing overlap window
-- [ ] Delivery log search (status, event type, endpoint, time range) with keyset pagination and indexes
-- [ ] Endpoint health summary (success rate, p50/p95 latency, last error, breaker state)
-- [ ] Message/payload retention policy and cleanup job
+- [x] Endpoint secret rotation with dual-signing overlap window
+- [x] Delivery log search (status, event type, endpoint, time range) with keyset pagination and indexes
+- [x] Endpoint health summary (success rate, p50/p95 latency, last error, breaker state)
+- [x] Message/payload retention policy and cleanup job
 
 ## Milestone 6: Redis
 
@@ -141,3 +141,14 @@ Legend: `[x]` done, `[ ]` planned.
 - New env vars `ENDPOINT_*_MAX_IN_FLIGHT`, `ENDPOINT_MAX_RATE_LIMIT_PER_S`, `BREAKER_*`, `ENDPOINT_AUTO_DISABLE_AFTER_S`, `REPLAY_*`, `NOTIFICATION_*`; compose passes the main ones to every service.
 - 803 tests (617 unit, 186 integration on Postgres 16), 98% line+branch coverage; ruff, ruff format, mypy strict, Alembic roundtrip + `alembic check` pass; the OpenAPI deny-by-default audit covers the new routes. Docker image build not re-verified locally (no Docker on the build host); CI's docker job covers it.
 - Next: Milestone 5 (operability for tenants: secret rotation with dual signing, delivery log search, endpoint health summary, retention policy).
+
+### 2026-11-04: Milestone 5 complete
+
+- Signing-secret rotation: `POST /v1/endpoints/{id}/secret/rotate` (admin, `If-Match` required, `*` to opt out; optional `overlap_s` up to `ENDPOINT_SECRET_MAX_OVERLAP_S` and bring-your-own `whsec_` secret of 24-64 bytes) moves the current ciphertext to `previous_secret_ciphertext` (never decrypted, same AAD) and encrypts the new one in one conditional `UPDATE`. Until `previous_secret_expires_at` the worker signs every attempt with both secrets (`v1,<new> v1,<old>`); the attempt log redacts each signature. At most two secrets sign; `DELETE /v1/endpoints/{id}/secret/previous` ends the overlap early (idempotent); an undecryptable previous secret falls back to single signing. Concurrent rotations with one ETag: exactly one wins.
+- Delivery log search: `GET /v1/deliveries` (reader) with repeatable `status`, `event_type`, `endpoint_id`, inclusive `created_after` / exclusive `created_before` (`422 invalid_time_range`), newest first with the shared keyset cursor. `deliveries.event_type` is denormalised by a `BEFORE INSERT` trigger and served by `(tenant_id, status, created_at, id)` / `(tenant_id, event_type, created_at, id)` indexes (EXPLAIN-tested: index scan, no sort).
+- Endpoint health: `GET /v1/endpoints/{id}/health?window_s=` (reader): attempts by outcome, success rate, p50 / p95 / p99 latency, errors by class, last error (any time), last success, breaker state and capped backlog, computed on read from an index-only scan over a covering `(endpoint_id, created_at) INCLUDE (outcome, latency_ms, error_class)` index on `delivery_attempts.endpoint_id` (trigger-maintained), with a capped window (`422 window_too_large`) and sample (`sampled`).
+- Payload retention: `EVENT_PAYLOAD_RETENTION_DAYS` (< `EVENT_RETENTION_DAYS`, 0 = off) drops payloads of events whose deliveries are all settled and scrubs their stored response bodies; events stay until `retain_until`. Batches of `RETENTION_BATCH_SIZE` in their own transactions (`SKIP LOCKED` events, deliveries share-locked through a `MATERIALIZED` CTE so in-flight completions and replays are waited for), a moving cursor past busy rows, `RETENTION_MAX_BATCHES` budget and `RETENTION_BATCH_PAUSE_MS` pause. Runs in relay housekeeping and as `hookrelay-retention` / `python -m hookrelay.retention` (exit 3 when the budget ran out; compose `retention` service, profile `ops`). Purged events answer replays with `409 payload_purged` (bulk skips them); a worker meeting one fails it `payload_purged` without a request and without touching the breaker.
+- Migration `0009`: endpoint previous-secret columns + CHECKs, `deliveries.event_type` and `delivery_attempts.endpoint_id` with backfills, triggers and a same-tenant FK, search / health indexes, nullable `events.payload` with `payload_purged_at` and a both-or-neither CHECK; downgrade restores purged payloads as `{}` (roundtrip test with seeded rows).
+- New env vars `ENDPOINT_SECRET_*`, `ENDPOINT_HEALTH_*`, `EVENT_PAYLOAD_RETENTION_DAYS`, `RETENTION_*`, cross-validated at startup.
+- 859 tests (all passing; Postgres 16 integration tests for rotation, search, health, retention races and the schema), 98% line+branch coverage; ruff, ruff format, mypy strict, Alembic roundtrip + `alembic check` pass; the OpenAPI deny-by-default audit covers the new routes.
+- Next: Milestone 6 (Redis: worker wake-ups, cached lookups, token buckets).
