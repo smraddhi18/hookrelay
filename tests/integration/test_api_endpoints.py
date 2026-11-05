@@ -44,7 +44,7 @@ async def test_create_returns_secret_once_and_stores_it_encrypted(
         json={
             "url": "HTTPS://Hooks.Example.com/in",
             "description": "billing",
-            "headers": {"X-Receiver-Token": "s3cr3t"},
+            "headers": {"X-Receiver-Token": "receiver-token-example"},
         },
         headers=tenant.headers,
     )
@@ -55,7 +55,7 @@ async def test_create_returns_secret_once_and_stores_it_encrypted(
     assert body["url"] == "https://hooks.example.com/in"
     assert body["timeout_ms"] == 10_000
     assert body["enabled"] is True
-    assert body["headers"] == {"X-Receiver-Token": "s3cr3t"}
+    assert body["headers"] == {"X-Receiver-Token": "receiver-token-example"}
     secret = body["signing_secret"]
     assert secret.startswith("whsec_")
     assert response.headers["Location"] == f"/v1/endpoints/{body['id']}"
