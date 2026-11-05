@@ -20,8 +20,9 @@ x-app-env: &app-env
   WAKEUP_COALESCE_MS: ${WAKEUP_COALESCE_MS:-50}
   SUBSCRIPTION_CACHE_TTL_S: ${SUBSCRIPTION_CACHE_TTL_S:-60}
   # Local-stack defaults only; export real values in your shell (or .env) to override.
-  OPERATOR_TOKEN: ${OPERATOR_TOKEN:-local-operator-token-change-me-0123456789}
-  SECRETS_ENCRYPTION_KEY: ${SECRETS_ENCRYPTION_KEY:-bG9jYWwtY29tcG9zZS1rZXktbm90LWZvci1wcm9kISE}
+  OPERATOR_TOKEN: ${OPERATOR_TOKEN:-EXAMPLE-local-only-not-for-prod-operator-token}
+  # Fake local-only defaults. The key is base64url of the text "EXAMPLE-local-only-not-for-prod!".
+  SECRETS_ENCRYPTION_KEY: ${SECRETS_ENCRYPTION_KEY:-RVhBTVBMRS1sb2NhbC1vbmx5LW5vdC1mb3ItcHJvZCE}
   SECRETS_ENCRYPTION_KEY_PREVIOUS: ${SECRETS_ENCRYPTION_KEY_PREVIOUS:-}
   EVENT_MAX_PAYLOAD_BYTES: ${EVENT_MAX_PAYLOAD_BYTES:-262144}
   EVENT_RETENTION_DAYS: ${EVENT_RETENTION_DAYS:-30}
