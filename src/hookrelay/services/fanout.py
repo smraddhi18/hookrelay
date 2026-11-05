@@ -21,11 +21,12 @@ from collections.abc import Sequence
 from dataclasses import dataclass
 from datetime import timedelta
 
-from sqlalchemy import and_, func, select, update
+from sqlalchemy import and_, func, literal, select, update
 from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from hookrelay.db.models import Delivery, Endpoint, Event, OutboxEntry, Subscription
+from hookrelay.redis_.subscription_cache import SubscriptionCache
 from hookrelay.services.subscriptions import pattern_matches_sql
 
 MAX_ERROR_LENGTH = 1_000
@@ -58,7 +59,34 @@ async def claim_batch(session: AsyncSession, *, batch_size: int) -> list[Claimed
     ]
 
 
-async def fan_out(session: AsyncSession, event_ids: Sequence[uuid.UUID]) -> int:
+async def matching_endpoint_ids(
+    session: AsyncSession, tenant_id: uuid.UUID, event_type: str
+) -> list[uuid.UUID]:
+    """Enabled, non-deleted endpoint IDs subscribed to ``event_type`` (SQL source of truth)."""
+    rows = (
+        await session.execute(
+            select(Endpoint.id)
+            .distinct()
+            .join(
+                Subscription,
+                and_(
+                    Subscription.tenant_id == Endpoint.tenant_id,
+                    Subscription.endpoint_id == Endpoint.id,
+                ),
+            )
+            .where(
+                Endpoint.tenant_id == tenant_id,
+                Endpoint.deleted_at.is_(None),
+                Endpoint.enabled.is_(True),
+                pattern_matches_sql(Subscription.event_type_pattern, literal(event_type)),
+            )
+            .order_by(Endpoint.id)
+        )
+    ).all()
+    return [r.id for r in rows]
+
+
+async def fan_out_sql(session: AsyncSession, event_ids: Sequence[uuid.UUID]) -> int:
     """Create the missing deliveries for ``event_ids`` in one set-based statement.
 
     Returns how many delivery rows were inserted (rows that already existed are not counted).
@@ -95,6 +123,77 @@ async def fan_out(session: AsyncSession, event_ids: Sequence[uuid.UUID]) -> int:
     )
     result = await session.execute(stmt)
     return len(result.all())
+
+
+async def fan_out_cached(
+    session: AsyncSession, event_ids: Sequence[uuid.UUID], cache: SubscriptionCache
+) -> int:
+    """Cache-aside fan-out: membership from Redis (SQL on miss), insert with ON CONFLICT.
+
+    Never invents matches. ON CONFLICT keeps the exactly-once insert invariant.
+    """
+    events = (
+        await session.execute(
+            select(Event.id, Event.tenant_id, Event.event_type, Event.retain_until).where(
+                Event.id.in_(list(event_ids))
+            )
+        )
+    ).all()
+    if not events:
+        return 0
+
+    values: list[dict[str, object]] = []
+    seen: set[tuple[uuid.UUID, uuid.UUID]] = set()
+
+    async def _loader(tenant_id: uuid.UUID, event_type: str) -> list[uuid.UUID]:
+        return await matching_endpoint_ids(session, tenant_id, event_type)
+
+    for event in events:
+        endpoint_ids = await cache.get_or_load(event.tenant_id, event.event_type, _loader)
+        for endpoint_id in endpoint_ids:
+            key = (event.id, endpoint_id)
+            if key in seen:
+                continue
+            seen.add(key)
+            values.append(
+                {
+                    "tenant_id": event.tenant_id,
+                    "event_id": event.id,
+                    "endpoint_id": endpoint_id,
+                    "retain_until": event.retain_until,
+                }
+            )
+    if not values:
+        return 0
+    stmt = (
+        pg_insert(Delivery)
+        .values(values)
+        .on_conflict_do_nothing(constraint="uq_deliveries_event_endpoint")
+        .returning(Delivery.id)
+    )
+    result = await session.execute(stmt)
+    return len(result.all())
+
+
+async def fan_out(
+    session: AsyncSession,
+    event_ids: Sequence[uuid.UUID],
+    *,
+    cache: SubscriptionCache | None = None,
+) -> int:
+    """Create the missing deliveries for ``event_ids``.
+
+    Prefer the subscription cache when it is available; fall back to the set-based SQL join
+    on miss/error/disabled so correctness never depends on Redis.
+    """
+    if not event_ids:
+        return 0
+    if cache is not None and cache.is_available():
+        try:
+            return await fan_out_cached(session, event_ids, cache)
+        except Exception:
+            return await fan_out_sql(session, event_ids)
+    return await fan_out_sql(session, event_ids)
 
 
 async def mark_processed(session: AsyncSession, rows: Sequence[ClaimedRow]) -> None:

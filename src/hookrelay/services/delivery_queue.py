@@ -13,12 +13,15 @@ Invariants (each enforced by a WHERE clause or a CHECK, not by convention):
   whichever transition ends the lease: completion, or the reaper for an expired lease. Drain
   release gives the attempt back. Hence, outside ``delivering``,
   ``attempt_count == count(delivery_attempts)``.
-* **Per-endpoint back-pressure (Milestone 4).** :func:`lease_due` first locks the
+* **Per-endpoint back-pressure (Milestone 4 / 6).** :func:`lease_due` first locks the
   ``endpoint_states`` rows of endpoints that may start work (breaker closed, or a half-open
   probe; below their in-flight cap; holding a rate-limit token), computes a per-endpoint quota
   and only then leases deliveries, all in one transaction. Because the state row stays locked
   until commit, two workers can never both decide the same endpoint has a free slot, so
-  ``max_in_flight`` and ``rate_limit_per_s`` hold across any number of workers.
+  ``max_in_flight`` holds across any number of workers. ``rate_limit_per_s`` prefers a Redis
+  Lua token bucket when available (Milestone 6) and falls back to the Postgres bucket —
+  never fail open. Postgres tokens are still spent on every lease so a Redis failover is not
+  unlimited.
 * **Retry budget per run.** Retry limits count attempts since ``attempt_offset`` and age since
   ``run_started_at``, so a replayed delivery gets a fresh budget while ``attempt_number`` keeps
   numbering the attempt log monotonically.
@@ -38,6 +41,7 @@ from sqlalchemy import text
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from hookrelay.db.models import AttemptOutcome, BreakerState, DeliveryAttempt, DeliveryStatus
+from hookrelay.redis_.rate_limit import RedisRateLimiter
 from hookrelay.services import circuit_breaker
 from hookrelay.services.circuit_breaker import BreakerPolicy
 from hookrelay.services.delivery_policy import ErrorClass, RetryPolicy, decide_retry
@@ -124,12 +128,14 @@ _TOKENS = """
 
 # Step 1: endpoints that may start work, locked so no other worker decides for them meanwhile.
 # Least-recently-leased first, so a deep backlog on one endpoint cannot starve the others.
+# Postgres token bucket is authoritative when Redis is down.
 _ELIGIBLE_SQL = text(
     f"""
     SELECT s.endpoint_id, s.breaker_state,
            COALESCE(e.max_in_flight, :default_max_in_flight) - f.n AS capacity,
            CASE WHEN e.rate_limit_per_s IS NULL THEN NULL ELSE {_TOKENS} END AS tokens,
-           q.n AS due
+           q.n AS due,
+           e.rate_limit_per_s
     FROM endpoint_states AS s
     JOIN endpoints AS e ON e.tenant_id = s.tenant_id AND e.id = s.endpoint_id
     JOIN tenants AS t ON t.id = s.tenant_id
@@ -151,6 +157,41 @@ _ELIGIBLE_SQL = text(
       AND (s.breaker_state = 'closed'
            OR (f.n = 0 AND (s.breaker_state = 'half_open' OR s.open_until <= now())))
       AND (e.rate_limit_per_s IS NULL OR {_TOKENS} >= 1)
+    ORDER BY s.last_leased_at ASC NULLS FIRST, s.endpoint_id
+    LIMIT :limit
+    FOR UPDATE OF s SKIP LOCKED
+    """  # noqa: S608 - interpolates a constant SQL fragment, never input
+)
+
+# When Redis RL is preferred, skip the PG token filter; Redis (or PG fallback per-endpoint)
+# caps the quota after allocate. Breaker and max_in_flight stay in Postgres.
+_ELIGIBLE_SQL_REDIS_RL = text(
+    f"""
+    SELECT s.endpoint_id, s.breaker_state,
+           COALESCE(e.max_in_flight, :default_max_in_flight) - f.n AS capacity,
+           CASE WHEN e.rate_limit_per_s IS NULL THEN NULL ELSE {_TOKENS} END AS tokens,
+           q.n AS due,
+           e.rate_limit_per_s
+    FROM endpoint_states AS s
+    JOIN endpoints AS e ON e.tenant_id = s.tenant_id AND e.id = s.endpoint_id
+    JOIN tenants AS t ON t.id = s.tenant_id
+    CROSS JOIN LATERAL (
+        SELECT count(*) AS n FROM deliveries AS x
+        WHERE x.endpoint_id = s.endpoint_id AND x.status = 'delivering'
+    ) AS f
+    CROSS JOIN LATERAL (
+        SELECT count(*) AS n FROM (
+            SELECT 1 FROM deliveries AS p
+            WHERE p.endpoint_id = s.endpoint_id AND p.status = 'pending'
+              AND p.next_attempt_at <= now()
+            LIMIT :limit
+        ) AS l
+    ) AS q
+    WHERE e.enabled AND e.deleted_at IS NULL AND t.status = 'active'
+      AND q.n > 0
+      AND f.n < COALESCE(e.max_in_flight, :default_max_in_flight)
+      AND (s.breaker_state = 'closed'
+           OR (f.n = 0 AND (s.breaker_state = 'half_open' OR s.open_until <= now())))
     ORDER BY s.last_leased_at ASC NULLS FIRST, s.endpoint_id
     LIMIT :limit
     FOR UPDATE OF s SKIP LOCKED
@@ -218,8 +259,10 @@ class EndpointSlot:
     endpoint_id: uuid.UUID
     breaker_state: BreakerState
     capacity: int  # in-flight slots left under max_in_flight
-    tokens: float | None  # rate-limit tokens available; None = unlimited
+    tokens: float | None  # Postgres rate-limit tokens available; None = unlimited
     due: int  # due pending deliveries (capped at the lease limit)
+    rate_limit_per_s: int | None = None  # None = unlimited; used by Redis RL
+    defer_rate_to_redis: bool = False  # when True, allocate ignores PG tokens
 
     @property
     def probe(self) -> bool:
@@ -229,7 +272,7 @@ class EndpointSlot:
     def limit(self) -> int:
         """Most deliveries this endpoint may start in this lease."""
         bound = min(self.capacity, self.due)
-        if self.tokens is not None:
+        if self.tokens is not None and not self.defer_rate_to_redis:
             bound = min(bound, math.floor(self.tokens))
         if self.probe:
             bound = min(bound, 1)  # half-open: exactly one probe
@@ -307,6 +350,37 @@ _EXPIRED_SQL = text(
 )
 
 
+async def _apply_redis_rate_limits(
+    quotas: dict[uuid.UUID, int],
+    slots: Sequence[EndpointSlot],
+    rate_limiter: RedisRateLimiter,
+) -> dict[uuid.UUID, int]:
+    """Cap quotas with the Redis Lua bucket; fall back to Postgres tokens per endpoint.
+
+    Never fail open: a Redis error uses ``floor(pg_tokens)`` (or 0 when unknown).
+    """
+    by_id = {s.endpoint_id: s for s in slots}
+    capped: dict[uuid.UUID, int] = {}
+    for endpoint_id, want in quotas.items():
+        slot = by_id[endpoint_id]
+        if slot.rate_limit_per_s is None:
+            capped[endpoint_id] = want
+            continue
+        result = await rate_limiter.take(endpoint_id, rate_per_s=slot.rate_limit_per_s, n=want)
+        if result is None:
+            # Degraded: Postgres bucket. Unlimited only when tokens is None (no rate limit).
+            if slot.tokens is None:
+                capped[endpoint_id] = want
+            else:
+                allowed = min(want, max(0, math.floor(slot.tokens)))
+                if allowed > 0:
+                    capped[endpoint_id] = allowed
+            continue
+        if result.allowed > 0:
+            capped[endpoint_id] = min(want, result.allowed)
+    return capped
+
+
 async def lease_due(
     session: AsyncSession,
     *,
@@ -314,6 +388,7 @@ async def lease_due(
     limit: int,
     lease_s: float,
     default_max_in_flight: int = DEFAULT_MAX_IN_FLIGHT,
+    rate_limiter: RedisRateLimiter | None = None,
 ) -> list[LeasedDelivery]:
     """Lease up to ``limit`` due deliveries for ``worker_id`` (commit to publish the lease).
 
@@ -321,12 +396,17 @@ async def lease_due(
     wait in ``pending`` (disabling an endpoint pauses it, it does not fail its backlog). Within
     that, each endpoint is held to its breaker, in-flight cap and rate limit: an endpoint whose
     breaker is open keeps its backlog ``pending`` without spending attempts.
+
+    When ``rate_limiter`` is provided and Redis is reachable, the Lua token bucket caps the
+    quota and Postgres tokens are still spent (dual-update) so a failover is not unlimited.
     """
     if limit <= 0:
         return []
+    use_redis_rl = rate_limiter is not None and rate_limiter.is_available()
+    eligible = _ELIGIBLE_SQL_REDIS_RL if use_redis_rl else _ELIGIBLE_SQL
     rows = (
         await session.execute(
-            _ELIGIBLE_SQL, {"limit": limit, "default_max_in_flight": default_max_in_flight}
+            eligible, {"limit": limit, "default_max_in_flight": default_max_in_flight}
         )
     ).all()
     slots = [
@@ -336,10 +416,16 @@ async def lease_due(
             capacity=r.capacity,
             tokens=r.tokens,
             due=r.due,
+            rate_limit_per_s=r.rate_limit_per_s,
+            defer_rate_to_redis=use_redis_rl,
         )
         for r in rows
     ]
     quotas = allocate(slots, limit)
+    if use_redis_rl and quotas:
+        if rate_limiter is None:  # pragma: no cover - guarded by use_redis_rl
+            raise RuntimeError("rate_limiter required when Redis RL is enabled")
+        quotas = await _apply_redis_rate_limits(quotas, slots, rate_limiter)
     if not quotas:
         return []
     ids = list(quotas)
