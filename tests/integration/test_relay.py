@@ -302,11 +302,11 @@ async def test_poison_row_is_parked_with_backoff(
     poison = uuid.UUID(events[1])
     real_fan_out = fanout.fan_out
 
-    async def flaky(session: Any, event_ids: Sequence[uuid.UUID]) -> int:
+    async def flaky(session: Any, event_ids: Sequence[uuid.UUID], **kwargs: Any) -> int:
         if poison in event_ids:
             # A real database error, so the savepoint is genuinely aborted and rolled back.
             await session.execute(text("SELECT 1/0"))
-        return await real_fan_out(session, event_ids)
+        return await real_fan_out(session, event_ids, **kwargs)
 
     monkeypatch.setattr(fanout, "fan_out", flaky)
     relay = Relay(database, settings_for(relay_retry_max_s=60))
