@@ -64,11 +64,11 @@ Legend: `[x]` done, `[ ]` planned.
 - [x] Endpoint health summary (success rate, p50/p95 latency, last error, breaker state)
 - [x] Message/payload retention policy and cleanup job
 
-## Milestone 6: Redis
+## Milestone 6: Redis ✅
 
-- [ ] Worker wake-ups via Redis pub/sub (Postgres polling remains the fallback)
-- [ ] Cached subscription lookups for fan-out with explicit invalidation
-- [ ] Token-bucket rate limits in Redis (Lua), degraded-mode behaviour when Redis is down
+- [x] Worker wake-ups via Redis pub/sub (Postgres polling remains the fallback)
+- [x] Cached subscription lookups for fan-out with explicit invalidation
+- [x] Token-bucket rate limits in Redis (Lua), degraded-mode behaviour when Redis is down
 
 ## Milestone 7: Observability
 
@@ -152,3 +152,39 @@ Legend: `[x]` done, `[ ]` planned.
 - New env vars `ENDPOINT_SECRET_*`, `ENDPOINT_HEALTH_*`, `EVENT_PAYLOAD_RETENTION_DAYS`, `RETENTION_*`, cross-validated at startup.
 - 859 tests (all passing; Postgres 16 integration tests for rotation, search, health, retention races and the schema), 98% line+branch coverage; ruff, ruff format, mypy strict, Alembic roundtrip + `alembic check` pass; the OpenAPI deny-by-default audit covers the new routes.
 - Next: Milestone 6 (Redis: worker wake-ups, cached lookups, token buckets).
+
+### 2026-11-05: Milestone 6 complete
+
+- Redis is optional (`REDIS_URL` unset → every Redis feature off, Postgres paths unchanged). Fail-soft
+  `redis.asyncio` client (`hookrelay.redis_`): jittered reconnect, commands fail fast while down (no
+  offline queue), dedicated pub/sub connection, `CLIENT LIST` names (`hookrelay:api:cmd`,
+  `hookrelay:relay:cmd:<id>`, `hookrelay:worker:cmd:<id>` / `:sub:<id>`), connected/disconnected logged
+  once, `redis.error` throttled.
+- Worker wake-ups: after the relay inserts pending deliveries (and after a replay re-queues) a
+  coalesced publish lands on the global `{prefix}:wake:deliveries` channel (leading + trailing window
+  so a stampede of events does not flood Redis). Workers subscribe on a dedicated connection and reset
+  their poll delay on message; payload is observational only. When Redis is down or `WAKEUP_ENABLED`
+  is false, the existing adaptive Postgres polling continues unchanged. `SIGTERM` unsubscribes and
+  closes cleanly.
+- Subscription cache for fan-out: cache-aside of matching enabled endpoint IDs keyed by
+  `(tenant_id, event_type)` with TTL, short negative cache for empty results, and single-flight
+  (process lock + Redis `SET NX` lock). Explicit tenant-wide invalidation on subscription
+  create/delete, endpoint enable/disable/delete/soft-delete, and event-type archive. On miss or
+  Redis error the relay falls back to the SQL `pattern_matches_sql` join — never invents matches;
+  `ON CONFLICT (event_id, endpoint_id) DO NOTHING` still guarantees exactly-once inserts.
+- Token-bucket rate limits in Redis (Lua, Redis `TIME` for refill, burst = 1 s of tokens, key
+  `hookrelay:rl:endpoint:<uuid>`). When Redis is healthy the lease path takes tokens from Redis and
+  still spends Postgres tokens (dual-update) so a failover is not unlimited. When Redis is down the
+  existing Postgres bucket is used — never fail open. `max_in_flight` and the circuit breaker stay
+  authoritative in Postgres.
+- `/ready` reports a Redis ping when `REDIS_URL` is set; by default (`REDIS_REQUIRED_FOR_READY=false`)
+  a Redis outage does not 503 the API (workers degrade). Set the flag when Redis is required for
+  traffic.
+- No schema migration (Redis-only). New settings: `REDIS_*` timeouts / reconnect / key prefix,
+  `WAKEUP_*`, `SUBSCRIPTION_CACHE_*`, `RATE_LIMIT_REDIS_*`, `REDIS_REQUIRED_FOR_READY`; effective
+  flags default on when `REDIS_URL` is set. Compose, `.env.example` and CI (Redis 7 service +
+  `REDIS_URL` on the test job) updated.
+- 892 tests (670 unit, 222 integration on Postgres 16 + Redis 7), 97% line+branch coverage; ruff,
+  ruff format, mypy strict, Alembic `check` pass; the OpenAPI deny-by-default audit still covers
+  every route (M6 adds none).
+- Next: Milestone 7 (Observability: Prometheus metrics, OpenTelemetry tracing, dashboard API).

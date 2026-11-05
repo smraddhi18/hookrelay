@@ -65,7 +65,7 @@ See the **[roadmap](ROADMAP.md)** for the plan and progress log.
 | Operability | Delivery log search `GET /v1/deliveries`: status (any of several), event type, endpoint, `[created_after, created_before)`; keyset pagination served by dedicated indexes | ✅ M5 |
 | Operability | Endpoint health `GET /v1/endpoints/{id}/health`: success rate, p50 / p95 / p99 latency, errors by class, last error, breaker state, backlog; bounded window and sample | ✅ M5 |
 | Operability | Payload retention (`EVENT_PAYLOAD_RETENTION_DAYS`) + cleanup job: batched, budgeted, `SKIP LOCKED`, never purges a payload still being delivered; runs in relay housekeeping or as `hookrelay-retention` | ✅ M5 |
-| Redis | Worker wake-ups, cached lookups, token buckets | 🔜 M6 |
+| Redis | Worker wake-ups via Redis pub/sub (Postgres poll fallback); subscription-cache for fan-out with explicit invalidation; Lua token-bucket rate limits with Postgres degraded mode (never fail open) | ✅ M6 |
 | Observability | Prometheus metrics, OpenTelemetry tracing, dashboard API | 🔜 M7 |
 | Scale | k6/locust load tests, chaos tests, capacity plan | 🔜 M8 |
 
@@ -348,6 +348,51 @@ flowchart LR
     XS --> EPT
 ```
 
+
+### Redis (Milestone 6)
+
+```mermaid
+flowchart LR
+    subgraph Producers["Relay / API / replays"]
+        FAN["Fan-out relay<br/>inserts deliveries"]
+        RP["Replay re-queue"]
+        INV["Subscription / endpoint<br/>mutations"]
+    end
+
+    subgraph Redis["Redis 7 (optional accelerator)"]
+        WAKE[("{prefix}:wake:deliveries<br/>pub/sub")]
+        CACHE[("{prefix}:sub:{tenant}:{type}<br/>TTL + invalidate")]
+        RL[("{prefix}:rl:endpoint:{id}<br/>Lua token bucket")]
+    end
+
+    subgraph Workers["Delivery workers"]
+        SUB["WakeupSubscriber<br/>dedicated connection"]
+        LOOP["Poll loop:<br/>wake → delay=0<br/>else adaptive PG poll"]
+        LEASE["lease_due:<br/>Redis RL then dual-spend PG"]
+    end
+
+    subgraph PG["Postgres 16 (source of truth)"]
+        DL[(deliveries)]
+        SUBS[(subscriptions<br/>+ endpoints)]
+        ES[(endpoint_states<br/>tokens / breaker / in-flight)]
+    end
+
+    FAN -->|"ON CONFLICT insert"| DL
+    FAN -. coalesced publish .-> WAKE
+    FAN -->|"cache-aside<br/>(SQL fallback)"| CACHE
+    CACHE -. miss .-> SUBS
+    RP -. wake .-> WAKE
+    INV -. invalidate tenant .-> CACHE
+    WAKE --> SUB --> LOOP --> LEASE
+    LEASE -->|"take tokens"| RL
+    LEASE -->|"max_in_flight + breaker<br/>+ dual-update tokens"| ES
+    LEASE --> DL
+```
+
+When `REDIS_URL` is unset every Redis feature is off and the M0–M5 Postgres paths are unchanged.
+Losing Redis after it was configured degrades latency / hot-path contention, never correctness or
+at-least-once delivery.
+
 ### Request flow (with auth)
 
 1. `RequestContextMiddleware` (pure ASGI) reads `X-Request-ID`. A caller-supplied ID is kept only
@@ -510,6 +555,26 @@ flowchart LR
    own short transaction; the cursor moves past skipped rows, the run stops at a short batch, at
    `RETENTION_MAX_BATCHES` (exit code 3 for the CLI) or on `SIGTERM`. Ended secret overlaps are
    cleared the same way. Deliveries and attempts themselves still live until `retain_until`.
+
+
+### Redis flows (Milestone 6)
+
+1. **Wake-up.** After the relay commits new `pending` deliveries (and after a replay re-queues),
+   `WakeupPublisher` triggers a coalesced publish on `{REDIS_KEY_PREFIX}:wake:deliveries`. The
+   payload (`source`, `sentAt`) is observational; presence of the message is the signal. Workers
+   with `WAKEUP_ENABLED` subscribe on a dedicated connection; on message they set an event that
+   short-circuits the idle poll delay. If Redis is down the adaptive Postgres poll continues.
+2. **Subscription cache.** Fan-out asks `SubscriptionCache.get_or_load(tenant, event_type)` first.
+   Hit → endpoint IDs. Miss → single-flight load via the SQL `pattern_matches_sql` join, then `SET`
+   with TTL (short negative TTL for empty). Mutations (subscriptions, endpoint enable/disable/delete,
+   event-type archive) call `invalidate_tenant`. Redis errors → SQL path; the insert stays
+   `ON CONFLICT DO NOTHING`.
+3. **Rate limit.** When `RATE_LIMIT_REDIS_ENABLED` and Redis is reachable, `lease_due` takes tokens
+   from the Lua bucket before leasing and still spends Postgres tokens (dual-update). On Redis
+   error it falls back to `floor(pg_tokens)` — never unlimited. `max_in_flight` and the breaker stay
+   in Postgres.
+4. **Readiness.** `/ready` always pings Postgres. When `REDIS_URL` is set it also reports a Redis
+   ping; by default (`REDIS_REQUIRED_FOR_READY=false`) Redis down does not 503 the API.
 
 ## Design decisions and trade-offs
 
@@ -757,12 +822,40 @@ flowchart LR
   a pause between batches gives replicas and autovacuum room, and a batch budget makes every run
   finish; the CLI exits `3` when there is more to do so a CronJob can alert or run again.
 
+
+### Milestone 6 decisions
+
+- **Pub/sub wake-ups over `LISTEN/NOTIFY`.** NOTIFY payloads are capped, queue when no listener, and
+  share the Postgres connection pool with lease traffic. Redis pub/sub is a dedicated side channel:
+  workers keep one subscribed connection and command connections stay free for leases. Postgres
+  adaptive polling remains the correctness fallback, so Redis is never on the durability path.
+- **One global wake channel, coalesced.** Per-endpoint channels would multiply publishes with
+  endpoint count while the worker still has to ask Postgres which deliveries are due. A leading +
+  trailing coalescer collapses a stampede of events into about two publishes per window.
+- **Cache-aside with explicit invalidation, never invent matches.** Fan-out membership changes are
+  rare relative to ingest; a short TTL plus tenant-wide invalidate on every mutating path is enough.
+  Single-flight (process lock + Redis `SET NX`) stops a cold key from hammering Postgres. On any
+  Redis miss/error the SQL matcher is authoritative.
+- **Redis rate limit with Postgres dual-update, never fail open.** Taking tokens in Redis removes
+  hot `endpoint_states` contention from the lease transaction when Redis is healthy. Spending the
+  Postgres bucket on the same allow keeps a failover from going unlimited (the degraded path uses
+  `floor(pg_tokens)`). The trade-off is slightly higher Postgres contention when Redis is down —
+  preferred over silently exceeding the tenant's limit. Breaker and `max_in_flight` stay in Postgres
+  because they are correctness across workers, not just soft pacing.
+- **Soft `/ready` for Redis.** The API can serve ingest and reads with Redis down; only workers
+  degrade. `REDIS_REQUIRED_FOR_READY=true` is available when an operator wants Redis in the
+  critical path. Report the check either way so probes and dashboards see it.
+- **Package name `hookrelay.redis_`.** A top-level `redis/` package would shadow the official
+  `redis` dependency on some import paths; the trailing underscore keeps the layout obvious without
+  that footgun.
+
 ## Getting started
 
 ### Prerequisites
 
 - Python 3.12+ and [uv](https://docs.astral.sh/uv/) (0.13.x)
 - Postgres 16 (or use Docker Compose)
+- Redis 7 (optional locally; required for M6 integration tests / compose when exercising wake / cache / RL)
 
 ### Local development
 
@@ -858,7 +951,16 @@ All settings are environment variables (or `.env`), validated at startup. See
 | `READINESS_TIMEOUT_S` | `2` | `/ready` gives up and returns 503 after this |
 | `LOG_FORMAT` / `LOG_LEVEL` | `json` / `INFO` | `console` for local readability |
 | `REQUEST_ID_HEADER` | `X-Request-ID` | correlation header accepted and returned |
-| `REDIS_URL` | unset | validated now, used from M6 |
+| `REDIS_URL` | unset | `redis://` or `rediss://`; unset → every Redis feature off (Postgres paths unchanged) |
+| `REDIS_CONNECT_TIMEOUT_MS` / `REDIS_COMMAND_TIMEOUT_MS` | `1000` / `500` | socket connect / per-command timeout |
+| `REDIS_RECONNECT_BASE_MS` / `REDIS_RECONNECT_MAX_MS` | `100` / `5000` | equal-jitter reconnect backoff (base ≤ max) |
+| `REDIS_KEY_PREFIX` | `hookrelay` | prefix for wake / cache / rate-limit keys (`{prefix}:wake:deliveries`, …) |
+| `WAKEUP_ENABLED` | unset | default on when `REDIS_URL` set; worker pub/sub wake-ups |
+| `WAKEUP_COALESCE_MS` | `50` | leading + trailing publish coalesce window |
+| `SUBSCRIPTION_CACHE_ENABLED` | unset | default on when `REDIS_URL` set |
+| `SUBSCRIPTION_CACHE_TTL_S` | `60` | positive-entry TTL; empty results use a shorter negative TTL |
+| `RATE_LIMIT_REDIS_ENABLED` | unset | default on when `REDIS_URL` set; Lua bucket with Postgres fallback |
+| `REDIS_REQUIRED_FOR_READY` | `false` | when true, Redis down makes `/ready` 503 |
 | `OPERATOR_TOKEN` | unset | ≥ 32 chars; enables `/admin`. Unset → every `/admin` call gets `403 operator_api_disabled` |
 | `SECRETS_ENCRYPTION_KEY` | unset | base64 of 32 bytes (AES-256-GCM) for endpoint signing secrets. **Required in production**; development falls back to a fixed insecure key |
 | `SECRETS_ENCRYPTION_KEY_PREVIOUS` | unset | old key during a key rotation (decrypt only) |
@@ -1144,6 +1246,9 @@ src/hookrelay/
   relay.py              fan-out relay process (`python -m hookrelay.relay` / `hookrelay-relay`)
   worker.py             delivery worker process (`python -m hookrelay.worker` / `hookrelay-worker`)
   retention.py          one bounded retention run (`python -m hookrelay.retention` / `hookrelay-retention`)
+  redis_/               fail-soft redis.asyncio client, keys, coalescer, wakeup pub/sub, subscription
+                        cache, Lua rate limiter, process runtime helpers (named redis_ so it does not
+                        shadow the redis package)
   api/
     deps.py             auth dependencies (operator token, API key → Principal, roles)
     contracts/          request/response models with OpenAPI examples
@@ -1164,13 +1269,15 @@ src/hookrelay/
                         purge + ended secret overlaps, batched runner); deliveries also holds search
 alembic/                async env + versioned migrations (0001 tenants ... 0009 tenant operability)
 tests/receiver.py       raw-asyncio HTTP receiver + fake resolver used by delivery tests
-tests/unit/             fast tests (fake database): config, security, rules, pagination, auth wiring audit,
-                        signing vectors, backoff / Retry-After, SSRF ranges, HTTP client, worker helpers
-tests/integration/      real Postgres: migrations, schema constraints, full HTTP flows per resource,
-                        idempotency races, concurrent relays and crash/replay, concurrent workers,
-                        fencing, lease expiry, retries, SIGTERM drain, end-to-end signed delivery,
-                        breaker lifecycle, in-flight / rate limits, fairness, auto-disable, replays,
-                        secret rotation, delivery search + health, retention races
+tests/unit/             fast tests (fake database / mocked Redis): config, security, rules, pagination,
+                        auth wiring audit, signing vectors, backoff / Retry-After, SSRF ranges, HTTP
+                        client, worker helpers, Redis client / coalescer / cache / Lua bucket / wakeup
+tests/integration/      real Postgres + Redis: migrations, schema constraints, full HTTP flows per
+                        resource, idempotency races, concurrent relays and crash/replay, concurrent
+                        workers, fencing, lease expiry, retries, SIGTERM drain, end-to-end signed
+                        delivery, breaker lifecycle, in-flight / rate limits, fairness, auto-disable,
+                        replays, secret rotation, delivery search + health, retention races, wake-up
+                        short-circuit, subscription-cache hit/miss/invalidate, Redis RL + degraded mode
 ```
 
 ## Scaling notes
@@ -1181,7 +1288,8 @@ tests/integration/      real Postgres: migrations, schema constraints, full HTTP
   claim query is served by a partial index over pending outbox rows (`WHERE processed_at IS NULL`),
   so its cost tracks the backlog, not table size. One fan-out statement per batch keeps round trips
   at O(batches), not O(events × endpoints). Adaptive polling keeps idle relays to a few queries per
-  second; M6 adds Redis wake-ups to cut latency further.
+  second; Redis wake-ups (M6) cut idle latency when `WAKEUP_ENABLED` — Postgres polling remains the
+  fallback when Redis is down.
 - Ingest is a handful of indexed writes in one transaction (event, outbox row, idempotency row).
   Idempotency keys live in Postgres so the guarantee survives a Redis outage; expired keys are purged
   in batches by the relay, and the table is keyed `(tenant_id, key)`.
@@ -1199,7 +1307,7 @@ tests/integration/      real Postgres: migrations, schema constraints, full HTTP
   per endpoint, locked `SKIP LOCKED`, so concurrent workers plan for disjoint endpoints) and counts
   in-flight / due rows through the partial `ix_deliveries_endpoint_delivering` and
   `ix_deliveries_endpoint_due` indexes; a fleet with tens of thousands of active endpoints would
-  move the due set into a per-endpoint queue table or Redis (M6).
+  move the due set into a per-endpoint queue table (Redis already holds wake / RL / cache).
 - The breaker row is a hot spot only for a single very busy endpoint (one short `UPDATE` per attempt);
   that is the trade for fleet-wide, restart-safe state. Batch outcome recording or Redis counters
   are the next step if it shows up in `pg_stat_activity`.
@@ -1213,7 +1321,8 @@ tests/integration/      real Postgres: migrations, schema constraints, full HTTP
 - Every list query is served by a `(tenant_id, created_at, id)` index (partial `WHERE deleted_at IS NULL`
   for endpoints), so pagination stays O(page size) no matter how many rows a tenant has.
 - The fan-out lookup (`/v1/subscriptions/match` and the relay's fan-out query) uses `(tenant_id, event_type_pattern)` for
-  exact matches; wildcard rows per tenant are few, and M6 caches the resolved set in Redis.
+  exact matches; wildcard rows per tenant are few, and the resolved set is cached in Redis with
+  explicit tenant invalidation (SQL fallback on miss).
 - Delivery search walks one `(tenant_id, <filter>, created_at, id)` index in order, so a page costs
   O(page size) for single filters; a combination with a rare second filter can scan more of the
   first index (bounded by the time range). The health summary is an index-only scan over at most
@@ -1224,8 +1333,9 @@ tests/integration/      real Postgres: migrations, schema constraints, full HTTP
   and pause keep it from competing with deliveries. Purging payloads keeps `events` rows small
   (TOASTed `jsonb` is most of their size) long before the rows themselves expire.
 - Hot tables (`deliveries`, `delivery_attempts`) are designed for time-based partitioning (M8), which
-  would turn expiry into dropping partitions. Redis (M6) only accelerates. Losing it degrades
-  latency, not correctness.
+  would turn expiry into dropping partitions. Redis only accelerates (wake-ups, subscription cache,
+  rate-limit tokens). Losing it degrades latency / hot-path contention, not correctness or
+  at-least-once delivery.
 
 ## Roadmap
 
