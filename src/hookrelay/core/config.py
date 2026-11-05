@@ -114,8 +114,25 @@ class Settings(BaseSettings):
     # Readiness / shutdown
     readiness_timeout_s: Annotated[float, Field(gt=0, le=30)] = 2.0
 
-    # Redis (not used until Milestone 6; validated now so compose/env stay honest)
+    # Redis (Milestone 6). Optional: unset disables wake-ups, subscription cache and Redis
+    # rate limits; Postgres paths remain correct. Features default on when the URL is set.
     redis_url: str | None = None
+    redis_key_prefix: str = "hookrelay"
+    redis_connect_timeout_ms: Annotated[int, Field(ge=50, le=60_000)] = 1_000
+    redis_command_timeout_ms: Annotated[int, Field(ge=50, le=60_000)] = 500
+    redis_reconnect_base_ms: Annotated[int, Field(ge=10, le=60_000)] = 100
+    redis_reconnect_max_ms: Annotated[int, Field(ge=100, le=300_000)] = 5_000
+    # When REDIS_URL is set, /ready reports a redis check. Soft by default: Redis down does
+    # not make the API 503 (workers/API degrade). Set REDIS_REQUIRED_FOR_READY=true to hard-fail.
+    redis_required_for_ready: bool = False
+    # Worker wake-ups via pub/sub. None = default on when REDIS_URL is set.
+    wakeup_enabled: bool | None = None
+    wakeup_coalesce_ms: Annotated[int, Field(ge=0, le=10_000)] = 50
+    # Cached fan-out membership (tenant + event_type -> endpoint ids).
+    subscription_cache_enabled: bool | None = None
+    subscription_cache_ttl_s: Annotated[int, Field(ge=1, le=86_400)] = 60
+    # Redis Lua token bucket for per-endpoint rate_limit_per_s; Postgres remains the fallback.
+    rate_limit_redis_enabled: bool | None = None
 
     # Request correlation
     request_id_header: str = "X-Request-ID"
@@ -381,6 +398,41 @@ class Settings(BaseSettings):
                     "it is refused in production (SSRF guard)"
                 )
         return self
+
+    @model_validator(mode="after")
+    def _check_redis(self) -> Self:
+        if self.redis_reconnect_base_ms > self.redis_reconnect_max_ms:
+            raise ValueError("REDIS_RECONNECT_BASE_MS must not exceed REDIS_RECONNECT_MAX_MS")
+        if (
+            not self.redis_key_prefix
+            or not self.redis_key_prefix.replace(":", "")
+            .replace("-", "")
+            .replace("_", "")
+            .isalnum()
+        ):
+            raise ValueError(
+                "REDIS_KEY_PREFIX must be a non-empty alphanumeric string (also :_- allowed)"
+            )
+        return self
+
+    @property
+    def wakeup_enabled_effective(self) -> bool:
+        """Wake-ups run when REDIS_URL is set, unless WAKEUP_ENABLED=false."""
+        if self.redis_url is None:
+            return False
+        return True if self.wakeup_enabled is None else self.wakeup_enabled
+
+    @property
+    def subscription_cache_enabled_effective(self) -> bool:
+        if self.redis_url is None:
+            return False
+        return True if self.subscription_cache_enabled is None else self.subscription_cache_enabled
+
+    @property
+    def rate_limit_redis_enabled_effective(self) -> bool:
+        if self.redis_url is None:
+            return False
+        return True if self.rate_limit_redis_enabled is None else self.rate_limit_redis_enabled
 
     @property
     def is_production(self) -> bool:
