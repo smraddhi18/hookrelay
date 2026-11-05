@@ -118,8 +118,9 @@ jobs:
     env:
       DATABASE_URL: postgresql+asyncpg://hookrelay:hookrelay@127.0.0.1:5432/hookrelay
       # Throwaway CI-only values: the image runs with APP_ENV=production, which requires a key.
-      SECRETS_ENCRYPTION_KEY: Y2ktb25seS1rZXktY2ktb25seS1rZXktY2ktb25seSE
-      OPERATOR_TOKEN: ci-operator-token-0123456789abcdefghij
+      # Fake CI-only values, no repo secrets needed. Key = base64url("ci-only-not-a-secret-EXAMPLE-key").
+      SECRETS_ENCRYPTION_KEY: Y2ktb25seS1ub3QtYS1zZWNyZXQtRVhBTVBMRS1rZXk
+      OPERATOR_TOKEN: ci-only-not-a-secret-EXAMPLE-operator-token
     steps:
       - uses: actions/checkout@v4
       - name: docker build
