@@ -66,7 +66,7 @@ class EndpointCreate(BaseModel):
                 {
                     "url": "https://hooks.example.com/hookrelay",
                     "description": "Billing service receiver",
-                    "headers": {"X-Receiver-Token": "s3cr3t"},
+                    "headers": {"X-Receiver-Token": "receiver-token-example"},
                     "timeout_ms": 10000,
                     "rate_limit_per_s": 50,
                     "max_in_flight": 10,
@@ -197,8 +197,8 @@ class EndpointCreated(EndpointOut):
             "examples": [
                 {
                     **_ENDPOINT_EXAMPLE,
-                    "headers": {"X-Receiver-Token": "s3cr3t"},
-                    "signing_secret": "whsec_MfKQ9r8GKYqrTqhvnGYfDSWRgJdnTgRkWDNg8tEKlrM=",
+                    "headers": {"X-Receiver-Token": "receiver-token-example"},
+                    "signing_secret": "whsec_EXAMPLE_NOT_A_REAL_SECRET",
                 }
             ]
         }
@@ -216,7 +216,7 @@ class EndpointSecret(BaseModel):
             "examples": [
                 {
                     "endpoint_id": "a3d5c1f0-7b2e-4c8d-9e6f-1a2b3c4d5e6f",
-                    "signing_secret": "whsec_MfKQ9r8GKYqrTqhvnGYfDSWRgJdnTgRkWDNg8tEKlrM=",
+                    "signing_secret": "whsec_EXAMPLE_NOT_A_REAL_SECRET",
                 }
             ]
         }
@@ -308,7 +308,7 @@ class SecretRotated(BaseModel):
             "examples": [
                 {
                     "endpoint_id": "a3d5c1f0-7b2e-4c8d-9e6f-1a2b3c4d5e6f",
-                    "signing_secret": "whsec_Zm9vYmFyYmF6cXV4cXV1eGNvcmdlZ3JhdWx0Z2FycGx5Lg==",
+                    "signing_secret": "whsec_EXAMPLE_BYO_SECRET_PLACEHOLDER",
                     "rotated_at": "2026-11-04T10:00:00Z",
                     "previous_secret_expires_at": "2026-11-05T10:00:00Z",
                     "version": 4,
