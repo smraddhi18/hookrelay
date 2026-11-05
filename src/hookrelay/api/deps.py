@@ -12,6 +12,7 @@ from __future__ import annotations
 
 from collections.abc import Awaitable, Callable
 from typing import Annotated
+from uuid import UUID
 
 import structlog
 from fastapi import Depends, Request
@@ -22,6 +23,8 @@ from hookrelay.core.errors import ForbiddenError, UnauthorizedError
 from hookrelay.core.security import SecretBox, operator_token_matches
 from hookrelay.db.models import ApiKeyRole
 from hookrelay.db.session import DatabaseDep
+from hookrelay.redis_ import RedisBundle, WakeupPublisher
+from hookrelay.redis_.subscription_cache import SubscriptionCache
 from hookrelay.services import api_keys as api_key_service
 from hookrelay.services.api_keys import BEARER_CHALLENGE, Principal
 from hookrelay.services.endpoints import EndpointPolicy
@@ -123,3 +126,29 @@ async def require_operator(settings: SettingsDep, credentials: OperatorCredentia
         logger.warning("auth.operator.rejected")
         raise UnauthorizedError("Invalid operator token", headers=BEARER_CHALLENGE)
     structlog.contextvars.bind_contextvars(actor="operator")
+
+
+def get_redis_bundle(request: Request) -> RedisBundle | None:
+    bundle: RedisBundle | None = getattr(request.app.state, "redis", None)
+    return bundle
+
+
+RedisBundleDep = Annotated[RedisBundle | None, Depends(get_redis_bundle)]
+
+
+async def invalidate_subscription_cache(request: Request, tenant_id: object) -> None:
+    """Drop cached fan-out membership for a tenant after a membership-changing mutation."""
+    bundle = get_redis_bundle(request)
+    cache: SubscriptionCache | None = None if bundle is None else bundle.cache
+    if cache is None:
+        return
+    tid = tenant_id if isinstance(tenant_id, UUID) else UUID(str(tenant_id))
+    await cache.invalidate_tenant(tid)
+
+
+def notify_workers(request: Request) -> None:
+    """Publish a deliveries wake after replay re-queues work."""
+    bundle = get_redis_bundle(request)
+    publisher: WakeupPublisher | None = None if bundle is None else bundle.publisher
+    if publisher is not None:
+        publisher.notify()
