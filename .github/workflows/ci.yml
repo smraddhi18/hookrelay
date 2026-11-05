@@ -56,11 +56,21 @@ jobs:
           --health-interval 2s
           --health-timeout 3s
           --health-retries 30
+      redis:
+        image: redis:7-alpine
+        ports:
+          - 6379:6379
+        options: >-
+          --health-cmd "redis-cli ping"
+          --health-interval 2s
+          --health-timeout 3s
+          --health-retries 30
     env:
       APP_ENV: test
       LOG_FORMAT: json
       DATABASE_URL: postgresql+asyncpg://hookrelay:hookrelay@localhost:5432/hookrelay
       TEST_DATABASE_URL: postgresql://hookrelay:hookrelay@localhost:5432/hookrelay
+      REDIS_URL: redis://localhost:6379/0
     steps:
       - uses: actions/checkout@v4
       - uses: astral-sh/setup-uv@v10.3.3
