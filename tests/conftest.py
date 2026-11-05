@@ -34,6 +34,8 @@ def make_settings(**overrides: Any) -> Settings:
         "database_url": os.environ.get(
             "TEST_DATABASE_URL", "postgresql+asyncpg://hookrelay:hookrelay@localhost:5432/hookrelay"
         ),
+        # Pin redis_url so a developer's shell REDIS_URL cannot leak into unit tests.
+        "redis_url": None,
     }
     base.update(overrides)
     return Settings(**_ISOLATED_ENV, **base)  # type: ignore[arg-type]
