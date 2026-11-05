@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from typing import Annotated
 
-from fastapi import APIRouter, Path, Query, Response, status
+from fastapi import APIRouter, Path, Query, Request, Response, status
 
 from hookrelay.api.contracts.common import (
     DEFAULT_LIMIT,
@@ -14,7 +14,7 @@ from hookrelay.api.contracts.common import (
     error_responses,
 )
 from hookrelay.api.contracts.event_types import EventTypeCreate, EventTypeOut, EventTypeUpdate
-from hookrelay.api.deps import PublisherDep, ReaderDep
+from hookrelay.api.deps import PublisherDep, ReaderDep, invalidate_subscription_cache
 from hookrelay.api.etag import IfMatchHeader, parse_if_match, set_etag
 from hookrelay.db.models.event_type import EVENT_TYPE_PATTERN, MAX_EVENT_TYPE_LENGTH
 from hookrelay.db.session import SessionDep
@@ -94,12 +94,18 @@ async def update_event_type(
     body: EventTypeUpdate,
     principal: PublisherDep,
     session: SessionDep,
+    request: Request,
     response: Response,
     if_match: IfMatchHeader = None,
 ) -> EventTypeOut:
     expected = parse_if_match(if_match, required=True)
+    changes = body.changes()
     event_type = await service.update_event_type(
-        session, principal.tenant_id, name, expected_version=expected, changes=body.changes()
+        session, principal.tenant_id, name, expected_version=expected, changes=changes
     )
+    if "archived" in changes:
+        # Archive / unarchive can change whether producers ingest this type; drop any cached
+        # membership so a subsequent fan-out cannot reuse a stale set.
+        await invalidate_subscription_cache(request, principal.tenant_id)
     set_etag(response, event_type.version)
     return EventTypeOut.from_model(event_type)

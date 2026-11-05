@@ -5,7 +5,7 @@ from __future__ import annotations
 import uuid
 from typing import Annotated
 
-from fastapi import APIRouter, Query, Response, status
+from fastapi import APIRouter, Query, Request, Response, status
 
 from hookrelay.api.contracts.common import (
     DEFAULT_LIMIT,
@@ -31,6 +31,7 @@ from hookrelay.api.deps import (
     ReaderDep,
     SecretBoxDep,
     SettingsDep,
+    invalidate_subscription_cache,
 )
 from hookrelay.api.etag import IfMatchHeader, parse_if_match, set_etag
 from hookrelay.db.models import ApiKeyRole
@@ -127,17 +128,22 @@ async def update_endpoint(
     session: SessionDep,
     policy: EndpointPolicyDep,
     response: Response,
+    request: Request,
     if_match: IfMatchHeader = None,
 ) -> EndpointOut:
     expected = parse_if_match(if_match, required=True)
+    changes = body.changes()
     endpoint = await service.update_endpoint(
         session,
         principal.tenant_id,
         endpoint_id,
         policy=policy,
         expected_version=expected,
-        changes=body.changes(),
+        changes=changes,
     )
+    # enabled/disabled changes fan-out membership; invalidate the whole tenant.
+    if "enabled" in changes:
+        await invalidate_subscription_cache(request, principal.tenant_id)
     set_etag(response, endpoint.version)
     return EndpointOut.from_model(endpoint, reveal_headers=True)
 
@@ -152,12 +158,14 @@ async def delete_endpoint(
     endpoint_id: uuid.UUID,
     principal: AdminDep,
     session: SessionDep,
+    request: Request,
     if_match: IfMatchHeader = None,
 ) -> Response:
     expected = parse_if_match(if_match, required=False)
     await service.delete_endpoint(
         session, principal.tenant_id, endpoint_id, expected_version=expected
     )
+    await invalidate_subscription_cache(request, principal.tenant_id)
     return Response(status_code=status.HTTP_204_NO_CONTENT)
 
 

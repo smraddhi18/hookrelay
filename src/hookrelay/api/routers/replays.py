@@ -30,7 +30,7 @@ from hookrelay.api.contracts.common import (
 )
 from hookrelay.api.contracts.events import DeliveryOut
 from hookrelay.api.contracts.replays import BulkReplay, EventReplay, ReplayOut
-from hookrelay.api.deps import AdminDep, PublisherDep, ReaderDep, SettingsDep
+from hookrelay.api.deps import AdminDep, PublisherDep, ReaderDep, SettingsDep, notify_workers
 from hookrelay.api.routers.events import IdempotencyKeyHeader
 from hookrelay.core.config import Settings
 from hookrelay.db.session import SessionDep
@@ -94,6 +94,8 @@ async def _idempotent(
             key=validated,
             response=idempotency.StoredResponse(status_code=status.HTTP_202_ACCEPTED, body=result),
         )
+    # Wake delivery workers: replay put rows back to pending. Harmless no-op when Redis is off.
+    notify_workers(request)
     return JSONResponse(result, status_code=status.HTTP_202_ACCEPTED)
 
 

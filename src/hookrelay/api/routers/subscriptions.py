@@ -5,7 +5,7 @@ from __future__ import annotations
 import uuid
 from typing import Annotated
 
-from fastapi import APIRouter, Query, Response, status
+from fastapi import APIRouter, Query, Request, Response, status
 
 from hookrelay.api.contracts.common import (
     DEFAULT_LIMIT,
@@ -20,7 +20,7 @@ from hookrelay.api.contracts.subscriptions import (
     SubscriptionCreate,
     SubscriptionOut,
 )
-from hookrelay.api.deps import AdminDep, ReaderDep
+from hookrelay.api.deps import AdminDep, ReaderDep, invalidate_subscription_cache
 from hookrelay.db.models.event_type import EVENT_TYPE_PATTERN, MAX_EVENT_TYPE_LENGTH
 from hookrelay.db.session import SessionDep
 from hookrelay.services import subscriptions as service
@@ -59,15 +59,18 @@ async def list_subscriptions(
     responses=error_responses(404, 409, 422),
 )
 async def create_subscription(
+    *,
     endpoint_id: uuid.UUID,
     body: SubscriptionCreate,
     principal: AdminDep,
     session: SessionDep,
     response: Response,
+    request: Request,
 ) -> SubscriptionOut:
     subscription = await service.create_subscription(
         session, tenant_id=principal.tenant_id, endpoint_id=endpoint_id, pattern=body.event_type
     )
+    await invalidate_subscription_cache(request, principal.tenant_id)
     response.headers["Location"] = f"/v1/endpoints/{endpoint_id}/subscriptions/{subscription.id}"
     return SubscriptionOut.from_model(subscription)
 
@@ -83,8 +86,10 @@ async def delete_subscription(
     subscription_id: uuid.UUID,
     principal: AdminDep,
     session: SessionDep,
+    request: Request,
 ) -> Response:
     await service.delete_subscription(session, principal.tenant_id, endpoint_id, subscription_id)
+    await invalidate_subscription_cache(request, principal.tenant_id)
     return Response(status_code=status.HTTP_204_NO_CONTENT)
 
 
