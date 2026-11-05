@@ -6,7 +6,7 @@ requests:
 1. **lease** due deliveries with ``FOR UPDATE SKIP LOCKED`` (only as many as there are free
    concurrency slots, so one worker never hoards work it cannot start), each with a fresh
    fencing token, and only within each endpoint's circuit breaker, ``max_in_flight`` cap and
-   ``rate_limit_per_s`` token bucket (enforced in Postgres across all workers);
+   ``rate_limit_per_s`` token bucket (Redis Lua when available, else Postgres; never fail open);
 2. **deliver** each one in its own task, bounded by a semaphore of ``WORKER_CONCURRENCY``:
    decrypt the endpoint secret, sign (Standard Webhooks), POST through the SSRF-guarded client;
 3. **complete** under the fence: success, retry with jittered backoff (honouring a capped
@@ -47,6 +47,8 @@ from hookrelay.core.security import SecretBox, SecretDecryptionError
 from hookrelay.core.signing import HEADER_SIGNATURE, sign
 from hookrelay.db.engine import Database
 from hookrelay.db.models import DeliveryStatus
+from hookrelay.redis_ import RedisBundle, RedisRateLimiter, WakeupSubscriber
+from hookrelay.redis_.runtime import build_redis_bundle, build_wakeup_subscriber
 from hookrelay.relay import heartbeat_is_fresh
 from hookrelay.services import delivery_queue
 from hookrelay.services.circuit_breaker import BreakerPolicy
@@ -153,10 +155,17 @@ class Worker:
         *,
         resolver: Resolver = system_resolver,
         sender: WebhookSender | None = None,
+        redis: RedisBundle | None = None,
+        rate_limiter: RedisRateLimiter | None = None,
     ) -> None:
         self.database = database
         self.settings = settings
         self.worker_id = settings.worker_id or default_worker_id()
+        self.redis = redis
+        self.rate_limiter = rate_limiter or (None if redis is None else redis.rate_limiter)
+        self._wake = asyncio.Event()
+        self._wakeup_listening = False
+        self._subscriber: WakeupSubscriber | None = None
         self.stats = WorkerStats()
         self.policy = RetryPolicy(
             max_attempts=settings.delivery_max_attempts,
@@ -222,6 +231,7 @@ class Worker:
                 limit=free,
                 lease_s=self.settings.worker_lease_s,
                 default_max_in_flight=self.settings.endpoint_default_max_in_flight,
+                rate_limiter=self.rate_limiter,
             )
         for delivery in leased:
             await self._slots.acquire()  # never blocks: we leased at most `free`
@@ -467,10 +477,20 @@ class Worker:
                 )
                 self._heartbeat_warned = True
 
+    def _on_wake(self) -> None:
+        self._wake.set()
+
+    def _on_listening_change(self, listening: bool) -> None:
+        self._wakeup_listening = listening
+
     async def _wait(self, seconds: float) -> None:
-        """Sleep until ``seconds`` pass, a slot frees up (when full) or stop is requested."""
+        """Sleep until ``seconds`` pass, a slot frees, a wake arrives, or stop is requested."""
         self._slot_freed.clear()
-        waiters = [asyncio.ensure_future(self._stop.wait())]
+        self._wake.clear()
+        waiters = [
+            asyncio.ensure_future(self._stop.wait()),
+            asyncio.ensure_future(self._wake.wait()),
+        ]
         if self.free_slots <= 0:
             waiters.append(asyncio.ensure_future(self._slot_freed.wait()))
         try:
@@ -511,6 +531,14 @@ class Worker:
                 self._every(settings.worker_reclaim_interval_s, "reclaim", self.reclaim_once)
             ),
         ]
+        self._subscriber = build_wakeup_subscriber(
+            settings,
+            instance_id=self.worker_id,
+            on_wake=self._on_wake,
+            on_listening_change=self._on_listening_change,
+        )
+        if self._subscriber is not None:
+            await self._subscriber.start()
         logger.info(
             "worker.started",
             worker_id=self.worker_id,
@@ -518,12 +546,16 @@ class Worker:
             lease_s=settings.worker_lease_s,
             max_attempts=settings.delivery_max_attempts,
             allow_private_networks=settings.delivery_allow_private_networks,
+            wakeup=self._subscriber is not None,
+            rate_limit_redis=self.rate_limiter is not None,
         )
         try:
             with contextlib.suppress(Exception):
                 await self.reclaim_once()
             while not self.stopping:
                 leased = 0
+                woke = self._wake.is_set()
+                self._wake.clear()
                 try:
                     leased = await self.poll_once()
                 except Exception as exc:
@@ -535,13 +567,16 @@ class Worker:
                 if leased and self.free_slots > 0:
                     delay = min_s
                     continue  # there was work and room for more: look again right away
-                delay = min_s if leased else min(delay * 2, max_s)
+                delay = min_s if woke or leased else min(delay * 2, max_s)
                 await self._wait(max_s if self.free_slots <= 0 else delay)
             await self.drain(settings.worker_drain_timeout_s)
         finally:
             for task in background:
                 task.cancel()
             await asyncio.gather(*background, return_exceptions=True)
+            if self._subscriber is not None:
+                await self._subscriber.close()
+                self._subscriber = None
             for sig in installed:
                 loop.remove_signal_handler(sig)
             logger.info("worker.stopped", worker_id=self.worker_id, **asdict(self.stats))
@@ -550,13 +585,15 @@ class Worker:
 
 async def serve(settings: Settings, *, once: bool = False) -> WorkerStats:
     database = Database.from_settings(settings)
-    worker = Worker(database, settings)
+    redis = build_redis_bundle(settings, role="worker", source="worker")
+    worker = Worker(database, settings, redis=redis)
     try:
         if once:
             return await worker.run_once()
         return await worker.run()
     finally:
         await worker.aclose()
+        await redis.close()
         await database.dispose()
 
 

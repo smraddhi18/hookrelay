@@ -21,6 +21,7 @@ from hookrelay.core.logging import configure_logging
 from hookrelay.core.request_context import RequestContextMiddleware
 from hookrelay.core.security import SecretBox
 from hookrelay.db.engine import Database
+from hookrelay.redis_.runtime import build_redis_bundle
 from hookrelay.services.endpoints import EndpointPolicy
 
 logger = structlog.stdlib.get_logger("hookrelay.app")
@@ -38,7 +39,9 @@ def create_app(settings: Settings | None = None, database: Database | None = Non
     @asynccontextmanager
     async def lifespan(app: FastAPI) -> AsyncIterator[None]:
         db = database or Database.from_settings(settings)
+        redis = build_redis_bundle(settings, role="api", source="api")
         app.state.database = db
+        app.state.redis = redis
         app.state.draining = False
         logger.info(
             "app.startup",
@@ -46,17 +49,24 @@ def create_app(settings: Settings | None = None, database: Database | None = Non
             version=__version__,
             pool_size=settings.db_pool_size,
             operator_api=settings.operator_token is not None,
+            redis=redis.enabled,
         )
         try:
             # Fail soft: a cold database should make /ready return 503, not crash-loop the pod.
             await db.ping(settings.readiness_timeout_s)
         except Exception as exc:
             logger.warning("app.startup.db_unreachable", error=type(exc).__name__)
+        if redis.command is not None:
+            try:
+                await redis.command.ensure_connected()
+            except Exception as exc:
+                logger.warning("app.startup.redis_unreachable", error=type(exc).__name__)
         try:
             yield
         finally:
             app.state.draining = True
             logger.info("app.shutdown.begin")
+            await redis.close()
             await db.dispose()
             logger.info("app.shutdown.complete")
 

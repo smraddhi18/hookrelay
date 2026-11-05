@@ -37,6 +37,8 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from hookrelay.core.config import Settings, get_settings
 from hookrelay.core.logging import configure_logging, redact_text
 from hookrelay.db.engine import Database
+from hookrelay.redis_ import RedisBundle, WakeupPublisher
+from hookrelay.redis_.runtime import build_redis_bundle
 from hookrelay.services import fanout, housekeeping, notifications
 from hookrelay.services.retention import RetentionPolicy, RetentionRunner
 
@@ -85,10 +87,15 @@ class Relay:
         settings: Settings,
         *,
         notifier: notifications.Notifier | None = None,
+        redis: RedisBundle | None = None,
+        publisher: WakeupPublisher | None = None,
     ) -> None:
         self.database = database
         self.settings = settings
         self.notifier: notifications.Notifier = notifier or notifications.LoggingNotifier()
+        self.redis = redis
+        self.publisher = publisher or (None if redis is None else redis.publisher)
+        self.cache = None if redis is None else redis.cache
         self.stats = RelayStats()
         self._stop = asyncio.Event()
         self._heartbeat = Path(settings.relay_heartbeat_file)
@@ -111,7 +118,9 @@ class Relay:
                 return BatchResult(claimed=0, processed=0, failed=0, deliveries_created=0)
             try:
                 async with session.begin_nested():
-                    created = await fanout.fan_out(session, [r.event_id for r in rows])
+                    created = await fanout.fan_out(
+                        session, [r.event_id for r in rows], cache=self.cache
+                    )
                     await fanout.mark_processed(session, rows)
                 result = BatchResult(
                     claimed=len(rows), processed=len(rows), failed=0, deliveries_created=created
@@ -123,7 +132,13 @@ class Relay:
                 self.stats.batch_fallbacks += 1
                 result = await self._one_by_one(session, rows)
         self._record(result)
+        if result.deliveries_created > 0:
+            self._notify_workers()
         return result
+
+    def _notify_workers(self) -> None:
+        if self.publisher is not None:
+            self.publisher.notify()
 
     async def _one_by_one(
         self, session: AsyncSession, rows: list[fanout.ClaimedRow]
@@ -132,7 +147,7 @@ class Relay:
         for row in rows:
             try:
                 async with session.begin_nested():
-                    created += await fanout.fan_out(session, [row.event_id])
+                    created += await fanout.fan_out(session, [row.event_id], cache=self.cache)
                     await fanout.mark_processed(session, [row])
                 processed += 1
             except SQLAlchemyError as exc:
@@ -265,6 +280,8 @@ class Relay:
             batch_size=self.settings.relay_batch_size,
             poll_min_ms=self.settings.relay_poll_min_ms,
             poll_max_ms=self.settings.relay_poll_max_ms,
+            wakeup=self.publisher is not None,
+            subscription_cache=self.cache is not None,
         )
         try:
             while not self.stopping:
@@ -312,7 +329,8 @@ def heartbeat_is_fresh(path: str, max_age_s: float, *, now: float | None = None)
 
 async def serve(settings: Settings, *, once: bool = False) -> RelayStats:
     database = Database.from_settings(settings)
-    relay = Relay(database, settings)
+    redis = build_redis_bundle(settings, role="relay", source="relay")
+    relay = Relay(database, settings, redis=redis)
     try:
         if once:
             await relay.run_once()
@@ -320,6 +338,7 @@ async def serve(settings: Settings, *, once: bool = False) -> RelayStats:
         else:
             await relay.run()
     finally:
+        await redis.close()
         await database.dispose()
     return relay.stats
 
