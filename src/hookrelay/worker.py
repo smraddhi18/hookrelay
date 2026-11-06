@@ -40,6 +40,7 @@ from pathlib import Path
 from typing import Any
 
 import structlog
+from opentelemetry import trace
 
 from hookrelay.core.config import Settings, get_settings
 from hookrelay.core.logging import configure_logging, redact_text
@@ -47,6 +48,17 @@ from hookrelay.core.security import SecretBox, SecretDecryptionError
 from hookrelay.core.signing import HEADER_SIGNATURE, sign
 from hookrelay.db.engine import Database
 from hookrelay.db.models import DeliveryStatus
+from hookrelay.observability.metrics import SERVICE_WORKER, Metrics
+from hookrelay.observability.runtime import (
+    build_observability,
+    metrics_http_server,
+    shutdown_observability,
+)
+from hookrelay.observability.tracing import (
+    attach_parent_from_headers,
+    inject_trace_headers,
+    start_span,
+)
 from hookrelay.redis_ import RedisBundle, RedisRateLimiter, WakeupSubscriber
 from hookrelay.redis_.runtime import build_redis_bundle, build_wakeup_subscriber
 from hookrelay.relay import heartbeat_is_fresh
@@ -157,12 +169,14 @@ class Worker:
         sender: WebhookSender | None = None,
         redis: RedisBundle | None = None,
         rate_limiter: RedisRateLimiter | None = None,
+        metrics: Metrics | None = None,
     ) -> None:
         self.database = database
         self.settings = settings
         self.worker_id = settings.worker_id or default_worker_id()
         self.redis = redis
         self.rate_limiter = rate_limiter or (None if redis is None else redis.rate_limiter)
+        self.metrics = metrics
         self._wake = asyncio.Event()
         self._wakeup_listening = False
         self._subscriber: WakeupSubscriber | None = None
@@ -238,6 +252,8 @@ class Worker:
             task = asyncio.create_task(self._run_attempt(delivery), name=f"delivery-{delivery.id}")
             self._inflight[delivery.id] = _InFlight(delivery, task)
         self.stats.leased += len(leased)
+        if self.metrics is not None:
+            self.metrics.record_worker_leased(len(leased))
         if leased:
             logger.debug("worker.leased", count=len(leased))
         return len(leased)
@@ -296,6 +312,8 @@ class Worker:
             "user-agent": USER_AGENT,
             **signed.as_dict(),
         }
+        # Propagate W3C trace context (deny-listed as tenant custom headers).
+        inject_trace_headers(headers)
         return WebhookRequest(
             url=delivery.url, headers=headers, body=body, timeout_s=delivery.timeout_ms / 1000
         )
@@ -318,9 +336,26 @@ class Worker:
             )
             headers: dict[str, str] = {}
         else:
-            request = self._build_request(delivery, secret, *self._previous_secret(delivery))
-            headers = loggable_headers(dict(request.headers), delivery.headers)
-            result = await self.sender.send(request, now=started)
+            parent = attach_parent_from_headers(
+                {"traceparent": delivery.traceparent, "tracestate": delivery.tracestate}
+            )
+            with start_span(
+                "hookrelay.delivery",
+                kind=trace.SpanKind.CLIENT,
+                context=parent,
+                attributes={
+                    "hookrelay.tenant_id": str(delivery.tenant_id),
+                    "hookrelay.event_id": str(delivery.event_id),
+                    "hookrelay.endpoint_id": str(delivery.endpoint_id),
+                    "hookrelay.delivery_id": str(delivery.id),
+                    "hookrelay.attempt": delivery.attempt_number,
+                    "http.request.method": "POST",
+                    "url.full": delivery.url,
+                },
+            ):
+                request = self._build_request(delivery, secret, *self._previous_secret(delivery))
+                headers = loggable_headers(dict(request.headers), delivery.headers)
+                result = await self.sender.send(request, now=started)
         return self._record(delivery, result, headers, started)
 
     def _record(
@@ -378,17 +413,24 @@ class Worker:
         }
         if completion is None:
             self.stats.lease_lost += 1
+            if self.metrics is not None:
+                self.metrics.record_worker_lease_lost()
             logger.warning("worker.lease_lost", **fields)
             return None
         match completion.outcome.value:
             case "succeeded":
                 self.stats.succeeded += 1
+                outcome = "succeeded"
             case "retrying":
                 self.stats.retried += 1
+                outcome = "retrying"
             case _:
                 self.stats.failed += 1
+                outcome = "dead" if completion.status is DeliveryStatus.DEAD else "failed"
                 if completion.status is DeliveryStatus.DEAD:
                     self.stats.dead_lettered += 1
+        if self.metrics is not None:
+            self.metrics.record_delivery_attempt(outcome=outcome, latency_ms=record.latency_ms)
         logger.info(
             "worker.attempt",
             outcome=completion.outcome.value,
@@ -560,6 +602,8 @@ class Worker:
                     leased = await self.poll_once()
                 except Exception as exc:
                     self.stats.loop_errors += 1
+                    if self.metrics is not None:
+                        self.metrics.record_worker_loop_error()
                     logger.exception("worker.poll_failed", error=type(exc).__name__)
                 self.touch_heartbeat()
                 if self._stop.is_set():
@@ -586,7 +630,9 @@ class Worker:
 async def serve(settings: Settings, *, once: bool = False) -> WorkerStats:
     database = Database.from_settings(settings)
     redis = build_redis_bundle(settings, role="worker", source="worker")
-    worker = Worker(database, settings, redis=redis)
+    obs = build_observability(settings, service=SERVICE_WORKER)
+    metrics_http_server(settings, obs.metrics)
+    worker = Worker(database, settings, redis=redis, metrics=obs.metrics)
     try:
         if once:
             return await worker.run_once()
@@ -595,6 +641,7 @@ async def serve(settings: Settings, *, once: bool = False) -> WorkerStats:
         await worker.aclose()
         await redis.close()
         await database.dispose()
+        shutdown_observability()
 
 
 def main(argv: list[str] | None = None) -> int:

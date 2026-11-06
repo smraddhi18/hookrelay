@@ -21,6 +21,8 @@ from hookrelay.core.logging import configure_logging
 from hookrelay.core.request_context import RequestContextMiddleware
 from hookrelay.core.security import SecretBox
 from hookrelay.db.engine import Database
+from hookrelay.observability.metrics import SERVICE_API
+from hookrelay.observability.runtime import build_observability, shutdown_observability
 from hookrelay.redis_.runtime import build_redis_bundle
 from hookrelay.services.endpoints import EndpointPolicy
 
@@ -40,8 +42,10 @@ def create_app(settings: Settings | None = None, database: Database | None = Non
     async def lifespan(app: FastAPI) -> AsyncIterator[None]:
         db = database or Database.from_settings(settings)
         redis = build_redis_bundle(settings, role="api", source="api")
+        obs = build_observability(settings, service=SERVICE_API)
         app.state.database = db
         app.state.redis = redis
+        app.state.observability = obs
         app.state.draining = False
         logger.info(
             "app.startup",
@@ -50,6 +54,7 @@ def create_app(settings: Settings | None = None, database: Database | None = Non
             pool_size=settings.db_pool_size,
             operator_api=settings.operator_token is not None,
             redis=redis.enabled,
+            tracing=obs.tracing,
         )
         try:
             # Fail soft: a cold database should make /ready return 503, not crash-loop the pod.
@@ -68,6 +73,7 @@ def create_app(settings: Settings | None = None, database: Database | None = Non
             logger.info("app.shutdown.begin")
             await redis.close()
             await db.dispose()
+            shutdown_observability()
             logger.info("app.shutdown.complete")
 
     app = FastAPI(

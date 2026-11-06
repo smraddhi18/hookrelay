@@ -31,12 +31,21 @@ from dataclasses import asdict, dataclass
 from pathlib import Path
 
 import structlog
+from opentelemetry import trace
 from sqlalchemy.exc import SQLAlchemyError
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from hookrelay.core.config import Settings, get_settings
 from hookrelay.core.logging import configure_logging, redact_text
 from hookrelay.db.engine import Database
+from hookrelay.observability.gauges import refresh_gauges
+from hookrelay.observability.metrics import SERVICE_RELAY, Metrics
+from hookrelay.observability.runtime import (
+    build_observability,
+    metrics_http_server,
+    shutdown_observability,
+)
+from hookrelay.observability.tracing import start_span
 from hookrelay.redis_ import RedisBundle, WakeupPublisher
 from hookrelay.redis_.runtime import build_redis_bundle
 from hookrelay.services import fanout, housekeeping, notifications
@@ -89,6 +98,7 @@ class Relay:
         notifier: notifications.Notifier | None = None,
         redis: RedisBundle | None = None,
         publisher: WakeupPublisher | None = None,
+        metrics: Metrics | None = None,
     ) -> None:
         self.database = database
         self.settings = settings
@@ -96,6 +106,7 @@ class Relay:
         self.redis = redis
         self.publisher = publisher or (None if redis is None else redis.publisher)
         self.cache = None if redis is None else redis.cache
+        self.metrics = metrics
         self.stats = RelayStats()
         self._stop = asyncio.Event()
         self._heartbeat = Path(settings.relay_heartbeat_file)
@@ -112,29 +123,41 @@ class Relay:
 
     async def run_once(self) -> BatchResult:
         """Claim and fan out one batch in one transaction."""
-        async with self.database.session() as session:
-            rows = await fanout.claim_batch(session, batch_size=self.settings.relay_batch_size)
-            if not rows:
-                return BatchResult(claimed=0, processed=0, failed=0, deliveries_created=0)
-            try:
-                async with session.begin_nested():
-                    created = await fanout.fan_out(
-                        session, [r.event_id for r in rows], cache=self.cache
+        with start_span(
+            "hookrelay.fanout",
+            kind=trace.SpanKind.INTERNAL,
+            attributes={"hookrelay.batch_size": self.settings.relay_batch_size},
+        ) as span:
+            async with self.database.session() as session:
+                rows = await fanout.claim_batch(session, batch_size=self.settings.relay_batch_size)
+                if not rows:
+                    return BatchResult(claimed=0, processed=0, failed=0, deliveries_created=0)
+                span.set_attribute("hookrelay.claimed", len(rows))
+                try:
+                    async with session.begin_nested():
+                        created = await fanout.fan_out(
+                            session, [r.event_id for r in rows], cache=self.cache
+                        )
+                        await fanout.mark_processed(session, rows)
+                    result = BatchResult(
+                        claimed=len(rows),
+                        processed=len(rows),
+                        failed=0,
+                        deliveries_created=created,
                     )
-                    await fanout.mark_processed(session, rows)
-                result = BatchResult(
-                    claimed=len(rows), processed=len(rows), failed=0, deliveries_created=created
-                )
-            except SQLAlchemyError as exc:
-                logger.warning(
-                    "relay.batch_failed", rows=len(rows), error=redact_text(type(exc).__name__)
-                )
-                self.stats.batch_fallbacks += 1
-                result = await self._one_by_one(session, rows)
-        self._record(result)
-        if result.deliveries_created > 0:
-            self._notify_workers()
-        return result
+                except SQLAlchemyError as exc:
+                    logger.warning(
+                        "relay.batch_failed",
+                        rows=len(rows),
+                        error=redact_text(type(exc).__name__),
+                    )
+                    self.stats.batch_fallbacks += 1
+                    result = await self._one_by_one(session, rows)
+            self._record(result)
+            span.set_attribute("hookrelay.deliveries_created", result.deliveries_created)
+            if result.deliveries_created > 0:
+                self._notify_workers()
+            return result
 
     def _notify_workers(self) -> None:
         if self.publisher is not None:
@@ -174,6 +197,13 @@ class Relay:
         self.stats.outbox_rows_processed += result.processed
         self.stats.outbox_rows_failed += result.failed
         self.stats.deliveries_created += result.deliveries_created
+        if self.metrics is not None:
+            self.metrics.record_relay_batch()
+            self.metrics.record_outbox_processed(
+                processed=result.processed,
+                deliveries=result.deliveries_created,
+                failed=result.failed,
+            )
         logger.info(
             "relay.batch",
             claimed=result.claimed,
@@ -181,6 +211,16 @@ class Relay:
             failed=result.failed,
             deliveries_created=result.deliveries_created,
         )
+
+    async def refresh_gauges_once(self) -> None:
+        """Push queue-depth / breaker gauges to Prometheus (best-effort)."""
+        if self.metrics is None:
+            return
+        try:
+            async with self.database.session() as session:
+                await refresh_gauges(session, self.metrics)
+        except Exception as exc:
+            logger.warning("relay.gauges_failed", error=type(exc).__name__)
 
     async def housekeep(self) -> housekeeping.SweepResult:
         """Purge expired idempotency keys, old processed outbox rows, expired events, old
@@ -261,7 +301,7 @@ class Relay:
         with contextlib.suppress(TimeoutError):
             await asyncio.wait_for(self._stop.wait(), timeout=seconds)
 
-    async def run(self) -> None:
+    async def run(self) -> None:  # noqa: PLR0912, PLR0915 - main loop with notify/housekeep
         """Poll until :meth:`stop` (or SIGTERM/SIGINT); the in-flight batch always completes."""
         loop = asyncio.get_running_loop()
         installed: list[signal.Signals] = []
@@ -290,6 +330,8 @@ class Relay:
                     claimed = (await self.run_once()).claimed
                 except Exception as exc:
                     self.stats.loop_errors += 1
+                    if self.metrics is not None:
+                        self.metrics.record_relay_loop_error()
                     logger.exception("relay.iteration_failed", error=type(exc).__name__)
                 self.touch_heartbeat()
                 if not self.stopping and time.monotonic() >= next_notify:
@@ -297,13 +339,18 @@ class Relay:
                         await self.notify_once()
                     except Exception as exc:
                         self.stats.loop_errors += 1
+                        if self.metrics is not None:
+                            self.metrics.record_relay_loop_error()
                         logger.exception("relay.notify_failed", error=type(exc).__name__)
                     next_notify = time.monotonic() + self.settings.notification_poll_interval_s
                 if not self.stopping and time.monotonic() >= next_housekeeping:
                     try:
                         await self.housekeep()
+                        await self.refresh_gauges_once()
                     except Exception as exc:
                         self.stats.loop_errors += 1
+                        if self.metrics is not None:
+                            self.metrics.record_relay_loop_error()
                         logger.exception("relay.housekeeping_failed", error=type(exc).__name__)
                     next_housekeeping = (
                         time.monotonic() + self.settings.relay_housekeeping_interval_s
@@ -330,16 +377,20 @@ def heartbeat_is_fresh(path: str, max_age_s: float, *, now: float | None = None)
 async def serve(settings: Settings, *, once: bool = False) -> RelayStats:
     database = Database.from_settings(settings)
     redis = build_redis_bundle(settings, role="relay", source="relay")
-    relay = Relay(database, settings, redis=redis)
+    obs = build_observability(settings, service=SERVICE_RELAY)
+    metrics_http_server(settings, obs.metrics)
+    relay = Relay(database, settings, redis=redis, metrics=obs.metrics)
     try:
         if once:
             await relay.run_once()
             await relay.notify_once()
+            await relay.refresh_gauges_once()
         else:
             await relay.run()
     finally:
         await redis.close()
         await database.dispose()
+        shutdown_observability()
     return relay.stats
 
 
