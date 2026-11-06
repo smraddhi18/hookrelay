@@ -13,6 +13,7 @@ from typing import Annotated, Any
 from fastapi import APIRouter, Header, Query, Request, status
 from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse
+from opentelemetry import trace
 from pydantic import AwareDatetime, ValidationError
 
 from hookrelay.api.body import canonical_json, parse_json, read_body
@@ -34,6 +35,12 @@ from hookrelay.api.deps import PublisherDep, ReaderDep, SettingsDep
 from hookrelay.core.errors import PayloadTooLargeError
 from hookrelay.db.models.event_type import EVENT_TYPE_PATTERN, MAX_EVENT_TYPE_LENGTH
 from hookrelay.db.session import SessionDep
+from hookrelay.observability.metrics import Metrics
+from hookrelay.observability.tracing import (
+    extract_context,
+    span_context_headers,
+    start_span,
+)
 from hookrelay.services import events as service
 from hookrelay.services import idempotency
 
@@ -132,36 +139,56 @@ async def publish_event(
                 },
             )
 
-    event = await service.ingest_event(
-        session,
-        tenant_id=principal.tenant_id,
-        new=service.NewEvent(
-            event_type=body.event_type,
-            payload=body.payload,
-            payload_size=payload_size,
-            external_id=body.external_id,
-            occurred_at=body.occurred_at,
-            idempotency_key=key,
-        ),
-        retention_days=settings.event_retention_days,
-        max_future_skew_s=settings.event_occurred_at_max_future_s,
-    )
-    accepted = EventAccepted.from_model(event).model_dump(mode="json")
-    if key is not None:
-        await idempotency.complete(
+    parent = extract_context(dict(request.headers))
+    with start_span(
+        "hookrelay.ingest",
+        kind=trace.SpanKind.SERVER,
+        context=parent,
+        attributes={
+            "hookrelay.tenant_id": str(principal.tenant_id),
+            "hookrelay.event_type": body.event_type,
+            "http.request.method": "POST",
+        },
+    ) as span:
+        carrier = span_context_headers()
+        event = await service.ingest_event(
             session,
             tenant_id=principal.tenant_id,
-            key=key,
-            event_id=event.id,
-            response=idempotency.StoredResponse(
-                status_code=status.HTTP_202_ACCEPTED, body=accepted
+            new=service.NewEvent(
+                event_type=body.event_type,
+                payload=body.payload,
+                payload_size=payload_size,
+                external_id=body.external_id,
+                occurred_at=body.occurred_at,
+                idempotency_key=key,
+                traceparent=carrier.get("traceparent"),
+                tracestate=carrier.get("tracestate"),
             ),
+            retention_days=settings.event_retention_days,
+            max_future_skew_s=settings.event_occurred_at_max_future_s,
         )
-    return JSONResponse(
-        accepted,
-        status_code=status.HTTP_202_ACCEPTED,
-        headers={"Location": f"{path}/{event.id}"},
-    )
+        span.set_attribute("hookrelay.event_id", str(event.id))
+        metrics: Metrics | None = getattr(
+            getattr(request.app.state, "observability", None), "metrics", None
+        )
+        if metrics is not None:
+            metrics.record_event_ingested()
+        accepted = EventAccepted.from_model(event).model_dump(mode="json")
+        if key is not None:
+            await idempotency.complete(
+                session,
+                tenant_id=principal.tenant_id,
+                key=key,
+                event_id=event.id,
+                response=idempotency.StoredResponse(
+                    status_code=status.HTTP_202_ACCEPTED, body=accepted
+                ),
+            )
+        return JSONResponse(
+            accepted,
+            status_code=status.HTTP_202_ACCEPTED,
+            headers={"Location": f"{path}/{event.id}"},
+        )
 
 
 @router.get("", response_model=PageResponse[EventSummary], summary="List events (newest first)")
