@@ -36,6 +36,9 @@ class NewEvent:
     external_id: str | None = None
     occurred_at: datetime | None = None
     idempotency_key: str | None = None
+    # W3C context captured at ingest (Milestone 7); None when tracing is off.
+    traceparent: str | None = None
+    tracestate: str | None = None
 
 
 async def _require_publishable_type(session: AsyncSession, tenant_id: uuid.UUID, name: str) -> None:
@@ -88,6 +91,9 @@ async def ingest_event(
     }
     if new.occurred_at is not None:
         values["occurred_at"] = new.occurred_at
+    if new.traceparent is not None:
+        values["traceparent"] = new.traceparent
+        values["tracestate"] = new.tracestate
     try:
         # Savepoint: a duplicate external_id must not poison the transaction we report from.
         async with session.begin_nested():

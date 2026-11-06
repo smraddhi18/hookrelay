@@ -81,6 +81,9 @@ class LeasedDelivery:
     run_started_at: datetime | None = None
     # The replaced signing secret while its rotation overlap window is open (else None).
     previous_secret_ciphertext: str | None = None
+    # W3C trace context from the parent event (Milestone 7); None when tracing was off at ingest.
+    traceparent: str | None = None
+    tracestate: str | None = None
 
     @property
     def lease(self) -> Lease:
@@ -226,7 +229,7 @@ _LEASE_SQL = text(
       AND e.tenant_id = d.tenant_id AND e.id = d.endpoint_id
     RETURNING d.id, d.tenant_id, d.event_id, d.endpoint_id, d.lease_token, d.attempt_count,
               d.created_at, d.attempt_offset, d.run_started_at,
-              ev.event_type, ev.payload, ev.occurred_at,
+              ev.event_type, ev.payload, ev.occurred_at, ev.traceparent, ev.tracestate,
               e.url, e.headers, e.timeout_ms, e.secret_ciphertext,
               CASE WHEN e.previous_secret_expires_at > now()
                    THEN e.previous_secret_ciphertext END AS previous_secret_ciphertext
@@ -459,6 +462,8 @@ async def lease_due(
             attempt_offset=r.attempt_offset,
             run_started_at=r.run_started_at,
             previous_secret_ciphertext=r.previous_secret_ciphertext,
+            traceparent=r.traceparent,
+            tracestate=r.tracestate,
         )
         for r in leased_rows
     ]
