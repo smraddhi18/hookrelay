@@ -1,6 +1,7 @@
 # Local stack: Postgres 16 + Redis 7 + a one-shot migration job + the API + the fan-out relay
-# + the delivery worker (+ an on-demand retention job, profile "ops").
+# + the delivery worker + Prometheus / Grafana / Jaeger (+ an on-demand retention job, profile "ops").
 #   docker compose up --build        -> http://localhost:8000/docs
+#   Prometheus http://localhost:9090  Grafana http://localhost:3000  Jaeger http://localhost:16686
 #   docker compose down -v           -> stop and wipe data
 name: hookrelay
 
@@ -47,6 +48,13 @@ x-app-env: &app-env
   EVENT_PAYLOAD_RETENTION_DAYS: ${EVENT_PAYLOAD_RETENTION_DAYS:-0}
   RETENTION_BATCH_SIZE: ${RETENTION_BATCH_SIZE:-500}
   RETENTION_MAX_BATCHES: ${RETENTION_MAX_BATCHES:-200}
+  # Observability (Milestone 7). /metrics is public; set METRICS_TOKEN to require a bearer.
+  METRICS_ENABLED: ${METRICS_ENABLED:-true}
+  METRICS_TOKEN: ${METRICS_TOKEN:-}
+  OTEL_EXPORTER_OTLP_ENDPOINT: ${OTEL_EXPORTER_OTLP_ENDPOINT:-http://jaeger:4318}
+  TRACING_SAMPLE_RATIO: ${TRACING_SAMPLE_RATIO:-1}
+  DASHBOARD_DEFAULT_WINDOW_S: ${DASHBOARD_DEFAULT_WINDOW_S:-3600}
+  DASHBOARD_MAX_WINDOW_S: ${DASHBOARD_MAX_WINDOW_S:-604800}
 
 services:
   postgres:
@@ -106,7 +114,11 @@ services:
   relay:
     image: hookrelay:local
     command: ["python", "-m", "hookrelay.relay"]
-    environment: *app-env
+    environment:
+      <<: *app-env
+      METRICS_PORT: ${RELAY_METRICS_PORT:-9101}
+    ports:
+      - "${RELAY_METRICS_PORT:-9101}:9101"
     depends_on:
       migrate:
         condition: service_completed_successfully
@@ -127,7 +139,11 @@ services:
   worker:
     image: hookrelay:local
     command: ["python", "-m", "hookrelay.worker"]
-    environment: *app-env
+    environment:
+      <<: *app-env
+      METRICS_PORT: ${WORKER_METRICS_PORT:-9102}
+    ports:
+      - "${WORKER_METRICS_PORT:-9102}:9102"
     depends_on:
       migrate:
         condition: service_completed_successfully
@@ -154,6 +170,54 @@ services:
         condition: service_completed_successfully
     restart: "no"
 
+
+  # Observability stack (Milestone 7). Always-on and lightweight; scrape api/relay/worker.
+  prometheus:
+    image: prom/prometheus:v2.55.1
+    command:
+      - --config.file=/etc/prometheus/prometheus.yml
+      - --storage.tsdb.path=/prometheus
+      - --web.enable-lifecycle
+    volumes:
+      - ./deploy/prometheus/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+      - prometheusdata:/prometheus
+    ports:
+      - "9090:9090"
+    depends_on:
+      - api
+    restart: unless-stopped
+
+  grafana:
+    image: grafana/grafana:11.3.1
+    environment:
+      GF_SECURITY_ADMIN_USER: admin
+      GF_SECURITY_ADMIN_PASSWORD: ${GRAFANA_ADMIN_PASSWORD:-EXAMPLE-local-only-not-for-prod}
+      GF_USERS_ALLOW_SIGN_UP: "false"
+      GF_AUTH_ANONYMOUS_ENABLED: "true"
+      GF_AUTH_ANONYMOUS_ORG_ROLE: Viewer
+    volumes:
+      - ./deploy/grafana/provisioning:/etc/grafana/provisioning:ro
+      - ./deploy/grafana/dashboards:/var/lib/grafana/dashboards:ro
+      - grafanadata:/var/lib/grafana
+    ports:
+      - "3000:3000"
+    depends_on:
+      - prometheus
+      - jaeger
+    restart: unless-stopped
+
+  # Jaeger all-in-one: OTLP HTTP on 4318, UI on 16686.
+  jaeger:
+    image: jaegertracing/all-in-one:1.62
+    environment:
+      COLLECTOR_OTLP_ENABLED: "true"
+    ports:
+      - "16686:16686"
+      - "4318:4318"
+    restart: unless-stopped
+
 volumes:
   pgdata:
   redisdata:
+  prometheusdata:
+  grafanadata:
