@@ -105,6 +105,9 @@ class Event(Base):
     )
     retain_until: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
     fanned_out_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    # W3C trace context captured at ingest (Milestone 7); continued by relay/worker.
+    traceparent: Mapped[str | None] = mapped_column(String(55))
+    tracestate: Mapped[str | None] = mapped_column(String(512))
 
     def __repr__(self) -> str:
         return f"Event(id={self.id!s}, event_type={self.event_type!r})"
