@@ -1,0 +1,26 @@
+# Scrapes the API /metrics endpoint and optional relay/worker side-car ports.
+global:
+  scrape_interval: 15s
+  evaluation_interval: 15s
+
+scrape_configs:
+  - job_name: hookrelay-api
+    metrics_path: /metrics
+    static_configs:
+      - targets: ["api:8000"]
+        labels:
+          service: api
+
+  - job_name: hookrelay-relay
+    metrics_path: /metrics
+    static_configs:
+      - targets: ["relay:9101"]
+        labels:
+          service: relay
+
+  - job_name: hookrelay-worker
+    metrics_path: /metrics
+    static_configs:
+      - targets: ["worker:9102"]
+        labels:
+          service: worker
