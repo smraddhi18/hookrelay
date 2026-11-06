@@ -245,6 +245,25 @@ class Settings(BaseSettings):
     retention_max_batches: Annotated[int, Field(ge=1, le=100_000)] = 200
     retention_batch_pause_ms: Annotated[int, Field(ge=0, le=60_000)] = 50
 
+    # Observability (Milestone 7).
+    # /metrics is scrapeable without tenant auth. Set METRICS_TOKEN to require
+    # Authorization: Bearer <token> (Prometheus bearer_token / authorization credentials).
+    metrics_enabled: bool = True
+    metrics_token: SecretStr | None = None
+    # Side-car scrape port for relay/worker (0 / unset = no side-car; API uses GET /metrics).
+    metrics_port: Annotated[int, Field(ge=0, le=65535)] | None = None
+    # OpenTelemetry: off unless an OTLP endpoint is set (or TRACING_ENABLED=true with exporter).
+    # Accepts OTEL_EXPORTER_OTLP_ENDPOINT or TRACING_OTLP_ENDPOINT.
+    otel_exporter_otlp_endpoint: str | None = None
+    tracing_otlp_endpoint: str | None = None
+    tracing_enabled: bool | None = None
+    tracing_service_name: str | None = None
+    tracing_sample_ratio: Annotated[float, Field(ge=0, le=1)] = 1.0
+    # Tenant dashboard (GET /v1/dashboard): default and widest window, max attempts sampled.
+    dashboard_default_window_s: Annotated[int, Field(ge=60, le=30 * 86_400)] = 3_600
+    dashboard_max_window_s: Annotated[int, Field(ge=60, le=30 * 86_400)] = 7 * 86_400
+    dashboard_max_attempts: Annotated[int, Field(ge=100, le=1_000_000)] = 50_000
+
     @field_validator("database_url", mode="before")
     @classmethod
     def _normalize_db_url(cls, value: object) -> object:
@@ -434,8 +453,43 @@ class Settings(BaseSettings):
             return False
         return True if self.rate_limit_redis_enabled is None else self.rate_limit_redis_enabled
 
+    @model_validator(mode="after")
+    def _check_dashboard(self) -> Self:
+        if self.dashboard_default_window_s > self.dashboard_max_window_s:
+            raise ValueError("DASHBOARD_DEFAULT_WINDOW_S must not exceed DASHBOARD_MAX_WINDOW_S")
+        return self
+
+    @field_validator("metrics_token", mode="before")
+    @classmethod
+    def _empty_metrics_token(cls, value: object) -> object:
+        raw = value.get_secret_value() if isinstance(value, SecretStr) else value
+        if raw is None or (isinstance(raw, str) and not raw.strip()):
+            return None
+        return value
+
+    @field_validator("otel_exporter_otlp_endpoint", "tracing_otlp_endpoint", mode="before")
+    @classmethod
+    def _empty_otlp(cls, value: object) -> object:
+        if isinstance(value, str) and not value.strip():
+            return None
+        return value
+
+    @property
+    def tracing_endpoint(self) -> str | None:
+        """Resolved OTLP HTTP endpoint (TRACING_OTLP_ENDPOINT wins over OTEL_*)."""
+        return self.tracing_otlp_endpoint or self.otel_exporter_otlp_endpoint
+
+    @property
+    def tracing_enabled_effective(self) -> bool:
+        if self.tracing_enabled is False:
+            return False
+        if self.tracing_enabled is True:
+            return True
+        return self.tracing_endpoint is not None
+
     @property
     def is_production(self) -> bool:
+
         return self.app_env is Environment.PRODUCTION
 
     @property
