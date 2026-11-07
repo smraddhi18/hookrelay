@@ -37,6 +37,10 @@ def make_settings(**overrides: Any) -> Settings:
         ),
         # Pin redis_url so a developer's shell REDIS_URL cannot leak into unit tests.
         "redis_url": None,
+        # Tracing off unless a test opts in (shell OTEL_* must not open exporters).
+        "otel_exporter_otlp_endpoint": None,
+        "tracing_otlp_endpoint": None,
+        "tracing_enabled": False,
     }
     base.update(overrides)
     return Settings(**_ISOLATED_ENV, **base)  # type: ignore[arg-type]
