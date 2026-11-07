@@ -70,12 +70,12 @@ Legend: `[x]` done, `[ ]` planned.
 - [x] Cached subscription lookups for fan-out with explicit invalidation
 - [x] Token-bucket rate limits in Redis (Lua), degraded-mode behaviour when Redis is down
 
-## Milestone 7: Observability
+## Milestone 7: Observability ✅
 
-- [ ] Prometheus metrics (ingest rate, fan-out lag, delivery latency histograms, attempts by outcome, breaker states, queue depth)
-- [ ] OpenTelemetry tracing from ingest → fan-out → delivery (trace context propagated to webhooks)
-- [ ] Dashboard API (throughput, success rate, latency percentiles per tenant / endpoint)
-- [ ] Prometheus + Grafana + Jaeger in compose
+- [x] Prometheus metrics (ingest rate, fan-out lag, delivery latency histograms, attempts by outcome, breaker states, queue depth)
+- [x] OpenTelemetry tracing from ingest → fan-out → delivery (trace context propagated to webhooks)
+- [x] Dashboard API (throughput, success rate, latency percentiles per tenant / endpoint)
+- [x] Prometheus + Grafana + Jaeger in compose
 
 ## Milestone 8: Load, chaos and capacity
 
@@ -188,3 +188,29 @@ Legend: `[x]` done, `[ ]` planned.
   ruff format, mypy strict, Alembic `check` pass; the OpenAPI deny-by-default audit still covers
   every route (M6 adds none).
 - Next: Milestone 7 (Observability: Prometheus metrics, OpenTelemetry tracing, dashboard API).
+
+### 2026-11-06: Milestone 7 complete
+
+- Prometheus metrics via ``prometheus-client``: process-local registry with ``service=api|relay|worker``
+  labels. Counters/histograms cover event ingest, outbox processing, delivery attempts by outcome
+  and latency; gauges cover outbox pending/lag, deliveries pending/delivering and circuit-breaker
+  state counts. ``GET /metrics`` is unauthenticated by default (scrape-network assumption; never
+  exposes tenant payloads) and optionally protected by ``METRICS_TOKEN``. Relay/worker expose a
+  side-car scrape port when ``METRICS_PORT`` is set. Gauges refresh from Postgres on scrape / on
+  the relay housekeeping interval.
+- OpenTelemetry tracing (off unless ``OTEL_EXPORTER_OTLP_ENDPOINT`` / ``TRACING_OTLP_ENDPOINT`` is
+  set): ingest → fan-out → delivery spans. W3C ``traceparent``/``tracestate`` are persisted on
+  ``events`` (migration ``0010``) so the worker continues the ingest trace and injects those
+  headers on outbound webhooks (deny-listed as tenant custom headers).
+- Tenant dashboard ``GET /v1/dashboard`` (reader+): throughput, success rate, latency p50/p95/p99
+  and per-endpoint breakdown over a bounded window, computed on read from ``delivery_attempts``
+  like endpoint health (no counter drift).
+- Compose adds Prometheus (9090), Grafana (3000) and Jaeger all-in-one (16686 / OTLP 4318) with
+  scrape config under ``deploy/``; ``.env.example`` documents the new knobs.
+- New deps: ``prometheus-client``, ``opentelemetry-api``, ``opentelemetry-sdk``,
+  ``opentelemetry-exporter-otlp-proto-http``. Migration ``0010`` (trace columns only).
+- 903 tests (all passing; Postgres 16 + Redis 7 integration), ~96% line+branch coverage; ruff,
+  ruff format, mypy strict, Alembic `check` pass; the OpenAPI deny-by-default audit treats
+  `/metrics` as public (optional `METRICS_TOKEN` at runtime). Docker unavailable on the build
+  host; CI covers the image.
+- Next: Milestone 8 (load, chaos and capacity).

@@ -66,7 +66,7 @@ See the **[roadmap](ROADMAP.md)** for the plan and progress log.
 | Operability | Endpoint health `GET /v1/endpoints/{id}/health`: success rate, p50 / p95 / p99 latency, errors by class, last error, breaker state, backlog; bounded window and sample | ✅ M5 |
 | Operability | Payload retention (`EVENT_PAYLOAD_RETENTION_DAYS`) + cleanup job: batched, budgeted, `SKIP LOCKED`, never purges a payload still being delivered; runs in relay housekeeping or as `hookrelay-retention` | ✅ M5 |
 | Redis | Worker wake-ups via Redis pub/sub (Postgres poll fallback); subscription-cache for fan-out with explicit invalidation; Lua token-bucket rate limits with Postgres degraded mode (never fail open) | ✅ M6 |
-| Observability | Prometheus metrics, OpenTelemetry tracing, dashboard API | 🔜 M7 |
+| Observability | Prometheus metrics, OpenTelemetry tracing, dashboard API | ✅ M7 |
 | Scale | k6/locust load tests, chaos tests, capacity plan | 🔜 M8 |
 
 ## Architecture
@@ -1007,6 +1007,21 @@ All settings are environment variables (or `.env`), validated at startup. See
 | `EVENT_PAYLOAD_RETENTION_DAYS` | `0` | drop event payloads (and stored response bodies) this long after the event once every delivery is settled; must be `< EVENT_RETENTION_DAYS`; `0` = keep until the event expires |
 | `RETENTION_BATCH_SIZE` / `RETENTION_MAX_BATCHES` / `RETENTION_BATCH_PAUSE_MS` | `500` / `200` / `50` | rows per retention transaction / batches per task per run / pause between batches |
 
+### Observability (Milestone 7)
+
+| Variable | Default | Notes |
+|---|---|---|
+| `METRICS_ENABLED` | `true` | Serve `GET /metrics` (Prometheus text exposition). |
+| `METRICS_TOKEN` | unset | Optional bearer token for `/metrics`. Unset = scrapeable without auth (private scrape network). Never exposes tenant payloads. |
+| `METRICS_PORT` | unset | Side-car scrape HTTP port for relay/worker (`0`/unset = off). API always uses `/metrics` on its main port. |
+| `OTEL_EXPORTER_OTLP_ENDPOINT` / `TRACING_OTLP_ENDPOINT` | unset | OTLP HTTP base or `/v1/traces` URL. Tracing is **off** when unset. |
+| `TRACING_ENABLED` | auto | Force on/off; default on when an OTLP endpoint is set. |
+| `TRACING_SAMPLE_RATIO` | `1` | Parent-based trace-id ratio sampler. |
+| `DASHBOARD_DEFAULT_WINDOW_S` / `DASHBOARD_MAX_WINDOW_S` | `3600` / `604800` | `GET /v1/dashboard` look-back window bounds. |
+| `DASHBOARD_MAX_ATTEMPTS` | `50000` | Cap on attempts sampled per dashboard request. |
+
+Compose also starts Prometheus (`:9090`), Grafana (`:3000`, admin/`EXAMPLE-local-only-not-for-prod`) and Jaeger all-in-one (`:16686`, OTLP `:4318`). Scrape config and a starter dashboard live under `deploy/`.
+
 ## API
 
 Interactive docs: `/docs` (Swagger UI), `/redoc`, schema at `/openapi.json` (disable with
@@ -1016,6 +1031,7 @@ Interactive docs: `/docs` (Swagger UI), `/redoc`, schema at `/openapi.json` (dis
 | --- | --- | --- | --- |
 | `GET` | `/health` | Liveness: process is up (no dependency checks) | `200 {"status":"ok","service","version"}` |
 | `GET` | `/ready` | Readiness: Postgres reachable within `READINESS_TIMEOUT_S` and not draining | `200` / `503` with per-check status and latency |
+| `GET` | `/metrics` | Prometheus scrape (unauthenticated by default; optional `METRICS_TOKEN` bearer). Never includes tenant payloads. | `200` text exposition / `401` / `404` when disabled |
 
 **Operator API** (`Authorization: Bearer $OPERATOR_TOKEN`):
 
@@ -1045,6 +1061,7 @@ Interactive docs: `/docs` (Swagger UI), `/redoc`, schema at `/openapi.json` (dis
 | `POST` | `/v1/endpoints/{endpoint_id}/secret/rotate` | Rotate the signing secret, **requires `If-Match`**; body optional: `overlap_s` (dual signing, `0` = cutover), `secret` (bring your own `whsec_`); returns the new secret once, `previous_secret_expires_at`, `ETag` | admin |
 | `DELETE` | `/v1/endpoints/{endpoint_id}/secret/previous` | End the overlap now: stop signing with the previous secret (idempotent, `If-Match` optional) | admin |
 | `GET` | `/v1/endpoints/{endpoint_id}/health` | Health over `?window_s=` (default `ENDPOINT_HEALTH_DEFAULT_WINDOW_S`): attempts by outcome, `success_rate`, p50 / p95 / p99 latency, `errors_by_class`, `last_error`, `last_success_at`, breaker, backlog | reader |
+| `GET` | `/v1/dashboard` | Tenant dashboard over `?window_s=`: throughput/min, success rate, latency percentiles, backlog, top endpoints | reader |
 | `GET` / `POST` | `/v1/event-types` | List (`?include_archived=`) / register | reader / publisher |
 | `GET` / `PATCH` | `/v1/event-types/{name}` | Get / update description or archive (`If-Match`) | reader / publisher |
 | `GET` / `POST` | `/v1/endpoints/{endpoint_id}/subscriptions` | List / subscribe to `invoice.paid`, `invoice.*` or `*` | reader / admin |
@@ -1249,11 +1266,12 @@ src/hookrelay/
   redis_/               fail-soft redis.asyncio client, keys, coalescer, wakeup pub/sub, subscription
                         cache, Lua rate limiter, process runtime helpers (named redis_ so it does not
                         shadow the redis package)
+  observability/        Prometheus metrics registry, OpenTelemetry setup + W3C propagation, gauge refresh
   api/
     deps.py             auth dependencies (operator token, API key → Principal, roles)
     contracts/          request/response models with OpenAPI examples
     routers/            thin HTTP layer: admin_tenants, api_keys, endpoints, event_types, subscriptions,
-                        events, deliveries, replays, me, health
+                        events, deliveries, replays, dashboard, me, health, metrics
     body.py             bounded body reading, strict JSON parsing, canonical JSON
     etag.py             ETag / If-Match parsing
   core/                 config, logging (redaction), errors, request context, security (keys, SecretBox),
@@ -1265,9 +1283,11 @@ src/hookrelay/
                         (classification, backoff, Retry-After), ssrf (address vetting + guarded backend),
                         webhook_client (httpx), deliveries (read API), circuit_breaker (breaker state
                         machine + outcome recording), notifications (outbox + notifier), replays,
-                        endpoint_secrets (rotation), endpoint_health (summary), retention (payload
-                        purge + ended secret overlaps, batched runner); deliveries also holds search
-alembic/                async env + versioned migrations (0001 tenants ... 0009 tenant operability)
+                        endpoint_secrets (rotation), endpoint_health (summary), dashboard (tenant
+                        rollup), retention (payload purge + ended secret overlaps, batched runner);
+                        deliveries also holds search
+  deploy/               Prometheus scrape config, Grafana provisioning + starter dashboard
+alembic/                async env + versioned migrations (0001 tenants ... 0010 observability trace context)
 tests/receiver.py       raw-asyncio HTTP receiver + fake resolver used by delivery tests
 tests/unit/             fast tests (fake database / mocked Redis): config, security, rules, pagination,
                         auth wiring audit, signing vectors, backoff / Retry-After, SSRF ranges, HTTP
@@ -1277,7 +1297,8 @@ tests/integration/      real Postgres + Redis: migrations, schema constraints, f
                         workers, fencing, lease expiry, retries, SIGTERM drain, end-to-end signed
                         delivery, breaker lifecycle, in-flight / rate limits, fairness, auto-disable,
                         replays, secret rotation, delivery search + health, retention races, wake-up
-                        short-circuit, subscription-cache hit/miss/invalidate, Redis RL + degraded mode
+                        short-circuit, subscription-cache hit/miss/invalidate, Redis RL + degraded mode,
+                        dashboard + /metrics after a real delivery
 ```
 
 ## Scaling notes
