@@ -10,7 +10,7 @@ import pytest
 from hookrelay.main import create_app
 from tests.conftest import TEST_OPERATOR_TOKEN, FakeDatabase, make_settings, serve
 
-PUBLIC_PATHS = {"/health", "/ready"}
+PUBLIC_PATHS = {"/health", "/ready", "/metrics"}
 ZERO_ID = "00000000-0000-0000-0000-000000000000"
 HTTP_METHODS = {"get", "post", "put", "patch", "delete"}
 
