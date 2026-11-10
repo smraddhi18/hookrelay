@@ -97,6 +97,74 @@ jobs:
           uv run pytest tests/integration -q -rs | tee integration.log
           if grep -q "SKIPPED" integration.log; then echo "integration tests were skipped" >&2; exit 1; fi
 
+  loadtest:
+    name: Load-test smoke (k6, Postgres 16 + Redis 7)
+    # A wiring check, not a benchmark: shared runners are too noisy for capacity numbers
+    # (see docs/capacity.md for measured ones). It runs the real API, relay, two workers and
+    # the mock receiver as processes and fails on any lost or twice-acknowledged delivery.
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_USER: hookrelay
+          POSTGRES_PASSWORD: hookrelay
+          POSTGRES_DB: hookrelay
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U hookrelay -d hookrelay"
+          --health-interval 2s
+          --health-timeout 3s
+          --health-retries 30
+      redis:
+        image: redis:7-alpine
+        ports:
+          - 6379:6379
+        options: >-
+          --health-cmd "redis-cli ping"
+          --health-interval 2s
+          --health-timeout 3s
+          --health-retries 30
+    env:
+      DATABASE_URL: postgresql+asyncpg://hookrelay:hookrelay@localhost:5432/hookrelay
+      REDIS_URL: redis://localhost:6379/0
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v10.3.3
+        with:
+          version: ${{ env.UV_VERSION }}
+          python-version: ${{ env.PYTHON_VERSION }}
+          enable-cache: true
+      - name: Install (locked)
+        run: uv sync --locked
+      - name: Setup k6
+        uses: grafana/setup-k6-action@v1
+        with:
+          k6-version: "2.3.0"
+      - name: k6 ingest smoke (50 req/s for 10 s, < 1% errors, p95 < 250 ms)
+        env:
+          OUT_DIR: k6-ingest
+        run: bash loadtest/run-local.sh ingest.js -e RATE=50 -e DURATION=10s
+      - name: k6 end-to-end smoke (flaky receivers; no lost or duplicated deliveries)
+        env:
+          OUT_DIR: k6-e2e
+        run: |
+          bash loadtest/run-local.sh e2e.js -e RATE=25 -e DURATION=15s -e ENDPOINTS=2 \
+            -e 'RECEIVER_QUERY=latency_ms=10&jitter_ms=20&failure_rate=0.05&failure_status=500,503' \
+            -e E2E_P95_MS=10000 -e DRAIN_TIMEOUT_S=90
+          jq . k6-e2e/receiver-stats.json
+      - name: Upload k6 summaries and process logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: k6-smoke
+          path: |
+            k6-ingest/
+            k6-e2e/
+          retention-days: 7
+
   docker:
     name: Docker build & smoke test
     runs-on: ubuntu-24.04
