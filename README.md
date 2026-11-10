@@ -15,7 +15,9 @@ migrations with downgrade paths, tests against real Postgres, containers and CI 
 See the **[roadmap](ROADMAP.md)** for the plan and progress log.
 
 > **Status:** Milestones 0 (foundation), 1 (tenancy), 2 (ingestion), 3 (delivery workers),
-> 4 (back-pressure and failure isolation) and 5 (operability for tenants) are complete. Tenants authenticate with hashed, role-scoped API keys, manage endpoints, event types
+> 4 (back-pressure and failure isolation), 5 (operability for tenants), 6 (Redis), 7 (observability)
+> and 8 (load, chaos and capacity) are complete; Milestone 9 (time partitioning and a Kubernetes
+> deploy) is next. Tenants authenticate with hashed, role-scoped API keys, manage endpoints, event types
 > and wildcard subscriptions, and publish events through `POST /v1/events` with `Idempotency-Key`
 > support. Each event and its outbox row commit in one transaction; a relay process fans the
 > outbox out into exactly one `delivery` per (event, endpoint); and delivery workers lease due
@@ -28,6 +30,10 @@ See the **[roadmap](ROADMAP.md)** for the plan and progress log.
 > deliveries can be replayed singly, per event or in bulk. Tenants rotate signing secrets with a
 > dual-signing overlap window, search their delivery log, read a per-endpoint health summary, and
 > a bounded, concurrent-safe retention job drops old payloads and ended secret overlaps.
+> Redis accelerates wake-ups, fan-out lookups and rate limits without being needed for
+> correctness; Prometheus metrics, OpenTelemetry traces and a tenant dashboard make it observable;
+> and k6 load tests, chaos tests (worker `SIGKILL`, Postgres restarts, slow / failing receivers)
+> and a measured [capacity plan](docs/capacity.md) show how far one box goes and what breaks first.
 
 ## Features
 
@@ -67,7 +73,10 @@ See the **[roadmap](ROADMAP.md)** for the plan and progress log.
 | Operability | Payload retention (`EVENT_PAYLOAD_RETENTION_DAYS`) + cleanup job: batched, budgeted, `SKIP LOCKED`, never purges a payload still being delivered; runs in relay housekeeping or as `hookrelay-retention` | ✅ M5 |
 | Redis | Worker wake-ups via Redis pub/sub (Postgres poll fallback); subscription-cache for fan-out with explicit invalidation; Lua token-bucket rate limits with Postgres degraded mode (never fail open) | ✅ M6 |
 | Observability | Prometheus metrics, OpenTelemetry tracing, dashboard API | ✅ M7 |
-| Scale | k6/locust load tests, chaos tests, capacity plan | 🔜 M8 |
+| Scale | k6 load tests (`loadtest/`): constant-rate ingest and end-to-end delivery to `hookrelay-mock-receiver` (latency, jitter, failure / `429` / hang rates per endpoint), failing on any lost or twice-acknowledged delivery; CI smoke job | ✅ M8 |
+| Scale | Chaos tests on real Postgres: worker `SIGKILL` mid-delivery, backend-termination storms, a backend killed between the receiver's 2xx and the completion write, slow / flaky / hanging receivers, drain during an outage; a real `pg_ctl restart` under load (`CHAOS_CMD`) | ✅ M8 |
+| Scale | Restart-safe write paths: transient DB errors (incl. `57P03` while Postgres restarts) are `503` + `Retry-After` on the API and fenced, retried completions in workers; sharded HTTP connection pools; measured [capacity plan](docs/capacity.md) | ✅ M8 |
+| Scale | Time partitioning of hot tables, PgBouncer, Helm chart + autoscaling on queue depth | 🔜 M9 |
 
 ## Architecture
 
@@ -106,6 +115,12 @@ flowchart LR
     EP["Tenant endpoints<br/>(HTTPS receivers)"]
     OBS["Prometheus / Grafana / Jaeger"]
 
+    subgraph Harness["Load & chaos harness (M8, dev / CI only)"]
+        K6["k6<br/>ingest.js / e2e.js"]
+        MOCK["hookrelay-mock-receiver<br/>latency, failures, hangs,<br/>ack accounting"]
+        CHAOS["Chaos: worker SIGKILL,<br/>Postgres restart / backend kills"]
+    end
+
     P -->|signed API key| ING
     T --> MGMT
     ING -->|"one transaction:<br/>event + outbox row"| EV
@@ -121,6 +136,11 @@ flowchart LR
     DW -. rate limit / breaker .-> R
     API -. metrics, traces .-> OBS
     Workers -. metrics, traces .-> OBS
+    K6 -.->|"constant-rate POST /v1/events"| ING
+    SSRF -.->|"loopback in dev / CI"| MOCK
+    K6 -.->|"poll /stats: lost or acked twice?"| MOCK
+    CHAOS -. faults .-> PG
+    CHAOS -. faults .-> DW
 ```
 
 ### Tenancy and auth (Milestone 1)
@@ -393,6 +413,43 @@ When `REDIS_URL` is unset every Redis feature is off and the M0–M5 Postgres pa
 Losing Redis after it was configured degrades latency / hot-path contention, never correctness or
 at-least-once delivery.
 
+### Load, chaos and capacity (Milestone 8)
+
+```mermaid
+flowchart LR
+    subgraph Run["loadtest/run-local.sh (one machine)"]
+        K6["k6 script<br/>ingest.js | e2e.js"]
+        API["API<br/>(API_WORKERS uvicorn processes)"]
+        REL["relay(s)"]
+        WK["workers<br/>(WORKERS × WORKER_CONCURRENCY)"]
+        MOCK["mock receiver<br/>?latency_ms&jitter_ms&failure_rate<br/>&failure_status&hang_rate"]
+        CH["CHAOS_CMD after CHAOS_AFTER_S<br/>(e.g. pg_ctl restart)"]
+    end
+    PG[("Postgres 16")]
+    RD[("Redis 7")]
+    OUT["OUT_DIR: k6 summary JSON,<br/>receiver /stats, process logs"]
+
+    K6 -->|"provision tenant + endpoints<br/>(operator API)"| API
+    K6 -->|"constant-arrival-rate<br/>POST /v1/events"| API
+    API --> PG
+    REL --> PG
+    WK --> PG
+    REL -. wake-ups .-> RD
+    RD -. wake-ups .-> WK
+    WK -->|"signed POSTs"| MOCK
+    K6 -->|"teardown: events × ENDPOINTS<br/>== acked_unique? duplicates == 0?"| MOCK
+    CH -. fault .-> PG
+    K6 --> OUT
+    MOCK --> OUT
+```
+
+The mock receiver counts a delivery as **acknowledged** only when a 2xx was written to a client
+that was still connected (a sender that timed out and hung up is `disconnected`), keyed by
+`(path, webhook-id)`. "Lost" is `expected - acked_unique`; "acked twice" is the duplicate a
+receiver would actually process twice. The chaos tests run the same receiver in-process and also
+reconcile it against `delivery_attempts` (every extra acknowledgement must be explained by a
+`lease_expired` attempt).
+
 ### Request flow (with auth)
 
 1. `RequestContextMiddleware` (pure ASGI) reads `X-Request-ID`. A caller-supplied ID is kept only
@@ -589,7 +646,9 @@ at-least-once delivery.
   therefore guarantees at-least-once delivery and sends a stable `webhook-id` so receivers can de-duplicate.
 - **FastAPI with async I/O.** The workload is I/O-bound: many concurrent outbound HTTP calls with slow
   receivers, plus Postgres round-trips. asyncio lets one process keep hundreds of requests in flight cheaply.
-  FastAPI gives typed request/response models and OpenAPI docs for free. CPU work (HMAC, JSON) is small.
+  FastAPI gives typed request/response models and OpenAPI docs for free. CPU work (HMAC, JSON) is small
+  per request, but it adds up: M8 measured ≈ 2 ms of worker CPU per delivery, so one worker process
+  tops out near one core and scales out by processes ([capacity plan](docs/capacity.md)).
 - **SQLAlchemy 2 async + asyncpg, Alembic for migrations.** Explicit SQL control where it matters
   (`SKIP LOCKED`, `RETURNING`, advisory locks) while keeping typed models. Every migration has
   a downgrade, and CI checks `upgrade → upgrade → check → downgrade → upgrade`.
@@ -849,6 +908,52 @@ at-least-once delivery.
   `redis` dependency on some import paths; the trailing underscore keeps the layout obvious without
   that footgun.
 
+### Milestone 8 decisions
+
+- **k6 against real processes, not in-process benchmarks.** The harness starts the API, relay,
+  workers and the mock receiver exactly as deployed (separate processes, real Postgres and Redis),
+  so the numbers include serialisation, connection pools and the OS scheduler. k6 (Go) generates
+  constant-arrival-rate load without the coordinated-omission problem of closed-loop Python load
+  generators.
+- **Correctness is the threshold, speed is reported.** `e2e.js` fails on any lost delivery or any
+  delivery acknowledged twice; throughput and lag are recorded, not asserted (except a generous lag
+  bound). CI runs a short smoke on every push as a wiring check; shared runners are too noisy for
+  capacity numbers, which come from dedicated runs written up in [docs/capacity.md](docs/capacity.md).
+- **A purpose-built mock receiver.** Per-endpoint behaviour in the URL query string
+  (`?latency_ms=800&failure_rate=0.2`), seeded randomness for repeatable runs, `Retry-After` on
+  `429` / `503`, and hangs past the sender's timeout. Its accounting distinguishes *received* from
+  *acknowledged* (2xx written to a still-connected client), which is what at-least-once is about.
+- **Deterministic chaos in CI.** Faults are injected at exact points (a worker `SIGKILL`-ed while the
+  receiver holds its 8 requests, a backend killed between the receiver's 2xx and the completion
+  write) instead of random sleeps, so the tests assert exact attempt / duplicate counts and never
+  flake on timing. "Postgres restart" in CI is a loop of `pg_terminate_backend` over every session of
+  the test database (what clients observe during a restart or failover; service containers cannot
+  be restarted mid-job); a real `pg_ctl restart` under load is reproduced locally with
+  `CHAOS_CMD` and is in the capacity plan.
+- **Retry the completion, not the request.** A Postgres blip right after a receiver's 2xx used to
+  mean the lease expired and the message was sent again. The worker now retries the completion
+  write on transient DB errors with capped exponential backoff (`WORKER_COMPLETE_RETRIES`). It is
+  safe because completion is fenced by the lease token: a retry after a commit whose
+  acknowledgement was lost matches nothing and is reported as a lost lease, never applied twice.
+- **Classify by SQLSTATE, not by exception class.** The real restart run showed that a restarting
+  server refuses new connections with `57P03`, which SQLAlchemy surfaces as a generic `DBAPIError`
+  that is not flagged as a disconnect. Connection-level SQLSTATEs (`08xxx`, `57P01-57P03`, `53300`)
+  are now transient: the API answers `503 database_unavailable` + `Retry-After` (clients retry with
+  the same `Idempotency-Key`), workers retry completions, and the relay abandons the batch for a
+  fresh connection instead of running poison-row isolation. Statement-level failures (timeouts,
+  constraint violations) are deliberately *not* transient for the relay, so a poisonous row is still
+  parked rather than retried forever.
+- **Profile, then fix the measured hot spot.** The worker was CPU-bound well below the Little's-law
+  limit. httpcore scans all pooled connections on every request, so the transport now shards its
+  pool (≤ 16 connections per shard, least-busy shard): 120.7 → 472.0 deliveries/s for one 128-slot
+  worker on the benchmark box. `sniffio` is declared explicitly because its absence turned
+  httpcore's async-backend probe into a failed import per pool operation. A short refill linger
+  batches lease transactions at saturation; it measured within noise and is kept as a cheap bound
+  on lease-transaction rate (`WORKER_REFILL_LINGER_MS=0` disables it).
+- **Honest numbers.** Every figure in the capacity plan cites the run it came from; the shared-box
+  caveat is stated up front, an outlier run is shown and explained rather than dropped silently, and
+  a step whose load generator was killed is reported as "no result".
+
 ## Getting started
 
 ### Prerequisites
@@ -856,6 +961,7 @@ at-least-once delivery.
 - Python 3.12+ and [uv](https://docs.astral.sh/uv/) (0.13.x)
 - Postgres 16 (or use Docker Compose)
 - Redis 7 (optional locally; required for M6 integration tests / compose when exercising wake / cache / RL)
+- [k6](https://grafana.com/docs/k6/latest/set-up/install-k6/) (optional; only for `loadtest/`)
 
 ### Local development
 
@@ -874,6 +980,10 @@ uv run mypy
 uv run alembic upgrade head && uv run alembic check && uv run alembic downgrade base && uv run alembic upgrade head
 TEST_DATABASE_URL=postgresql://hookrelay:hookrelay@localhost:5432/hookrelay uv run pytest
 ```
+
+`make test-chaos` runs only the chaos suite; `make loadtest-smoke` runs the CI k6 smoke against a
+local stack (needs [k6](https://grafana.com/docs/k6/latest/set-up/install-k6/) and a dedicated
+`DATABASE_URL`).
 
 Integration tests need `TEST_DATABASE_URL` pointing at a role that may `CREATE DATABASE`. Each run
 creates and drops its own scratch databases, so your data is never touched. Without the variable,
@@ -984,6 +1094,9 @@ All settings are environment variables (or `.env`), validated at startup. See
 | `WORKER_LEASE_S` / `WORKER_LEASE_RENEW_INTERVAL_S` | `60` / `15` | lease length and renewal cadence (renewal ≤ half the lease, enforced) |
 | `WORKER_RECLAIM_INTERVAL_S` | `10` | how often expired leases are reaped |
 | `WORKER_DRAIN_TIMEOUT_S` | `25` | `SIGTERM` grace for in-flight attempts before leases are released |
+| `WORKER_REFILL_LINGER_MS` | `20` | when saturated, wait up to this long for a quarter of the slots to free before leasing again (0 = lease per freed slot) |
+| `WORKER_COMPLETE_RETRIES` | `6` | retries of a completion write after a transient DB error (restart, failover, pool timeout); fenced by the lease token, so idempotent. 0 = leave it to lease expiry + reaper |
+| `WORKER_COMPLETE_RETRY_BASE_MS` / `WORKER_COMPLETE_RETRY_MAX_MS` | `100` / `2000` | exponential backoff of those retries (base ≤ max enforced) |
 | `WORKER_HEARTBEAT_FILE` / `WORKER_HEARTBEAT_MAX_AGE_S` | `/tmp/hookrelay-worker.heartbeat` / `60` | liveness file for `--healthcheck` |
 | `DELIVERY_CONNECT_TIMEOUT_MS` | `5000` | TCP + TLS handshake deadline (the endpoint's `timeout_ms` bounds the whole request) |
 | `DELIVERY_RESPONSE_MAX_BYTES` | `4096` | response bytes read and kept in the attempt log (0 to 65536) |
@@ -1263,6 +1376,8 @@ src/hookrelay/
   relay.py              fan-out relay process (`python -m hookrelay.relay` / `hookrelay-relay`)
   worker.py             delivery worker process (`python -m hookrelay.worker` / `hookrelay-worker`)
   retention.py          one bounded retention run (`python -m hookrelay.retention` / `hookrelay-retention`)
+  mock_receiver.py      configurable webhook receiver for load / chaos tests (`hookrelay-mock-receiver`):
+                        latency, jitter, failure / 429 / hang rates per endpoint, ack accounting, /stats
   redis_/               fail-soft redis.asyncio client, keys, coalescer, wakeup pub/sub, subscription
                         cache, Lua rate limiter, process runtime helpers (named redis_ so it does not
                         shadow the redis package)
@@ -1288,6 +1403,9 @@ src/hookrelay/
                         deliveries also holds search
   deploy/               Prometheus scrape config, Grafana provisioning + starter dashboard
 alembic/                async env + versioned migrations (0001 tenants ... 0010 observability trace context)
+loadtest/               k6 scripts (ingest.js, e2e.js, lib.js) + run-local.sh (starts the stack, runs k6,
+                        optional CHAOS_CMD fault injection, collects summaries and logs)
+docs/capacity.md        measured capacity plan (throughput per worker, scaling, pool sizing, storage, limits)
 tests/receiver.py       raw-asyncio HTTP receiver + fake resolver used by delivery tests
 tests/unit/             fast tests (fake database / mocked Redis): config, security, rules, pagination,
                         auth wiring audit, signing vectors, backoff / Retry-After, SSRF ranges, HTTP
@@ -1298,8 +1416,52 @@ tests/integration/      real Postgres + Redis: migrations, schema constraints, f
                         delivery, breaker lifecycle, in-flight / rate limits, fairness, auto-disable,
                         replays, secret rotation, delivery search + health, retention races, wake-up
                         short-circuit, subscription-cache hit/miss/invalidate, Redis RL + degraded mode,
-                        dashboard + /metrics after a real delivery
+                        dashboard + /metrics after a real delivery; chaos suite (worker SIGKILL, backend
+                        storms, completion-write kill, slow / flaky / hanging receivers, drain in an outage)
 ```
+
+## Load testing, chaos and capacity
+
+Details: [loadtest/README.md](loadtest/README.md) (harness), [docs/capacity.md](docs/capacity.md)
+(measured numbers and the capacity model), `tests/integration/test_chaos.py` (chaos suite).
+
+```bash
+# Mock receiver on its own (per-endpoint behaviour can also come from the endpoint URL's query string)
+uv run hookrelay-mock-receiver --port 9000 --latency-ms 20 --jitter-ms 30 --failure-rate 0.02 --failure-status 500,503
+
+# End to end against a local stack: 4 endpoints, realistic receivers, fail on any lost / double-acked delivery
+export DATABASE_URL=postgresql+asyncpg://hookrelay:hookrelay@127.0.0.1:5432/hookrelay_load   # dedicated DB
+WORKERS=2 bash loadtest/run-local.sh e2e.js -e RATE=75 -e DURATION=60s -e ENDPOINTS=4 \
+  -e 'RECEIVER_QUERY=latency_ms=20&jitter_ms=30&failure_rate=0.02&failure_status=500,503'
+
+# Chaos suite (real Postgres): worker SIGKILL, backend storms, completion-write kill, bad receivers
+make test-chaos
+```
+
+Headline numbers from one shared 8-vCPU box running Postgres, Redis, k6 and every hookrelay process
+together (so a floor, not a production figure; see the caveats in the capacity plan):
+
+| What | Measured |
+| --- | --- |
+| Ingest, 1 API process | 200 req/s at p95 32.6 ms / p99 107.6 ms, 0 errors; saturates at ~230 req/s |
+| Ingest, 4 API processes | 800 req/s at p95 58.9 ms / p99 110.6 ms, 0 errors; saturates at ~900 req/s |
+| Delivery, 1 worker (50 ms receiver) | 265-274/s at concurrency 32, 368/s at 64, 430/s at 128; CPU-bound at ~1 core (≈ 2 ms CPU per delivery) |
+| Delivery, 2 workers × 64, 16 endpoints | 547/s (1.29× one 128-slot worker); 4 workers hit the shared box's CPU limit |
+| Steady state, 2 workers × 32, 4 endpoints, 20-50 ms receivers, 2% 5xx | 300 deliveries/s with lag p50 98 ms / p95 180 ms / p99 477 ms; saturates at ~375/s |
+| Correctness | 0 lost and 0 acknowledged twice in every completed run except one stalled-box outlier (8 duplicates, explained in the plan) |
+| Real Postgres restart under load | 0 lost, 0 acknowledged twice, 0 API 500s; ~0.3-0.4% of ingest requests got `503` + `Retry-After` during the restart |
+
+What the chaos suite proves on every CI run:
+
+| Scenario | Fault | Invariant checked |
+| --- | --- | --- |
+| Worker crash | worker subprocess `SIGKILL`-ed while the receiver holds its 8 requests | the 8 are redelivered exactly once after lease expiry (`lease_expired` attempt + success), nothing acknowledged twice |
+| Postgres restart / failover | every backend of the test database terminated 8 times during ingest + delivery to fast, flaky and slow receivers | 60 events (idempotent client retries), 180 deliveries all succeeded, both loops survive |
+| Lost completion | backend killed between the receiver's 2xx and the completion write | completion retried, no redelivery; with retries off exactly one redelivery |
+| Slow receiver | one endpoint at high latency next to a healthy one | the healthy endpoint is not starved |
+| Bad receivers | flaky `5xx`, `429` + `Retry-After`, hanging past the timeout | every delivery converges to exactly one acknowledgement |
+| Drain during outage | `SIGTERM` while Postgres is unreachable | leases are left for the reaper; nothing lost |
+| Relay connection loss | `57P01` / `PendingRollbackError` during fan-out | batch retried on a fresh connection, no row parked as poison |
 
 ## Scaling notes
 
@@ -1318,10 +1480,13 @@ tests/integration/      real Postgres + Redis: migrations, schema constraints, f
   disjoint set (tests run 5 workers over 40 deliveries: every delivery sent exactly once, one attempt
   row each). The lease query is served by the partial `ix_deliveries_due` index (`WHERE status =
   'pending'`) and the reaper by `ix_deliveries_lease_expiry` (`WHERE status = 'delivering'`), so both
-  cost O(due rows). Throughput per worker is roughly `WORKER_CONCURRENCY / receiver latency`; raise
-  concurrency for slow receivers (it is I/O wait, not CPU) and add replicas for more. Each worker holds
-  one Postgres connection per lease / complete transaction, never during the HTTP call, so
-  `DB_POOL_SIZE` can stay far below `WORKER_CONCURRENCY`.
+  cost O(due rows). Throughput per worker is `min(WORKER_CONCURRENCY / receiver latency, CPU limit)`: M8 measured
+  the CPU limit at ~265-430 deliveries/s per worker process on the benchmark box (concurrency 32 → 128,
+  50 ms receivers), so raise concurrency for slow receivers and add worker processes once a worker
+  sits near one core, provided there are many more active endpoints than workers (the per-endpoint
+  planner row is the unit of parallelism). Each worker holds one Postgres connection per lease /
+  complete transaction, never during the HTTP call, so the default pool (10 + 5 overflow) carried a
+  128-slot worker; larger pools measured no gain. See [docs/capacity.md](docs/capacity.md).
 - One slow or broken endpoint is isolated: it holds at most `max_in_flight` slots across the whole
   fleet, its open breaker stops leasing entirely, and least-recently-leased ordering hands free slots
   to other endpoints first. The eligibility query scans `endpoint_states` rows with due work (one row
@@ -1353,14 +1518,15 @@ tests/integration/      real Postgres + Redis: migrations, schema constraints, f
   `ix_events_payload_unpurged` index, runners split the work with `SKIP LOCKED`, and the batch budget
   and pause keep it from competing with deliveries. Purging payloads keeps `events` rows small
   (TOASTed `jsonb` is most of their size) long before the rows themselves expire.
-- Hot tables (`deliveries`, `delivery_attempts`) are designed for time-based partitioning (M8), which
-  would turn expiry into dropping partitions. Redis only accelerates (wake-ups, subscription cache,
+- Hot tables (`deliveries`, `delivery_attempts`) are designed for time-based partitioning (planned in
+  M9; at the measured ~2.1 KB per delivery + attempt and ~1.4 KB per event, 300 deliveries/s is on the
+  order of 65 GB/day before payload retention), which would turn expiry into dropping partitions. Redis only accelerates (wake-ups, subscription cache,
   rate-limit tokens). Losing it degrades latency / hot-path contention, not correctness or
   at-least-once delivery.
 
 ## Roadmap
 
-See [ROADMAP.md](ROADMAP.md): Milestone 0 through Milestone 8, with a dated progress log.
+See [ROADMAP.md](ROADMAP.md): Milestone 0 through Milestone 9, with a dated progress log.
 
 ## License
 

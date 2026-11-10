@@ -77,11 +77,23 @@ Legend: `[x]` done, `[ ]` planned.
 - [x] Dashboard API (throughput, success rate, latency percentiles per tenant / endpoint)
 - [x] Prometheus + Grafana + Jaeger in compose
 
-## Milestone 8: Load, chaos and capacity
+## Milestone 8: Load, chaos and capacity ✅
 
-- [ ] k6 / locust load tests (ingest + delivery to a mock receiver with configurable latency/failure)
-- [ ] Chaos tests: Postgres restart, slow/failing receivers, worker kill mid-delivery (no lost or duplicated-beyond-at-least-once deliveries)
-- [ ] Capacity plan: throughput per worker, pool sizing, partitioning / retention strategy, scaling limits
+- [x] k6 / locust load tests (ingest + delivery to a mock receiver with configurable latency/failure)
+- [x] Chaos tests: Postgres restart, slow/failing receivers, worker kill mid-delivery (no lost or duplicated-beyond-at-least-once deliveries)
+- [x] Capacity plan: throughput per worker, pool sizing, partitioning / retention strategy, scaling limits
+
+## Milestone 9: Partitioning and a production deploy
+
+The capacity plan's next levers, plus the deployment story an operator would actually run.
+
+- [ ] Native range partitioning by `created_at` for `delivery_attempts` first (append-only, largest), then `deliveries` and `events`: daily partitions created ahead by a maintenance job, retention by `DETACH` / `DROP PARTITION` instead of batched `DELETE`s, online migration with a dual-write / backfill window and a tested downgrade
+- [ ] Batched completion writes in workers (one transaction for several finished attempts, still fenced per lease) to cut the one-completion-transaction-per-delivery cost (leases are already batched)
+- [ ] PgBouncer (transaction pooling) in compose and docs: asyncpg prepared-statement settings, connection budget per process, re-measured pool sizing
+- [ ] Helm chart: API / relay / worker Deployments, a pre-upgrade migration Job, liveness / readiness / heartbeat probes, PodDisruptionBudgets, `SIGTERM` grace above the drain timeout, secrets from Kubernetes Secrets
+- [ ] Autoscaling: HPA for the API on CPU, KEDA (Prometheus scaler) for workers on `deliveries_pending` / fan-out lag
+- [ ] CI: `helm lint` + a kind cluster smoke (install chart, run the k6 e2e smoke against it)
+- [ ] Re-run the M8 capacity matrix with the load generator, Postgres and hookrelay on separate nodes and publish the delta against `docs/capacity.md`
 
 ## Progress log
 
@@ -214,3 +226,51 @@ Legend: `[x]` done, `[ ]` planned.
   `/metrics` as public (optional `METRICS_TOKEN` at runtime). Docker unavailable on the build
   host; CI covers the image.
 - Next: Milestone 8 (load, chaos and capacity).
+
+### 2026-11-10: Milestone 8 complete
+
+- k6 harness (`loadtest/`): `run-local.sh` migrates a dedicated database and starts the mock receiver,
+  API (`API_WORKERS` uvicorn processes), relays and workers as real processes, runs one script and
+  collects the k6 summary, the receiver's `/stats` and every process log. `ingest.js` is a
+  constant-arrival-rate `POST /v1/events` (10% `Idempotency-Key`, half replays; < 1% errors, p95 <
+  250 ms). `e2e.js` publishes to `ENDPOINTS` endpoints and, after a drain, fails on **any lost
+  delivery or any delivery acknowledged twice**, reporting throughput and ingest → receiver lag.
+  `START_WORKERS_AFTER_S` turns it into a backlog-drain benchmark; `CHAOS_CMD` / `CHAOS_AFTER_S`
+  inject a fault (e.g. a real `pg_ctl restart`) mid-run. A CI `loadtest` job runs a short ingest +
+  flaky-receiver e2e smoke on Postgres 16 + Redis 7 (`make loadtest-smoke` locally).
+- `hookrelay-mock-receiver`: latency + jitter, failure rate / statuses (`Retry-After` on 429 / 503),
+  hang rate past the sender's timeout, per endpoint via the URL query string or `PUT /config`,
+  seeded RNG; acknowledgement accounting per `(path, webhook-id)` that only counts a 2xx written to a
+  still-connected client.
+- Chaos suite (`tests/integration/test_chaos.py`, 9 tests, real Postgres): worker `SIGKILL` with 8
+  requests held by the receiver (redelivered once each, 0 acknowledged twice), 8 rounds of
+  terminating every backend during traffic (60 events / 180 deliveries all succeed, loops survive),
+  a backend killed between a 2xx and the completion write (retried, no redelivery; with retries off,
+  exactly one), slow vs healthy receiver isolation, flaky / 429 / hanging receivers converging to
+  exactly-once acknowledgement, `SIGTERM` drain during an outage, and relay connection loss not
+  parking healthy outbox rows. Every scenario reconciles receiver acknowledgements with
+  `delivery_attempts`.
+- Restart-safe write paths: transient DB errors are `503 database_unavailable` + `Retry-After` on the
+  API instead of `500`; workers retry completion writes (`WORKER_COMPLETE_RETRIES`, fenced by the
+  lease token, so idempotent); a drain that cannot release leases leaves them to the reaper; the
+  relay retries a batch on a fresh connection after a disconnect. A real `pg_ctl restart` under load
+  found that a restarting server's `57P03` (`cannot_connect_now`) was not classified as transient
+  (5 API 500s and 24 acknowledged deliveries stranded until lease expiry); connection-level
+  SQLSTATEs (`08xxx`, `57P01-57P03`, `53300`) are now transient and the rerun had 0 500s, 0 stranded,
+  0 lost, 0 duplicates.
+- Worker performance from profiling: sharded httpcore pools (≤ 16 connections per shard; 120.7 →
+  472.0 deliveries/s for a 128-slot worker), explicit `sniffio` dependency, and a saturation refill
+  linger (`WORKER_REFILL_LINGER_MS`).
+- [docs/capacity.md](docs/capacity.md) with measured numbers only (one shared 8-vCPU box running
+  everything, stated up front): ~200 ingest req/s per API process (p99 107.6 ms), 800 with four;
+  265-430 deliveries/s per worker process (CPU-bound, ≈ 2 ms CPU per delivery); 547/s with 2 workers
+  on 16 endpoints; 300 deliveries/s steady state at p95 lag 180 ms with 2 workers × 32; default DB
+  pool sufficient up to 128 slots; ~1.4 KB per event and ~2.1 KB per delivery + attempt on disk;
+  partitioning / retention strategy, scaling limits and a sizing formula.
+- New settings `WORKER_REFILL_LINGER_MS`, `WORKER_COMPLETE_RETRIES`, `WORKER_COMPLETE_RETRY_BASE_MS`,
+  `WORKER_COMPLETE_RETRY_MAX_MS`; new entry point `hookrelay-mock-receiver`; `make test-chaos`,
+  `make mock-receiver`, `make loadtest-smoke`. No schema migration.
+- 943 tests (711 unit, 232 integration on Postgres 16 + Redis), 97% line+branch coverage; ruff, ruff
+  format, mypy strict, Alembic upgrade / downgrade roundtrip + `alembic check` pass; both CI k6 smokes
+  pass locally (0 lost, 0 acknowledged twice).
+- Next: Milestone 9 (time partitioning, batched completions, PgBouncer, Helm + autoscaling).
