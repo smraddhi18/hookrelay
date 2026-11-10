@@ -1,5 +1,5 @@
 # Thin wrappers over the exact commands CI runs.
-.PHONY: install lint format typecheck test test-unit test-integration migrate migrations-roundtrip run relay worker check up down
+.PHONY: install lint format typecheck test test-unit test-integration test-chaos migrate migrations-roundtrip run relay worker mock-receiver loadtest-smoke check up down
 
 install:
 	uv sync --locked
@@ -24,6 +24,10 @@ test-unit:
 test-integration:
 	uv run pytest tests/integration
 
+# Milestone 8: crash / Postgres-restart / slow-and-failing-receiver scenarios (needs TEST_DATABASE_URL).
+test-chaos:
+	uv run pytest tests/integration/test_chaos.py -v
+
 migrate:
 	uv run alembic upgrade head
 
@@ -42,6 +46,16 @@ relay:
 
 worker:
 	uv run hookrelay-worker
+
+mock-receiver:
+	uv run hookrelay-mock-receiver --port 9000
+
+# Same k6 smoke as CI against a local stack (DATABASE_URL must point at a dedicated database).
+loadtest-smoke:
+	OUT_DIR=k6-ingest bash loadtest/run-local.sh ingest.js -e RATE=50 -e DURATION=10s
+	OUT_DIR=k6-e2e bash loadtest/run-local.sh e2e.js -e RATE=25 -e DURATION=15s -e ENDPOINTS=2 \
+	  -e 'RECEIVER_QUERY=latency_ms=10&jitter_ms=20&failure_rate=0.05&failure_status=500,503' \
+	  -e E2E_P95_MS=10000 -e DRAIN_TIMEOUT_S=90
 
 check: lint typecheck migrations-roundtrip test
 

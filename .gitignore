@@ -25,3 +25,7 @@ htmlcov/
 .vscode/
 *.swp
 .DS_Store
+
+# Load-test output (loadtest/run-local.sh OUT_DIR in CI / make loadtest-smoke)
+k6-ingest/
+k6-e2e/
