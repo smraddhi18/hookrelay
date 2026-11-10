@@ -181,10 +181,21 @@ class Settings(BaseSettings):
     worker_batch_size: Annotated[int, Field(ge=1, le=500)] = 50
     worker_poll_min_ms: Annotated[int, Field(ge=10, le=10_000)] = 100
     worker_poll_max_ms: Annotated[int, Field(ge=10, le=60_000)] = 2_000
+    # A saturated worker waits up to this long for a quarter of its slots to free before
+    # leasing again, so a deep backlog is leased in batches instead of one lease transaction
+    # per finished delivery. 0 = lease as soon as any slot frees.
+    worker_refill_linger_ms: Annotated[int, Field(ge=0, le=1_000)] = 20
     worker_lease_s: Annotated[int, Field(ge=5, le=3_600)] = 60
     worker_lease_renew_interval_s: Annotated[float, Field(gt=0, le=1_200)] = 15.0
     worker_reclaim_interval_s: Annotated[float, Field(gt=0, le=3_600)] = 10.0
     worker_drain_timeout_s: Annotated[float, Field(ge=0, le=600)] = 25.0
+    # Completion writes retried on transient DB errors (connection killed, failover, pool
+    # timeout) so a Postgres blip after a 2xx does not turn into a redelivery. Safe because
+    # completion is fenced by the lease token: a retry after a commit whose ack was lost
+    # matches nothing and is reported as a lost lease, never applied twice.
+    worker_complete_retries: Annotated[int, Field(ge=0, le=20)] = 6
+    worker_complete_retry_base_ms: Annotated[int, Field(ge=1, le=10_000)] = 100
+    worker_complete_retry_max_ms: Annotated[int, Field(ge=1, le=60_000)] = 2_000
     worker_heartbeat_file: str = "/tmp/hookrelay-worker.heartbeat"  # noqa: S108 - container-local
     worker_heartbeat_max_age_s: Annotated[int, Field(ge=5, le=3_600)] = 60
 
@@ -354,6 +365,10 @@ class Settings(BaseSettings):
             raise ValueError("WORKER_LEASE_RENEW_INTERVAL_S must be at most WORKER_LEASE_S / 2")
         if self.delivery_backoff_base_s > self.delivery_backoff_max_s:
             raise ValueError("DELIVERY_BACKOFF_BASE_S must not exceed DELIVERY_BACKOFF_MAX_S")
+        if self.worker_complete_retry_base_ms > self.worker_complete_retry_max_ms:
+            raise ValueError(
+                "WORKER_COMPLETE_RETRY_BASE_MS must not exceed WORKER_COMPLETE_RETRY_MAX_MS"
+            )
         return self
 
     @model_validator(mode="after")

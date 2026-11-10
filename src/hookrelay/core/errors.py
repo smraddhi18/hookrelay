@@ -19,9 +19,11 @@ from fastapi.encoders import jsonable_encoder
 from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel
+from sqlalchemy.exc import SQLAlchemyError
 from starlette.exceptions import HTTPException as StarletteHTTPException
 
 from hookrelay.core.request_context import request_id_from_scope
+from hookrelay.db.integrity import is_transient_db_error
 
 logger = structlog.stdlib.get_logger("hookrelay.errors")
 
@@ -248,8 +250,35 @@ async def unhandled_exception_handler(request: Request, exc: Exception) -> JSONR
     )
 
 
+DATABASE_RETRY_AFTER_S = 1
+
+
+async def database_error_handler(request: Request, exc: Exception) -> JSONResponse:
+    """Transient database trouble (pool exhausted under load, Postgres restarting or failing
+    over) is a retryable ``503`` with ``Retry-After``, not a ``500``: clients retry with the
+    same ``Idempotency-Key`` and get exactly one event. Anything else is still a bug (500)."""
+    if not is_transient_db_error(exc):
+        return await unhandled_exception_handler(request, exc)
+    logger.warning(
+        "database.unavailable",
+        exc_type=type(exc).__name__,
+        path=request.url.path,
+        method=request.method,
+        request_id=request_id_from_scope(request.scope),
+    )
+    return error_response(
+        request,
+        status_code=HTTPStatus.SERVICE_UNAVAILABLE,
+        code="database_unavailable",
+        message="The database is temporarily unavailable; retry the request",
+        headers={"Retry-After": str(DATABASE_RETRY_AFTER_S)},
+    )
+
+
 def register_exception_handlers(app: FastAPI) -> None:
     app.add_exception_handler(AppError, app_error_handler)
+    app.add_exception_handler(SQLAlchemyError, database_error_handler)
+    app.add_exception_handler(ConnectionError, database_error_handler)
     app.add_exception_handler(StarletteHTTPException, http_exception_handler)
     app.add_exception_handler(RequestValidationError, validation_exception_handler)
     app.add_exception_handler(Exception, unhandled_exception_handler)

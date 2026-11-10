@@ -110,6 +110,9 @@ def configure_logging(settings: Settings, *, stream: Any = None) -> None:
         uv_logger = logging.getLogger(name)
         uv_logger.handlers.clear()
         uv_logger.propagate = True
+        # LOG_LEVEL governs: drop any level uvicorn.Config(log_level=...) pinned earlier in
+        # this process (e.g. an embedded server such as the mock receiver in tests).
+        uv_logger.setLevel(logging.NOTSET)
     logging.getLogger("uvicorn.access").disabled = True
     logging.getLogger("sqlalchemy.engine").setLevel(
         logging.INFO if settings.db_echo else logging.WARNING
