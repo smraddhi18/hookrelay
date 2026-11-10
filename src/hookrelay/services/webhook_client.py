@@ -12,9 +12,11 @@
 from __future__ import annotations
 
 import asyncio
+import functools
+import math
 import ssl
 import time
-from collections.abc import AsyncIterator, Iterator, Mapping
+from collections.abc import AsyncIterator, Callable, Iterator, Mapping
 from contextlib import contextmanager
 from dataclasses import dataclass
 from datetime import datetime
@@ -70,8 +72,9 @@ def _map_httpcore_errors() -> Iterator[None]:
 
 
 class _ResponseStream(httpx.AsyncByteStream):
-    def __init__(self, stream: httpcore.Response) -> None:
+    def __init__(self, stream: httpcore.Response, on_close: Callable[[], None]) -> None:
         self._response = stream
+        self._on_close: Callable[[], None] | None = on_close
 
     async def __aiter__(self) -> AsyncIterator[bytes]:
         with _map_httpcore_errors():
@@ -79,11 +82,30 @@ class _ResponseStream(httpx.AsyncByteStream):
                 yield chunk
 
     async def aclose(self) -> None:
-        await self._response.aclose()
+        try:
+            await self._response.aclose()
+        finally:
+            if self._on_close is not None:
+                self._on_close()
+                self._on_close = None
+
+
+# httpcore scans every connection of a pool (expiry check, socket poll) on each request and
+# release, so one pool of N connections costs O(N) per request. Measured on the box: with a
+# single 128-connection pool that scan dominated the worker profile, and sharding took a
+# 128-slot worker from 120.7 to 472.0 deliveries/s (docs/capacity.md). Sharding keeps each
+# scan to about this many connections.
+POOL_SHARD_CONNECTIONS = 16
 
 
 class GuardedTransport(httpx.AsyncBaseTransport):
-    """``httpx`` transport whose sockets only reach addresses the SSRF policy allows."""
+    """``httpx`` transport whose sockets only reach addresses the SSRF policy allows.
+
+    Requests are spread over ``ceil(max_connections / POOL_SHARD_CONNECTIONS)`` connection
+    pools, each request going to the pool with the fewest requests in flight. Every pool may
+    open up to ``max_connections`` (so a request never queues behind a busy shard while the
+    caller is within its own concurrency), but keeps at most its share alive when idle.
+    """
 
     def __init__(
         self,
@@ -92,17 +114,32 @@ class GuardedTransport(httpx.AsyncBaseTransport):
         ssl_context: ssl.SSLContext | None = None,
         max_connections: int = 100,
         keepalive_expiry: float = 30.0,
+        shard_connections: int = POOL_SHARD_CONNECTIONS,
     ) -> None:
-        self._pool = httpcore.AsyncConnectionPool(
-            ssl_context=ssl_context or httpx.create_ssl_context(),
-            max_connections=max_connections,
-            max_keepalive_connections=max_connections,
-            keepalive_expiry=keepalive_expiry,
-            http1=True,
-            http2=False,
-            retries=0,  # the delivery retry policy owns retries
-            network_backend=backend,
-        )
+        shards = max(1, math.ceil(max_connections / max(1, shard_connections)))
+        keepalive = math.ceil(max_connections / shards)
+        context = ssl_context or httpx.create_ssl_context()
+        self._pools = [
+            httpcore.AsyncConnectionPool(
+                ssl_context=context,
+                max_connections=max_connections,
+                max_keepalive_connections=keepalive,
+                keepalive_expiry=keepalive_expiry,
+                http1=True,
+                http2=False,
+                retries=0,  # the delivery retry policy owns retries
+                network_backend=backend,
+            )
+            for _ in range(shards)
+        ]
+        self._active = [0] * shards
+
+    @property
+    def shards(self) -> int:
+        return len(self._pools)
+
+    def _release(self, shard: int) -> None:
+        self._active[shard] -= 1
 
     async def handle_async_request(self, request: httpx.Request) -> httpx.Response:
         assert isinstance(request.stream, httpx.AsyncByteStream)  # noqa: S101
@@ -118,17 +155,24 @@ class GuardedTransport(httpx.AsyncBaseTransport):
             content=request.stream,
             extensions=request.extensions,
         )
-        with _map_httpcore_errors():
-            response = await self._pool.handle_async_request(core_request)
+        shard = min(range(len(self._active)), key=self._active.__getitem__)
+        self._active[shard] += 1
+        try:
+            with _map_httpcore_errors():
+                response = await self._pools[shard].handle_async_request(core_request)
+        except BaseException:
+            self._release(shard)
+            raise
         return httpx.Response(
             status_code=response.status,
             headers=response.headers,
-            stream=_ResponseStream(response),
+            stream=_ResponseStream(response, functools.partial(self._release, shard)),
             extensions=response.extensions,
         )
 
     async def aclose(self) -> None:
-        await self._pool.aclose()
+        for pool in self._pools:
+            await pool.aclose()
 
 
 @dataclass(frozen=True, slots=True)
