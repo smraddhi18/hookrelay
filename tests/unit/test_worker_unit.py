@@ -2,21 +2,38 @@
 
 from __future__ import annotations
 
+import contextlib
 import json
 import os
 import time
 import uuid
+from collections.abc import AsyncIterator
 from datetime import UTC, datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, cast
 
 import pytest
+from sqlalchemy.exc import (
+    DBAPIError,
+    IntegrityError,
+    InterfaceError,
+    OperationalError,
+    PendingRollbackError,
+)
+from sqlalchemy.exc import TimeoutError as PoolTimeoutError
 
 from hookrelay import worker as worker_module
 from hookrelay.core.config import get_settings
 from hookrelay.core.security import SecretBox
 from hookrelay.core.signing import verify
 from hookrelay.db.engine import Database
+from hookrelay.db.integrity import (
+    is_connection_lost,
+    is_disconnect,
+    is_transient_db_error,
+    is_transient_sqlstate,
+)
+from hookrelay.services import delivery_queue
 from hookrelay.services.delivery_policy import ErrorClass
 from hookrelay.services.delivery_queue import LeasedDelivery
 from hookrelay.services.endpoints import secret_aad
@@ -191,3 +208,145 @@ def test_healthcheck_cli(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Non
         assert worker_module.main(["--healthcheck"]) == 1  # stale
     finally:
         get_settings.cache_clear()
+
+
+# -- Milestone 8: completion retries on transient database errors -----------------------------
+
+
+class _FlakyDatabase:
+    """``session()`` fails with the queued errors, then yields a dummy session."""
+
+    def __init__(self, *errors: BaseException) -> None:
+        self.errors = list(errors)
+        self.sessions = 0
+
+    @contextlib.asynccontextmanager
+    async def session(self) -> AsyncIterator[Any]:
+        self.sessions += 1
+        if self.errors:
+            raise self.errors.pop(0)
+        yield object()
+
+
+def _disconnect() -> DBAPIError:
+    return DBAPIError("UPDATE deliveries", {}, ConnectionError("gone"), connection_invalidated=True)
+
+
+def test_transient_db_error_classification() -> None:
+    assert is_disconnect(_disconnect())
+    assert is_transient_db_error(_disconnect())
+    assert is_transient_db_error(OperationalError("SELECT 1", {}, OSError("reset")))
+    assert is_transient_db_error(InterfaceError("SELECT 1", {}, Exception("closed")))
+    assert is_transient_db_error(PoolTimeoutError("QueuePool limit reached"))
+    assert is_transient_db_error(ConnectionResetError())
+    assert is_transient_db_error(TimeoutError())
+    assert not is_disconnect(OperationalError("SELECT 1", {}, OSError("reset")))
+    assert not is_transient_db_error(IntegrityError("INSERT", {}, Exception("duplicate key")))
+    assert not is_transient_db_error(DBAPIError("SELECT", {}, Exception("syntax")))
+    assert not is_transient_db_error(ValueError("bug"))
+
+
+class _PgError(Exception):
+    def __init__(self, message: str, sqlstate: str) -> None:
+        super().__init__(message)
+        self.sqlstate = sqlstate
+
+
+@pytest.mark.parametrize(
+    ("code", "transient"),
+    [
+        ("57P03", True),  # cannot_connect_now: "the database system is shutting down"
+        ("57P01", True),  # admin_shutdown
+        ("57P02", True),  # crash_shutdown
+        ("53300", True),  # too_many_connections
+        ("08006", True),  # connection_failure
+        ("08003", True),  # connection_does_not_exist
+        ("23505", False),  # unique_violation
+        ("42P01", False),  # undefined_table
+        ("57014", False),  # query_canceled (statement_timeout): the statement itself
+        ("XX000", False),  # internal_error
+    ],
+)
+def test_connection_level_sqlstates_are_transient(code: str, transient: bool) -> None:
+    """A restart refuses *new* connections with 57P03 while it shuts down / starts up. That
+    arrives as a plain DBAPIError (not ``connection_invalidated``) when the pool opens a
+    connection, and must still count as transient (measured: a real ``pg_ctl restart``)."""
+    cause = _PgError("the database system is shutting down", code)
+    orig = Exception("wrapped")
+    orig.__cause__ = cause
+    exc = DBAPIError("SELECT now()", {}, orig)
+    assert is_transient_sqlstate(code) is transient
+    assert is_transient_db_error(exc) is transient
+    assert is_connection_lost(exc) is transient
+    assert not is_transient_sqlstate(None)
+
+
+def test_connection_lost_excludes_statement_level_failures() -> None:
+    assert is_connection_lost(_disconnect())
+    assert is_connection_lost(PendingRollbackError("invalid transaction"))
+    # Transient for a whole-unit retry, but not proof that the connection is gone: a poison
+    # statement that times out must still be isolated by the relay.
+    assert not is_connection_lost(OperationalError("SELECT", {}, Exception("canceling statement")))
+    assert not is_connection_lost(PoolTimeoutError("QueuePool limit reached"))
+    assert not is_connection_lost(ValueError("bug"))
+
+
+def _completing_worker(tmp_path: Path, db: _FlakyDatabase, **overrides: Any) -> Worker:
+    worker = _worker(
+        tmp_path, worker_complete_retry_base_ms=1, worker_complete_retry_max_ms=2, **overrides
+    )
+    worker.database = cast("Database", db)
+    return worker
+
+
+async def test_completion_is_retried_on_transient_errors_then_applied(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    db = _FlakyDatabase(_disconnect(), PoolTimeoutError("pool"))
+    worker = _completing_worker(tmp_path, db)
+    applied: list[Any] = []
+
+    async def fake_complete(_session: Any, delivery: Any, *_a: Any, **_k: Any) -> str:
+        applied.append(delivery)
+        return "done"
+
+    async def fake_now(_session: Any) -> datetime:
+        return datetime.now(UTC)
+
+    monkeypatch.setattr(delivery_queue, "complete", fake_complete)
+    monkeypatch.setattr(worker_module, "db_now", fake_now)
+    try:
+        completion, retries = await worker._complete(_delivery(), cast("Any", None))
+    finally:
+        await worker.aclose()
+    assert (cast("Any", completion), retries) == ("done", 2)
+    assert (db.sessions, len(applied), worker.stats.completion_retries) == (3, 1, 2)
+
+
+async def test_completion_gives_up_after_the_retry_budget(tmp_path: Path) -> None:
+    db = _FlakyDatabase(*(_disconnect() for _ in range(5)))
+    worker = _completing_worker(tmp_path, db, worker_complete_retries=2)
+    try:
+        with pytest.raises(DBAPIError):
+            await worker._complete(_delivery(), cast("Any", None))
+    finally:
+        await worker.aclose()
+    assert (db.sessions, worker.stats.completion_retries) == (3, 2)
+
+
+async def test_completion_never_retries_a_non_transient_error(tmp_path: Path) -> None:
+    db = _FlakyDatabase(IntegrityError("INSERT", {}, Exception("duplicate key")))
+    worker = _completing_worker(tmp_path, db)
+    try:
+        with pytest.raises(IntegrityError):
+            await worker._complete(_delivery(), cast("Any", None))
+    finally:
+        await worker.aclose()
+    assert (db.sessions, worker.stats.completion_retries) == (1, 0)
+
+
+def test_completion_retry_backoff_bounds_are_validated() -> None:
+    with pytest.raises(ValueError, match="WORKER_COMPLETE_RETRY_BASE_MS"):
+        make_settings(worker_complete_retry_base_ms=500, worker_complete_retry_max_ms=100)
+    settings = make_settings()
+    assert (settings.worker_complete_retries, settings.worker_complete_retry_max_ms) == (6, 2000)

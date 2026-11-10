@@ -10,9 +10,15 @@ import httpx
 import pytest
 
 from hookrelay.services.delivery_policy import ErrorClass
-from hookrelay.services.ssrf import AddressPolicy, DestinationBlockedError, ResolutionError
+from hookrelay.services.ssrf import (
+    AddressPolicy,
+    DestinationBlockedError,
+    GuardedNetworkBackend,
+    ResolutionError,
+)
 from hookrelay.services.webhook_client import (
     USER_AGENT,
+    GuardedTransport,
     SenderConfig,
     WebhookRequest,
     WebhookSender,
@@ -226,3 +232,66 @@ async def test_concurrent_sends() -> None:
             await sender.aclose()
     assert all(r.status_code == 204 for r in results)
     assert all(r.response_body is None for r in results)
+
+
+# -- Milestone 8: sharded connection pools ---------------------------------------------------
+
+
+def _sharded_sender(port: int, transport: GuardedTransport) -> WebhookSender:
+    return WebhookSender(
+        SenderConfig(
+            allow_http=True,
+            allowed_ports=frozenset({port}),
+            connect_timeout_s=1.0,
+            response_max_bytes=64,
+            retry_after_max_s=600.0,
+        ),
+        policy=AddressPolicy(allow_private_networks=True),
+        transport=transport,
+    )
+
+
+def test_pool_shard_count_follows_max_connections() -> None:
+    backend = GuardedNetworkBackend(AddressPolicy(), resolver=local_resolver)
+    assert GuardedTransport(backend, max_connections=4).shards == 1
+    assert GuardedTransport(backend, max_connections=16).shards == 1
+    assert GuardedTransport(backend, max_connections=17).shards == 2
+    assert GuardedTransport(backend, max_connections=128).shards == 8
+    assert GuardedTransport(backend, max_connections=40, shard_connections=0).shards == 40
+
+
+async def test_concurrent_requests_spread_over_shards_and_release_them() -> None:
+    backend = GuardedNetworkBackend(
+        AddressPolicy(allow_private_networks=True), resolver=local_resolver
+    )
+    transport = GuardedTransport(backend, max_connections=48, shard_connections=16)
+    assert transport.shards == 3
+    async with running_receiver(lambda _r: Reply(204, b"")) as receiver:
+        sender = _sharded_sender(receiver.port, transport)
+        try:
+            results = await asyncio.gather(
+                *(sender.send(_request(receiver.url), now=NOW) for _ in range(9))
+            )
+            in_flight_after = list(transport._active)
+            used = [len(pool.connections) for pool in transport._pools]
+        finally:
+            await sender.aclose()
+    assert all(r.status_code == 204 for r in results)
+    assert in_flight_after == [0, 0, 0]
+    assert all(n >= 1 for n in used), used  # every shard carried traffic
+
+
+async def test_failed_requests_release_their_shard() -> None:
+    backend = GuardedNetworkBackend(
+        AddressPolicy(allow_private_networks=True), resolver=local_resolver
+    )
+    transport = GuardedTransport(backend, max_connections=32, shard_connections=16)
+    async with running_receiver() as receiver:
+        port = receiver.port
+    sender = _sharded_sender(port, transport)  # the receiver is gone: connection refused
+    try:
+        result = await sender.send(_request(f"http://receiver.test:{port}/hook"), now=NOW)
+    finally:
+        await sender.aclose()
+    assert result.error_class is ErrorClass.CONNECT_ERROR
+    assert transport._active == [0, 0]

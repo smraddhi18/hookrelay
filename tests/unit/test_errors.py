@@ -1,9 +1,11 @@
 from __future__ import annotations
 
-from typing import Annotated
+from typing import Annotated, Any
 
 import pytest
 from fastapi import FastAPI, HTTPException, Query
+from sqlalchemy.exc import DBAPIError, IntegrityError
+from sqlalchemy.exc import TimeoutError as PoolTimeoutError
 
 from hookrelay.core.errors import (
     AppError,
@@ -161,3 +163,44 @@ def test_error_types_carry_status_and_code(
 )
 def test_code_for_status(status: int, code: str) -> None:
     assert code_for_status(status) == code
+
+
+async def test_transient_database_errors_are_retryable_503s(app_factory: Any) -> None:
+    app: FastAPI = app_factory()
+
+    @app.get("/_test/pool")
+    async def pool() -> None:
+        raise PoolTimeoutError("QueuePool limit of size 10 overflow 5 reached")
+
+    @app.get("/_test/disconnect")
+    async def disconnect() -> None:
+        raise DBAPIError("SELECT 1", {}, ConnectionError("gone"), connection_invalidated=True)
+
+    @app.get("/_test/refused")
+    async def refused() -> None:
+        raise ConnectionRefusedError("connect to db:5432")
+
+    @app.get("/_test/restarting")
+    async def restarting() -> None:
+        cause = Exception("the database system is shutting down")
+        cause.sqlstate = "57P03"  # type: ignore[attr-defined]
+        orig = Exception("wrapped")
+        orig.__cause__ = cause
+        raise DBAPIError("SELECT 1", {}, orig)
+
+    @app.get("/_test/integrity")
+    async def integrity() -> None:
+        raise IntegrityError("INSERT", {}, Exception("duplicate key secret-value"))
+
+    async with serve(app, raise_app_exceptions=False) as client:
+        for path in ("/_test/pool", "/_test/disconnect", "/_test/refused", "/_test/restarting"):
+            resp = await client.get(path)
+            assert resp.status_code == 503, path
+            assert resp.headers["retry-after"] == "1"
+            assert resp.json()["error"]["code"] == "database_unavailable"
+            assert resp.headers["x-request-id"] == resp.json()["error"]["request_id"]
+        bug = await client.get("/_test/integrity")
+    # A non-transient database error is still a bug: an opaque 500 that leaks nothing.
+    assert bug.status_code == 500
+    assert bug.json()["error"]["code"] == "internal_error"
+    assert "secret-value" not in bug.text
