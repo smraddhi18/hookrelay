@@ -47,6 +47,7 @@ from hookrelay.core.logging import configure_logging, redact_text
 from hookrelay.core.security import SecretBox, SecretDecryptionError
 from hookrelay.core.signing import HEADER_SIGNATURE, sign
 from hookrelay.db.engine import Database
+from hookrelay.db.integrity import is_transient_db_error
 from hookrelay.db.models import DeliveryStatus
 from hookrelay.observability.metrics import SERVICE_WORKER, Metrics
 from hookrelay.observability.runtime import (
@@ -104,6 +105,8 @@ class WorkerStats:
     reclaimed_retried: int = 0
     reclaimed_failed: int = 0
     loop_errors: int = 0
+    completion_retries: int = 0  # completions retried after a transient DB error
+    release_failures: int = 0  # drains whose lease release could not be written
 
 
 def default_worker_id() -> str:
@@ -385,19 +388,53 @@ class Worker:
             finished_at=datetime.now(UTC),
         )
 
+    async def _complete(
+        self, delivery: LeasedDelivery, record: AttemptRecord
+    ) -> tuple[delivery_queue.Completion | None, int]:
+        """Write the attempt's outcome, retrying transient DB failures with backoff.
+
+        Returns the completion (``None`` if the fence rejected it) and the number of retries.
+        Retrying is idempotent: ``complete`` only matches while our lease token is current,
+        and a commit clears it, so a retry after an ambiguous commit matches nothing.
+        """
+        settings = self.settings
+        retries = 0
+        while True:
+            try:
+                async with self.database.session() as session:
+                    now = await db_now(session)
+                    completion = await delivery_queue.complete(
+                        session,
+                        delivery,
+                        record,
+                        worker_id=self.worker_id,
+                        now=now,
+                        policy=self.policy,
+                        breaker=self.breaker,
+                    )
+            except Exception as exc:
+                if retries >= settings.worker_complete_retries or not is_transient_db_error(exc):
+                    raise
+                delay_ms = min(
+                    settings.worker_complete_retry_base_ms * 2**retries,
+                    settings.worker_complete_retry_max_ms,
+                )
+                retries += 1
+                self.stats.completion_retries += 1
+                logger.warning(
+                    "worker.completion_retry",
+                    delivery_id=str(delivery.id),
+                    retry=retries,
+                    delay_ms=delay_ms,
+                    error=type(exc).__name__,
+                )
+                await asyncio.sleep(delay_ms / 1000)
+            else:
+                return completion, retries
+
     async def deliver(self, delivery: LeasedDelivery) -> delivery_queue.Completion | None:
         record = await self.attempt(delivery)
-        async with self.database.session() as session:
-            now = await db_now(session)
-            completion = await delivery_queue.complete(
-                session,
-                delivery,
-                record,
-                worker_id=self.worker_id,
-                now=now,
-                policy=self.policy,
-                breaker=self.breaker,
-            )
+        completion, retries = await self._complete(delivery, record)
         flight = self._inflight.get(delivery.id)
         if flight is not None:
             flight.settled = True
@@ -415,7 +452,9 @@ class Worker:
             self.stats.lease_lost += 1
             if self.metrics is not None:
                 self.metrics.record_worker_lease_lost()
-            logger.warning("worker.lease_lost", **fields)
+            # After a retried write this is usually our own earlier commit whose ack was
+            # lost (the fence makes it a no-op), not another worker's takeover.
+            logger.warning("worker.lease_lost", after_retry=retries > 0, **fields)
             return None
         match completion.outcome.value:
             case "succeeded":
@@ -499,10 +538,19 @@ class Worker:
         for flight in unfinished:
             flight.task.cancel()
         await asyncio.gather(*(f.task for f in unfinished), return_exceptions=True)
-        async with self.database.session() as session:
-            released = await delivery_queue.release_leases(
-                session, [f.delivery.lease for f in unfinished]
+        try:
+            async with self.database.session() as session:
+                released = await delivery_queue.release_leases(
+                    session, [f.delivery.lease for f in unfinished]
+                )
+        except Exception as exc:
+            # Postgres is unreachable while we shut down: nothing is lost, the leases simply
+            # expire and the reaper of another worker retries them (one attempt is spent).
+            self.stats.release_failures += 1
+            logger.exception(
+                "worker.release_failed", count=len(unfinished), error=type(exc).__name__
             )
+            return 0
         self.stats.released += len(released)
         logger.warning("worker.leases_released", count=len(released))
         return len(released)
@@ -540,6 +588,43 @@ class Worker:
         finally:
             for waiter in waiters:
                 waiter.cancel()
+
+    @property
+    def refill_watermark(self) -> int:
+        """Free slots worth a lease transaction once the worker has been saturated."""
+        settings = self.settings
+        return max(1, min(settings.worker_batch_size, settings.worker_concurrency // 4))
+
+    async def _await_refill(self) -> None:
+        """After saturation, linger briefly so the next lease fills several slots at once.
+
+        Without this a saturated worker re-leases for every single finished delivery: one full
+        lease transaction (eligibility scan, row locks, spend) per delivery, which measured
+        as the dominant cost at high concurrency.
+        """
+        linger_s = self.settings.worker_refill_linger_ms / 1000
+        if linger_s <= 0:
+            return
+        loop = asyncio.get_running_loop()
+        deadline = loop.time() + linger_s
+        target = self.refill_watermark
+        while self.free_slots < target and not self.stopping:
+            remaining = deadline - loop.time()
+            if remaining <= 0:
+                return
+            self._slot_freed.clear()
+            with contextlib.suppress(TimeoutError):
+                await asyncio.wait_for(self._slot_freed.wait(), timeout=remaining)
+
+    async def _pause(self, delay_s: float, max_s: float) -> None:
+        """Wait before the next lease: for a free slot (then a batch of them) when saturated,
+        else for ``delay_s`` or a wake-up."""
+        if self.free_slots > 0:
+            await self._wait(delay_s)
+            return
+        await self._wait(max_s)
+        if self.free_slots > 0:
+            await self._await_refill()
 
     async def run_once(self) -> WorkerStats:
         """Reclaim expired leases, lease one batch, finish it, exit (``--once``, tests, CI)."""
@@ -612,7 +697,7 @@ class Worker:
                     delay = min_s
                     continue  # there was work and room for more: look again right away
                 delay = min_s if woke or leased else min(delay * 2, max_s)
-                await self._wait(max_s if self.free_slots <= 0 else delay)
+                await self._pause(delay, max_s)
             await self.drain(settings.worker_drain_timeout_s)
         finally:
             for task in background:

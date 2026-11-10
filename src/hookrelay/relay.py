@@ -38,6 +38,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from hookrelay.core.config import Settings, get_settings
 from hookrelay.core.logging import configure_logging, redact_text
 from hookrelay.db.engine import Database
+from hookrelay.db.integrity import is_connection_lost
 from hookrelay.observability.gauges import refresh_gauges
 from hookrelay.observability.metrics import SERVICE_RELAY, Metrics
 from hookrelay.observability.runtime import (
@@ -146,6 +147,12 @@ class Relay:
                         deliveries_created=created,
                     )
                 except SQLAlchemyError as exc:
+                    if is_connection_lost(exc):
+                        # The connection died (Postgres restart / failover): the transaction
+                        # and its claims are gone, so isolating a "poison" row is pointless and
+                        # would only fail again on the dead session. The loop retries the
+                        # batch on a fresh connection.
+                        raise
                     logger.warning(
                         "relay.batch_failed",
                         rows=len(rows),
