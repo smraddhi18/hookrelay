@@ -92,6 +92,8 @@ known-third-party = ["alembic"]
 "tests/integration/test_delivery_search_and_health.py" = ["F811"]
 "tests/integration/test_observability.py" = ["F811"]
 "tests/integration/test_chaos.py" = ["F811"]
+"tests/integration/test_completion_batches.py" = ["F811"]
+"tests/integration/test_pgbouncer.py" = ["F811"]
 "alembic/**" = ["ANN"]
 
 [tool.ruff.lint.flake8-bugbear]

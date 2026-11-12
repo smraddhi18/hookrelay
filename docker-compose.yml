@@ -1,5 +1,10 @@
-# Local stack: Postgres 16 + Redis 7 + a one-shot migration job + the API + the fan-out relay
-# + the delivery worker + Prometheus / Grafana / Jaeger (+ an on-demand retention job, profile "ops").
+# Local stack: Postgres 16 + PgBouncer (transaction pooling) + Redis 7 + a one-shot migration job
+# + the API + the fan-out relay + the delivery worker + Prometheus / Grafana / Jaeger
+# (+ an on-demand retention job, profile "ops").
+# The API, relays and workers reach Postgres through PgBouncer (DB_PGBOUNCER=true); migrations
+# go straight to Postgres (DATABASE_DIRECT_URL). To bypass the pooler, set
+# HOOKRELAY_DATABASE_URL=postgresql+asyncpg://hookrelay:hookrelay@postgres:5432/hookrelay and
+# DB_PGBOUNCER=false.
 #   docker compose up --build        -> http://localhost:8000/docs
 #   Prometheus http://localhost:9090  Grafana http://localhost:3000  Jaeger http://localhost:16686
 #   docker compose down -v           -> stop and wipe data
@@ -10,7 +15,11 @@ x-app-env: &app-env
   LOG_FORMAT: json
   LOG_LEVEL: INFO
   DOCS_ENABLED: "true"
-  DATABASE_URL: postgresql+asyncpg://hookrelay:hookrelay@postgres:5432/hookrelay
+  DATABASE_URL: ${HOOKRELAY_DATABASE_URL:-postgresql+asyncpg://hookrelay:hookrelay@pgbouncer:6432/hookrelay}
+  DB_PGBOUNCER: ${DB_PGBOUNCER:-true}
+  DATABASE_DIRECT_URL: postgresql+asyncpg://hookrelay:hookrelay@postgres:5432/hookrelay
+  WORKER_COMPLETE_BATCH_MAX: ${WORKER_COMPLETE_BATCH_MAX:-32}
+  WORKER_COMPLETE_BATCH_LINGER_MS: ${WORKER_COMPLETE_BATCH_LINGER_MS:-5}
   REDIS_URL: redis://redis:6379/0
   REDIS_KEY_PREFIX: ${REDIS_KEY_PREFIX:-hookrelay}
   REDIS_CONNECT_TIMEOUT_MS: ${REDIS_CONNECT_TIMEOUT_MS:-1000}
@@ -73,6 +82,25 @@ services:
       timeout: 3s
       retries: 20
 
+  # Transaction pooling (Milestone 9): many client connections (every process's SQLAlchemy
+  # pool) share default_pool_size server connections. Config: deploy/pgbouncer/pgbouncer.ini.
+  pgbouncer:
+    image: edoburu/pgbouncer:v1.26.1-p0
+    volumes:
+      - ./deploy/pgbouncer/pgbouncer.ini:/etc/pgbouncer/pgbouncer.ini:ro
+      - ./deploy/pgbouncer/userlist.txt:/etc/pgbouncer/userlist.txt:ro
+    ports:
+      - "6432:6432"
+    depends_on:
+      postgres:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "pg_isready", "-h", "127.0.0.1", "-p", "6432", "-U", "hookrelay"]
+      interval: 3s
+      timeout: 3s
+      retries: 20
+    restart: unless-stopped
+
   redis:
     image: redis:7-alpine
     command: ["redis-server", "--appendonly", "yes"]
@@ -104,6 +132,8 @@ services:
     depends_on:
       migrate:
         condition: service_completed_successfully
+      pgbouncer:
+        condition: service_healthy
       redis:
         condition: service_healthy
     restart: unless-stopped
@@ -122,6 +152,8 @@ services:
     depends_on:
       migrate:
         condition: service_completed_successfully
+      pgbouncer:
+        condition: service_healthy
     # The image's default probe checks the API port; the relay has none, so it proves
     # liveness through a heartbeat file touched on every polling iteration.
     healthcheck:
@@ -147,6 +179,8 @@ services:
     depends_on:
       migrate:
         condition: service_completed_successfully
+      pgbouncer:
+        condition: service_healthy
     healthcheck:
       test: ["CMD", "python", "-m", "hookrelay.worker", "--healthcheck"]
       interval: 10s
@@ -168,6 +202,8 @@ services:
     depends_on:
       migrate:
         condition: service_completed_successfully
+      pgbouncer:
+        condition: service_healthy
     restart: "no"
 
 
