@@ -11,14 +11,18 @@ requests:
    decrypt the endpoint secret, sign (Standard Webhooks), POST through the SSRF-guarded client;
 3. **complete** under the fence: success, retry with jittered backoff (honouring a capped
    ``Retry-After``), ``failed`` (permanent error) or ``dead`` (budget exhausted), plus an
-   attempt-log row and the endpoint's circuit-breaker update, in one transaction.
+   attempt-log row and the endpoint's circuit-breaker update, in one transaction. Since
+   Milestone 9 finished attempts are group-committed (``WORKER_COMPLETE_BATCH_MAX`` per
+   transaction, at most ``WORKER_COMPLETE_BATCH_LINGER_MS`` of extra wait), each row still
+   fenced by its own lease token; ``WORKER_COMPLETE_BATCH_MAX=1`` is the per-attempt path.
 
 Background loops renew in-flight leases every ``WORKER_LEASE_RENEW_INTERVAL_S`` (a task whose
 lease was lost is cancelled) and reclaim leases that expired on crashed workers.
 
 ``SIGTERM``/``SIGINT`` drain: stop leasing, give in-flight attempts ``WORKER_DRAIN_TIMEOUT_S``
-to finish, then cancel the rest and release their leases (without spending an attempt) so
-another worker picks them up immediately. A heartbeat file is touched every loop;
+to finish, write every attempt that already finished (so a delivered webhook is recorded, not
+released and redelivered), then cancel the rest and release their leases (without spending an
+attempt) so another worker picks them up immediately. A heartbeat file is touched every loop;
 ``--healthcheck`` checks its age.
 """
 
@@ -34,6 +38,7 @@ import socket
 import sys
 import time
 import uuid
+from collections.abc import Sequence
 from dataclasses import asdict, dataclass
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
@@ -66,13 +71,14 @@ from hookrelay.relay import heartbeat_is_fresh
 from hookrelay.services import delivery_queue
 from hookrelay.services.circuit_breaker import BreakerPolicy
 from hookrelay.services.clock import db_now
+from hookrelay.services.completion_batcher import CompletionBatcher, FlushReport
 from hookrelay.services.delivery_policy import (
     ErrorClass,
     RetryPolicy,
     is_retryable_error,
     truncate_message,
 )
-from hookrelay.services.delivery_queue import AttemptRecord, LeasedDelivery
+from hookrelay.services.delivery_queue import AttemptRecord, CompletionItem, LeasedDelivery
 from hookrelay.services.endpoints import secret_aad
 from hookrelay.services.ssrf import AddressPolicy, Resolver, system_resolver
 from hookrelay.services.webhook_client import (
@@ -89,6 +95,11 @@ REDACTED_SIGNATURE = "v1,[redacted]"
 MASKED_HEADER_VALUE = "********"
 CONTENT_TYPE = "application/json"
 RECLAIM_BATCH_SIZE = 100
+DRAIN_FLUSH_MIN_S = 1.0
+
+# What the batcher hands back per attempt: the completion (None = fenced out) and how many
+# transient-error retries its transaction needed.
+CompletionResult = tuple[delivery_queue.Completion | None, int]
 
 
 @dataclass(slots=True)
@@ -106,6 +117,8 @@ class WorkerStats:
     reclaimed_failed: int = 0
     loop_errors: int = 0
     completion_retries: int = 0  # completions retried after a transient DB error
+    completion_batches: int = 0  # completion transactions written by the batcher
+    completion_fallbacks: int = 0  # batches re-written one attempt per transaction
     release_failures: int = 0  # drains whose lease release could not be written
 
 
@@ -211,6 +224,15 @@ class Worker:
         self._stop = asyncio.Event()
         self._heartbeat = Path(settings.worker_heartbeat_file)
         self._heartbeat_warned = False
+        self.batcher: CompletionBatcher[CompletionItem, CompletionResult] | None = None
+        if settings.worker_complete_batch_max > 1:
+            self.batcher = CompletionBatcher(
+                self._write_batch,
+                max_size=settings.worker_complete_batch_max,
+                linger_s=settings.worker_complete_batch_linger_ms / 1000,
+                outstanding=lambda: len(self._inflight),
+                on_flush=self._on_flush,
+            )
 
     # -- lifecycle --------------------------------------------------------------------------
 
@@ -228,6 +250,8 @@ class Worker:
         self._stop.set()
 
     async def aclose(self) -> None:
+        if self.batcher is not None:
+            await self.batcher.aclose()
         await self.sender.aclose()
 
     # -- leasing ----------------------------------------------------------------------------
@@ -278,6 +302,8 @@ class Worker:
             self._inflight.pop(delivery.id, None)
             self._slots.release()
             self._slot_freed.set()
+            if self.batcher is not None:
+                self.batcher.notify()  # one fewer attempt can still join the open batch
 
     # -- one attempt ------------------------------------------------------------------------
 
@@ -415,26 +441,101 @@ class Worker:
             except Exception as exc:
                 if retries >= settings.worker_complete_retries or not is_transient_db_error(exc):
                     raise
-                delay_ms = min(
-                    settings.worker_complete_retry_base_ms * 2**retries,
-                    settings.worker_complete_retry_max_ms,
-                )
+                await self._retry_delay(retries, exc, delivery_id=str(delivery.id))
                 retries += 1
-                self.stats.completion_retries += 1
-                logger.warning(
-                    "worker.completion_retry",
-                    delivery_id=str(delivery.id),
-                    retry=retries,
-                    delay_ms=delay_ms,
-                    error=type(exc).__name__,
-                )
-                await asyncio.sleep(delay_ms / 1000)
             else:
                 return completion, retries
 
+    async def _retry_delay(self, retries: int, exc: BaseException, **fields: Any) -> None:
+        settings = self.settings
+        delay_ms = min(
+            settings.worker_complete_retry_base_ms * 2**retries,
+            settings.worker_complete_retry_max_ms,
+        )
+        self.stats.completion_retries += 1
+        if self.metrics is not None:
+            self.metrics.record_worker_completion_retry()
+        logger.warning(
+            "worker.completion_retry",
+            retry=retries + 1,
+            delay_ms=delay_ms,
+            error=type(exc).__name__,
+            **fields,
+        )
+        await asyncio.sleep(delay_ms / 1000)
+
+    async def _complete_batch(
+        self, items: list[CompletionItem]
+    ) -> tuple[list[delivery_queue.Completion | None], int]:
+        """Write a batch in one transaction, retrying transient DB failures with backoff.
+
+        Same retry contract as :meth:`_complete`, for the whole batch: every row is fenced by
+        its own lease token, so re-running the batch after an ambiguous commit applies nothing
+        twice (rows that did commit come back fenced out, i.e. ``None``).
+        """
+        retries = 0
+        while True:
+            try:
+                async with self.database.session() as session:
+                    now = await db_now(session)
+                    completions = await delivery_queue.complete_many(
+                        session,
+                        items,
+                        worker_id=self.worker_id,
+                        now=now,
+                        policy=self.policy,
+                        breaker=self.breaker,
+                    )
+            except Exception as exc:
+                if retries >= self.settings.worker_complete_retries or not is_transient_db_error(
+                    exc
+                ):
+                    raise
+                await self._retry_delay(retries, exc, batch_size=len(items))
+                retries += 1
+            else:
+                return completions, retries
+
+    async def _write_batch(
+        self, items: Sequence[CompletionItem]
+    ) -> list[CompletionResult | BaseException]:
+        """The batcher's writer: one transaction for the batch, per-item results.
+
+        A transient failure that outlives the retry budget fails every item (their leases stay
+        and expire into the reaper, as with a single completion). Any other error means some
+        row is poisonous; the batch is then re-written one attempt per transaction so only
+        the culprit fails and the rest are recorded.
+        """
+        batch = list(items)
+        try:
+            completions, retries = await self._complete_batch(batch)
+        except Exception as exc:
+            if is_transient_db_error(exc):
+                return [exc] * len(batch)
+            self.stats.completion_fallbacks += 1
+            logger.warning(
+                "worker.completion_batch_fallback", batch_size=len(batch), error=type(exc).__name__
+            )
+            results: list[CompletionResult | BaseException] = []
+            for item in batch:
+                try:
+                    results.append(await self._complete(item.delivery, item.record))
+                except Exception as item_exc:
+                    results.append(item_exc)
+            return results
+        self.stats.completion_batches += 1
+        return [(completion, retries) for completion in completions]
+
+    def _on_flush(self, report: FlushReport) -> None:
+        if self.metrics is not None:
+            self.metrics.record_worker_completion_flush(size=report.size, seconds=report.seconds)
+
     async def deliver(self, delivery: LeasedDelivery) -> delivery_queue.Completion | None:
         record = await self.attempt(delivery)
-        completion, retries = await self._complete(delivery, record)
+        if self.batcher is None:
+            completion, retries = await self._complete(delivery, record)
+        else:
+            completion, retries = await self.batcher.submit(CompletionItem(delivery, record))
         flight = self._inflight.get(delivery.id)
         if flight is not None:
             flight.settled = True
@@ -528,10 +629,23 @@ class Worker:
 
         Returns the number of leases released back to ``pending``.
         """
+        loop = asyncio.get_running_loop()
+        deadline = loop.time() + timeout_s
         tasks = [f.task for f in self._inflight.values()]
         if tasks:
             logger.info("worker.draining", in_flight=len(tasks), timeout_s=timeout_s)
             await asyncio.wait(tasks, timeout=timeout_s)
+        if self.batcher is not None and self.batcher.queued:
+            # Attempts that finished but are still queued for a group commit are written now,
+            # before anything is cancelled: releasing them would redeliver a delivered webhook.
+            # Bounded (at least DRAIN_FLUSH_MIN_S even when the drain budget is spent) so a
+            # database outage cannot stall shutdown past the orchestrator's grace period.
+            budget = max(deadline - loop.time(), DRAIN_FLUSH_MIN_S)
+            try:
+                await asyncio.wait_for(self.batcher.flush_now(), timeout=budget)
+            except TimeoutError:
+                logger.warning("worker.drain_flush_timeout", queued=self.batcher.queued)
+            await asyncio.sleep(0)  # let tasks whose results just landed finish first
         unfinished = list(self._inflight.values())
         if not unfinished:
             return 0
@@ -628,6 +742,8 @@ class Worker:
 
     async def run_once(self) -> WorkerStats:
         """Reclaim expired leases, lease one batch, finish it, exit (``--once``, tests, CI)."""
+        if self.batcher is not None:
+            self.batcher.start()
         await self.reclaim_once()
         await self.poll_once()
         tasks = [f.task for f in self._inflight.values()]
@@ -635,6 +751,19 @@ class Worker:
             await asyncio.wait(tasks)
         self.touch_heartbeat()
         return self.stats
+
+    async def _start_helpers(self) -> None:
+        """Redis wake-up subscriber (optional) and the completion group-commit writer."""
+        self._subscriber = build_wakeup_subscriber(
+            self.settings,
+            instance_id=self.worker_id,
+            on_wake=self._on_wake,
+            on_listening_change=self._on_listening_change,
+        )
+        if self._subscriber is not None:
+            await self._subscriber.start()
+        if self.batcher is not None:
+            self.batcher.start()
 
     async def run(self) -> WorkerStats:
         """Lease and deliver until :meth:`stop` (or SIGTERM/SIGINT), then drain."""
@@ -658,14 +787,7 @@ class Worker:
                 self._every(settings.worker_reclaim_interval_s, "reclaim", self.reclaim_once)
             ),
         ]
-        self._subscriber = build_wakeup_subscriber(
-            settings,
-            instance_id=self.worker_id,
-            on_wake=self._on_wake,
-            on_listening_change=self._on_listening_change,
-        )
-        if self._subscriber is not None:
-            await self._subscriber.start()
+        await self._start_helpers()
         logger.info(
             "worker.started",
             worker_id=self.worker_id,
@@ -675,6 +797,8 @@ class Worker:
             allow_private_networks=settings.delivery_allow_private_networks,
             wakeup=self._subscriber is not None,
             rate_limit_redis=self.rate_limiter is not None,
+            complete_batch_max=settings.worker_complete_batch_max,
+            complete_batch_linger_ms=settings.worker_complete_batch_linger_ms,
         )
         try:
             with contextlib.suppress(Exception):
