@@ -110,6 +110,14 @@ class Settings(BaseSettings):
     db_connect_timeout_s: PositiveFloat = 5.0
     db_statement_timeout_ms: Annotated[int, Field(ge=100, le=600_000)] = 15_000
     db_echo: bool = False
+    # Milestone 9: DATABASE_URL points at PgBouncer in transaction pooling mode. asyncpg's
+    # prepared-statement caches are disabled and statement names made unique (a server
+    # connection is shared by many clients), and only startup parameters PgBouncer tracks are
+    # sent (statement / idle-in-transaction timeouts belong in the pooler's connect_query or
+    # the role's defaults). Migrations need session state, so they use DATABASE_DIRECT_URL.
+    db_pgbouncer: bool = False
+    # Direct Postgres URL (bypassing any pooler) for Alembic; required when DB_PGBOUNCER=true.
+    database_direct_url: SecretStr | None = None
 
     # Readiness / shutdown
     readiness_timeout_s: Annotated[float, Field(gt=0, le=30)] = 2.0
@@ -196,6 +204,13 @@ class Settings(BaseSettings):
     worker_complete_retries: Annotated[int, Field(ge=0, le=20)] = 6
     worker_complete_retry_base_ms: Annotated[int, Field(ge=1, le=10_000)] = 100
     worker_complete_retry_max_ms: Annotated[int, Field(ge=1, le=60_000)] = 2_000
+    # Group commit for completions (Milestone 9): finished attempts are written up to this many
+    # per transaction (each row still fenced by its own lease token). 1 = one transaction per
+    # attempt, exactly the pre-M9 behaviour. A batch is flushed when it is full, when every
+    # in-flight attempt is waiting on it, or WORKER_COMPLETE_BATCH_LINGER_MS after its oldest
+    # entry arrived, whichever comes first.
+    worker_complete_batch_max: Annotated[int, Field(ge=1, le=500)] = 32
+    worker_complete_batch_linger_ms: Annotated[int, Field(ge=0, le=1_000)] = 5
     worker_heartbeat_file: str = "/tmp/hookrelay-worker.heartbeat"  # noqa: S108 - container-local
     worker_heartbeat_max_age_s: Annotated[int, Field(ge=5, le=3_600)] = 60
 
@@ -274,6 +289,16 @@ class Settings(BaseSettings):
     dashboard_default_window_s: Annotated[int, Field(ge=60, le=30 * 86_400)] = 3_600
     dashboard_max_window_s: Annotated[int, Field(ge=60, le=30 * 86_400)] = 7 * 86_400
     dashboard_max_attempts: Annotated[int, Field(ge=100, le=1_000_000)] = 50_000
+
+    @field_validator("database_direct_url", mode="before")
+    @classmethod
+    def _normalize_direct_db_url(cls, value: object) -> object:
+        if value is None or (isinstance(value, str) and not value.strip()):
+            return None
+        raw = value.get_secret_value() if isinstance(value, SecretStr) else value
+        if isinstance(raw, str):
+            return SecretStr(normalize_database_url(raw.strip()))
+        return value
 
     @field_validator("database_url", mode="before")
     @classmethod
@@ -511,6 +536,23 @@ class Settings(BaseSettings):
     def database_dsn(self) -> str:
         """SQLAlchemy URL (``postgresql+asyncpg://...``). Never log it: it holds the password."""
         return self.database_url.get_secret_value()
+
+    @property
+    def migration_dsn(self) -> str:
+        """URL for Alembic: never through a transaction pooler.
+
+        Migrations set session-level ``lock_timeout`` / ``statement_timeout`` and hold one
+        connection across statements, which PgBouncer's transaction pooling would leak to (or
+        split across) other clients' server connections.
+        """
+        if self.database_direct_url is not None:
+            return self.database_direct_url.get_secret_value()
+        if self.db_pgbouncer:
+            raise ValueError(
+                "DB_PGBOUNCER=true: set DATABASE_DIRECT_URL to Postgres itself for migrations "
+                "(session-level settings must not go through a transaction pooler)"
+            )
+        return self.database_dsn
 
 
 @lru_cache(maxsize=1)
