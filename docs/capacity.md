@@ -1,4 +1,4 @@
-# hookrelay capacity plan (Milestone 8)
+# hookrelay capacity plan (Milestones 8 and 9)
 
 Every number in this document was measured with the k6 harness in [`loadtest/`](../loadtest/README.md)
 against the real processes (uvicorn API, fan-out relay, delivery workers, `hookrelay-mock-receiver`)
@@ -15,7 +15,7 @@ given in brackets, e.g. `[final-drain-w1-c128-l50]`.
 | Postgres | 16.15, `shared_buffers=512MB`, `max_connections=300`, `fsync=on`, `synchronous_commit=on`, `work_mem=4MB` |
 | Redis | 8.0.2 locally (CI runs `redis:7-alpine`); wake-ups, subscription cache and Redis rate limits on |
 | k6 | v2.3.0, constant-arrival-rate executor |
-| Dates | 2026-11-08/09 (matrix), 2026-11-10 (Postgres restart runs) |
+| Dates | 2026-11-08/09 (matrix), 2026-11-10 (Postgres restart runs), 2026-11-11/12 (Milestone 9 batching / PgBouncer runs, section 11) |
 
 So: absolute numbers are a **floor for one shared 8-vCPU machine**, not a production figure. k6 and
 Postgres compete with hookrelay for the same cores, which is why adding a 4th worker process stopped
@@ -75,6 +75,8 @@ setting.
 **Planning number: one worker process (≈ 1 vCPU) delivers ~265-430 deliveries/s** depending on
 `WORKER_CONCURRENCY` (32 → 128) when receivers answer in ~50 ms. Raise concurrency for slow
 receivers (it is cheap: slots are coroutines), but expect the curve to flatten at about one core.
+(These are M8 numbers with one completion transaction per delivery; Milestone 9's group commit
+roughly doubled the 128-slot figure on the same box, see section 11.)
 
 One run was an outlier and is excluded from the table: the first `final-drain-w1-c32-l50` drained
 at 99.2/s; 22 attempts against the 50 ms receiver timed out after ~15.9 s (a stalled process on the
@@ -232,7 +234,7 @@ Strategy (implemented pieces in **bold**, the rest is Milestone 9):
 | API (ingest) | ~200 req/s per process at p99 ≈ 108 ms; ~800 req/s with 4 | processes / replicas (stateless) | Postgres write rate and connection count; PgBouncer past ~20 processes |
 | Relay (fan-out) | 3.5-4% of a core while feeding 430-547 deliveries/s | replicas (`SKIP LOCKED` batches) | not near a limit in any run |
 | Workers | ~265-430 deliveries/s per process (CPU-bound); 547/s with 2 workers on 16 endpoints | processes, *if* active endpoints ≫ workers | per-endpoint planner row; very hot single endpoints are capped by `max_in_flight` by design |
-| Postgres | not saturated in isolation (shared CPU was) | vertical first; partition hot tables; read replica for dashboards / search | every delivery costs its own completion transaction (leases are batched): a batched completion write is the next optimisation |
+| Postgres | not saturated in isolation (shared CPU was) | vertical first; partition hot tables; read replica for dashboards / search | completions are group-committed since M9 (~13x fewer commits per delivery, section 11); partitioning is next |
 | Redis | accelerator only (wake-ups, cache, token buckets) | single primary is ample | losing it costs latency, not correctness |
 
 Capacity formula for a target delivery rate `D` (deliveries/s) and ingest rate `I` (events/s), with
@@ -248,6 +250,76 @@ Example: 1,000 deliveries/s from 250 events/s × 4 endpoints → 3-4 workers at 
 2 API processes, 2 relays, ≈ 105-120 Postgres connections. On separate nodes the per-process figures
 should only improve, which Milestone 9 will verify.
 
+## 11. Milestone 9: batched completions + PgBouncer
+
+Same method and box as section 2 (6,000 events × 2 endpoints = ~12,000 deliveries ingested with the
+worker stopped, then **1 worker × 128 slots** against a 50 ms receiver, 2 API processes, Redis on).
+`WORKER_COMPLETE_BATCH_MAX=1` is the pre-M9 one-transaction-per-attempt path; `32` is the new
+default (linger 5 ms). "Commits" is the `xact_commit` delta of the load database from 3 s after the
+worker started to the end of the drain (so ingest is excluded; it includes lease, renewal and
+reaper transactions), "WAL" the `pg_current_wal_lsn()` delta over the same window, "worker CPU" the
+mean `ps` %CPU of the worker process. Every run: **0 lost, 0 acknowledged twice**, and one attempt
+row per delivery.
+
+| Batch max | Path to Postgres | Deliveries/s | Drain (s) | Commits | WAL (MB) | Worker CPU | Run |
+| --- | --- | --- | --- | --- | --- | --- | --- |
+| 1 | direct | 329.2 / 329.7 | 43.7 / 44.2 | 13,115 / 12,995 | 44.9 / 45.0 | 96.6% / 95.7% | `m9a-drain-w1-c128-l50-b1-r1/r2` (11-11) |
+| 32 | direct | 693.5 / 716.2 | 24.6 / 24.1 | 944 / 1,022 | 42.1 / 41.6 | 87.3% / 87.3% | `m9a-drain-w1-c128-l50-b32-r1/r2` (11-11) |
+| 1 | direct | 388.5 | 38.2 | 12,907 | 44.4 | 97.1% | `m9a-1112-drain-w1-c128-l50-b1` |
+| 32 | direct | 759.6 | 23.1 | 1,005 | 41.0 | 86.5% | `m9a-1112-drain-w1-c128-l50-b32` |
+| 1 | PgBouncer (transaction, 8 server conns) | 372.2 | 39.6 | 12,496 | 44.4 | 96.0% | `m9a-1112-drain-w1-c128-l50-b1-pgb` |
+| 32 | PgBouncer (transaction, 8 server conns) | 618.5 | 26.6 | 924 | 41.3 | 76.2% | `m9a-1112-drain-w1-c128-l50-b32-pgb` |
+
+The 11-11 runs used the M9 code before the final `(id, lease_token)` fencing hardening (same SQL
+shape and statement count); the 11-12 runs are the final code. Absolute numbers moved between the two
+days (the baseline was 329 vs 388 deliveries/s on the same shared box), so compare within a day.
+
+What this shows:
+
+- **Group commit roughly doubles what one worker drains**: 329 → 694-716 deliveries/s (11-11, 2
+  reps each) and 388.5 → 759.6 (11-12), i.e. ×1.96-2.18. The worker was CPU-bound in both modes
+  (86-97% of a core), so the gain is mostly CPU *per delivery*: ≈ 0.97 core / 388.5/s ≈ 2.5 ms
+  with batch 1 vs ≈ 0.865 / 759.6 ≈ 1.1 ms with batch 32. One completion transaction per delivery
+  (session checkout, `now()`, `UPDATE`, ORM insert + flush, breaker `UPDATE`, `COMMIT`, through
+  SQLAlchemy + asyncpg) was more than half of the worker's per-delivery CPU.
+- **Commits per delivery drop ~13x**: ≈ 1.08 (12,907 / 12,000) → ≈ 0.084 (1,005 / 12,002). The
+  remaining commits are mostly leases (a 128-slot worker leases in groups) plus completion batches.
+- **WAL barely changes** (44.4 → 41.0 MB for ~12,000 deliveries): the row images dominate, not
+  commit records. Batching saves fsyncs and round trips, not bytes; partitioning and payload
+  retention remain the storage levers (section 9).
+- **The drain is shorter, end-to-end lag is not the metric here**: p50 lag in a backlog drain is
+  dominated by the 35 s the backlog waited for the worker to start (28.4 s vs 35.6 s p50 on 11-12).
+  At low load the batcher adds no wait (it flushes as soon as every in-flight attempt is waiting);
+  under load the added wait is bounded by `WORKER_COMPLETE_BATCH_LINGER_MS` (5 ms).
+- **PgBouncer costs something on one box**: 372.2 vs 388.5/s with batch 1 (−4%) and 618.5 vs 759.6/s
+  with batch 32 (−19%), single runs. Each statement is prepared afresh (no statement cache, unique
+  names), the pooler is one more process on the same 8 vCPUs, and its pool was 8 server connections.
+  The batched path still beats the unbatched direct path by ×1.6 behind the pooler. PgBouncer is
+  there for the connection budget below, not for speed; measure on separate nodes before tuning it
+  (still on the roadmap).
+
+### Connection budget
+
+Without a pooler Postgres sees `Σ processes × (DB_POOL_SIZE + DB_MAX_OVERFLOW)` = 15 per API,
+relay or worker process with the defaults (section 6): the 1,000 deliveries/s example in section 10 needs
+~105-120 server connections and grows linearly with replicas. With PgBouncer in transaction mode
+(compose default, `deploy/pgbouncer/pgbouncer.ini`):
+
+- clients: every process keeps its SQLAlchemy pool (cheap client connections to PgBouncer, up to
+  `max_client_conn = 1000`);
+- servers: `default_pool_size = 20` per (database, user), `reserve_pool_size = 5` after 2 s of
+  queueing, hard cap `max_db_connections = 40`, so Postgres' `max_connections` only needs 40 +
+  migrations + admin / monitoring sessions, whatever the replica count;
+- a client waits at most `query_wait_timeout = 15 s` for a server connection, then gets an error
+  the worker treats as transient (fenced retry) and the API as `503`.
+
+Each transaction holds a server connection only while it runs (no connection is held during HTTP
+calls, section 6), and group commit cuts completion transactions ~13x, so the server-side pool is
+sized by transaction *rate × duration*, not by slot count. On this box the drain above ran on 8
+server connections (the local pooler's `default_pool_size`). The compose values above are a
+configured starting point, not a measured optimum: size `default_pool_size` against the Postgres
+host and re-measure on separate nodes.
+
 ## Reproducing
 
 ```bash
@@ -257,6 +329,11 @@ export REDIS_URL=redis://127.0.0.1:6379/0
 API_WORKERS=1 bash loadtest/run-local.sh ingest.js -e RATE=200 -e DURATION=30s
 # Backlog drain (delivery throughput per worker)
 API_WORKERS=2 WORKERS=1 WORKER_CONCURRENCY=128 START_WORKERS_AFTER_S=35 \
+  bash loadtest/run-local.sh e2e.js -e RATE=200 -e DURATION=30s -e ENDPOINTS=2 \
+  -e RECEIVER_QUERY=latency_ms=50 -e E2E_P95_MS=600000 -e DRAIN_TIMEOUT_S=400
+# Milestone 9: the same drain with batch 1 vs 32 (add DB_PGBOUNCER=true, DATABASE_DIRECT_URL=<direct>
+# and a DATABASE_URL pointing at PgBouncer to measure through the pooler)
+WORKER_COMPLETE_BATCH_MAX=1 API_WORKERS=2 WORKERS=1 WORKER_CONCURRENCY=128 START_WORKERS_AFTER_S=35 \
   bash loadtest/run-local.sh e2e.js -e RATE=200 -e DURATION=30s -e ENDPOINTS=2 \
   -e RECEIVER_QUERY=latency_ms=50 -e E2E_P95_MS=600000 -e DRAIN_TIMEOUT_S=400
 # Real Postgres restart 25 s in (the data directory must be yours to restart)
