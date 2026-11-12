@@ -37,6 +37,11 @@ _LATENCY_BUCKETS_S: Final = (
     60.0,
 )
 
+# Completion group-commit sizes (WORKER_COMPLETE_BATCH_MAX is at most 500).
+_BATCH_SIZE_BUCKETS: Final = (1, 2, 4, 8, 16, 32, 64, 128, 256, 500)
+# Flush transactions: sub-millisecond local commits through retried ones during an outage.
+_FLUSH_BUCKETS_S: Final = (0.001, 0.0025, 0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 1.0, 5.0)
+
 SERVICE_API: Final = "api"
 SERVICE_RELAY: Final = "relay"
 SERVICE_WORKER: Final = "worker"
@@ -64,6 +69,9 @@ class Metrics:
     worker_leased: Counter
     worker_lease_lost: Counter
     worker_loop_errors: Counter
+    worker_completion_batch_size: Histogram
+    worker_completion_flush_seconds: Histogram
+    worker_completion_retries: Counter
 
     def record_event_ingested(self) -> None:
         self.events_ingested.labels(service=self.service).inc()
@@ -98,6 +106,13 @@ class Metrics:
 
     def record_worker_loop_error(self) -> None:
         self.worker_loop_errors.labels(service=self.service).inc()
+
+    def record_worker_completion_flush(self, *, size: int, seconds: float) -> None:
+        self.worker_completion_batch_size.labels(service=self.service).observe(size)
+        self.worker_completion_flush_seconds.labels(service=self.service).observe(max(seconds, 0))
+
+    def record_worker_completion_retry(self) -> None:
+        self.worker_completion_retries.labels(service=self.service).inc()
 
     def set_queue_depth(
         self,
@@ -218,6 +233,26 @@ def build_metrics(service: str) -> Metrics:
         worker_loop_errors=Counter(
             "hookrelay_worker_loop_errors_total",
             "Unhandled errors in the worker main loop.",
+            ["service"],
+            registry=registry,
+        ),
+        worker_completion_batch_size=Histogram(
+            "hookrelay_worker_completion_batch_size",
+            "Attempts written per completion transaction (group commit).",
+            ["service"],
+            buckets=_BATCH_SIZE_BUCKETS,
+            registry=registry,
+        ),
+        worker_completion_flush_seconds=Histogram(
+            "hookrelay_worker_completion_flush_seconds",
+            "Wall time to write one completion batch, including transient-error retries.",
+            ["service"],
+            buckets=_FLUSH_BUCKETS_S,
+            registry=registry,
+        ),
+        worker_completion_retries=Counter(
+            "hookrelay_worker_completion_retries_total",
+            "Completion transactions retried after a transient database error.",
             ["service"],
             registry=registry,
         ),
