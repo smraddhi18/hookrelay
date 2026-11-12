@@ -39,7 +39,7 @@ jobs:
         run: uv run mypy
 
   test:
-    name: Migrations & tests (Postgres 16)
+    name: Migrations & tests (Postgres 16, PgBouncer)
     runs-on: ubuntu-24.04
     timeout-minutes: 15
     services:
@@ -80,6 +80,14 @@ jobs:
           enable-cache: true
       - name: Install (locked)
         run: uv sync --locked
+      - name: Start PgBouncer (transaction pooling) for the pooler tests
+        # Milestone 9: tests/integration/test_pgbouncer.py runs hookrelay behind a real pooler.
+        # The distro package's own service is stopped; ours listens on 6439 (see the script).
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq --no-install-recommends pgbouncer
+          sudo systemctl stop pgbouncer || true
+          bash deploy/pgbouncer/run-test-pooler.sh >> "$GITHUB_ENV"
       - name: alembic upgrade head
         run: uv run alembic upgrade head
       - name: alembic upgrade head (idempotent re-run)
@@ -155,6 +163,21 @@ jobs:
             -e 'RECEIVER_QUERY=latency_ms=10&jitter_ms=20&failure_rate=0.05&failure_status=500,503' \
             -e E2E_P95_MS=10000 -e DRAIN_TIMEOUT_S=90
           jq . k6-e2e/receiver-stats.json
+      - name: k6 end-to-end smoke behind PgBouncer (transaction pooling, DB_PGBOUNCER=true)
+        env:
+          OUT_DIR: k6-e2e-pgbouncer
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq --no-install-recommends pgbouncer
+          sudo systemctl stop pgbouncer || true
+          bash deploy/pgbouncer/run-test-pooler.sh
+          # Every process goes through the pooler; Alembic uses the direct URL.
+          DATABASE_DIRECT_URL="$DATABASE_URL" DB_PGBOUNCER=true \
+          DATABASE_URL=postgresql+asyncpg://hookrelay:hookrelay@127.0.0.1:6439/hookrelay \
+            bash loadtest/run-local.sh e2e.js -e RATE=25 -e DURATION=15s -e ENDPOINTS=2 \
+            -e 'RECEIVER_QUERY=latency_ms=10&jitter_ms=20&failure_rate=0.05&failure_status=500,503' \
+            -e E2E_P95_MS=10000 -e DRAIN_TIMEOUT_S=90
+          jq . k6-e2e-pgbouncer/receiver-stats.json
       - name: Upload k6 summaries and process logs
         if: always()
         uses: actions/upload-artifact@v4
@@ -163,6 +186,7 @@ jobs:
           path: |
             k6-ingest/
             k6-e2e/
+            k6-e2e-pgbouncer/
           retention-days: 7
 
   docker:
