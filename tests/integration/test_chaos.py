@@ -414,18 +414,29 @@ async def test_postgres_connection_storm_during_traffic(
     )
 
 
+# Both completion paths: one transaction per attempt (WORKER_COMPLETE_BATCH_MAX=1, the pre-M9
+# behaviour) and group commit (the writer is complete_many).
+COMPLETION_PATHS = pytest.mark.parametrize(
+    ("batch_max", "writer"), [(1, "complete"), (32, "complete_many")], ids=["single", "batched"]
+)
+
+
+@COMPLETION_PATHS
 async def test_completion_is_retried_when_the_backend_dies_mid_write(
     api: Any,
+    *,
     mock: RunningReceiver,
     chaos_settings: Callable[..., Settings],
     db_url: str,
     monkeypatch: pytest.MonkeyPatch,
+    batch_max: int,
+    writer: str,
 ) -> None:
     tenant, _ = await provision(api, mock, mock.url("/once"))
     await publish_reliably(api, tenant, 1, prefix="mid-write")
-    settings = chaos_settings()
+    settings = chaos_settings(worker_complete_batch_max=batch_max)
     await fan_out(settings)
-    real_complete = delivery_queue.complete
+    real_complete = getattr(delivery_queue, writer)
     calls = Counter[str]()
 
     async def killed_then_real(session: Any, *args: Any, **kwargs: Any) -> Any:
@@ -436,7 +447,7 @@ async def test_completion_is_retried_when_the_backend_dies_mid_write(
             await query(db_url, "SELECT pg_terminate_backend($1)", pid)
         return await real_complete(session, *args, **kwargs)
 
-    monkeypatch.setattr(delivery_queue, "complete", killed_then_real)
+    monkeypatch.setattr(delivery_queue, writer, killed_then_real)
     db = Database.from_settings(settings)
     worker = Worker(db, settings)
     try:
@@ -451,20 +462,24 @@ async def test_completion_is_retried_when_the_backend_dies_mid_write(
     assert mock.app.recorder.stats()["received"] == 1
 
 
+@COMPLETION_PATHS
 async def test_without_completion_retries_a_lost_write_means_one_redelivery(
     api: Any,
+    *,
     mock: RunningReceiver,
     chaos_settings: Callable[..., Settings],
     db_url: str,
     monkeypatch: pytest.MonkeyPatch,
+    batch_max: int,
+    writer: str,
 ) -> None:
     """The baseline the retry improves on: the reaper still guarantees delivery, at the
     price of exactly one duplicate the receiver must deduplicate by ``webhook-id``."""
     tenant, _ = await provision(api, mock, mock.url("/once"))
     await publish_reliably(api, tenant, 1, prefix="no-retry")
-    settings = chaos_settings(worker_complete_retries=0)
+    settings = chaos_settings(worker_complete_retries=0, worker_complete_batch_max=batch_max)
     await fan_out(settings)
-    real_complete = delivery_queue.complete
+    real_complete = getattr(delivery_queue, writer)
     calls = Counter[str]()
 
     async def killed_once(session: Any, *args: Any, **kwargs: Any) -> Any:
@@ -474,7 +489,7 @@ async def test_without_completion_retries_a_lost_write_means_one_redelivery(
             await query(db_url, "SELECT pg_terminate_backend($1)", pid)
         return await real_complete(session, *args, **kwargs)
 
-    monkeypatch.setattr(delivery_queue, "complete", killed_once)
+    monkeypatch.setattr(delivery_queue, writer, killed_once)
     db = Database.from_settings(settings)
     worker = Worker(db, settings)
     try:

@@ -703,6 +703,7 @@ async def test_run_delivers_continuously_and_survives_loop_errors(
     assert len(receiver.requests) == 2
 
 
+@pytest.mark.parametrize("batch_max", [1, 32], ids=["single", "batched"])
 async def test_attempt_crash_keeps_the_lease_for_the_reaper(
     api: httpx.AsyncClient,
     *,
@@ -711,14 +712,17 @@ async def test_attempt_crash_keeps_the_lease_for_the_reaper(
     make_worker: Any,
     db_url: str,
     monkeypatch: pytest.MonkeyPatch,
+    batch_max: int,
 ) -> None:
     await _setup(api, settings_for(), receiver)
-    worker = make_worker()
+    worker = make_worker(worker_complete_batch_max=batch_max)
 
     async def crash(*_args: Any, **_kwargs: Any) -> Any:
         raise RuntimeError("db went away")
 
+    # Batched: the group write fails, its per-attempt fallback fails too.
     monkeypatch.setattr(delivery_queue, "complete", crash)
+    monkeypatch.setattr(delivery_queue, "complete_many", crash)
     stats = await worker.run_once()
     assert stats.loop_errors == 1
     assert worker.in_flight == 0
