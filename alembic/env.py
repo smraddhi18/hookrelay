@@ -35,7 +35,7 @@ def _database_url() -> str:
     explicit = config.get_main_option("sqlalchemy.url")
     if explicit:
         return normalize_database_url(explicit)
-    return Settings().database_dsn
+    return Settings().migration_dsn
 
 
 def run_migrations_offline() -> None:
