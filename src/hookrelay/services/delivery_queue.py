@@ -22,6 +22,10 @@ Invariants (each enforced by a WHERE clause or a CHECK, not by convention):
   Lua token bucket when available (Milestone 6) and falls back to the Postgres bucket —
   never fail open. Postgres tokens are still spent on every lease so a Redis failover is not
   unlimited.
+* **Group commit (Milestone 9).** :func:`complete_many` applies several attempts in one
+  transaction. The fence still holds per row: a row whose token no longer matches is skipped
+  (``None`` for that item) while the rest commit. Rows are locked in id order and breaker rows
+  in endpoint order, so concurrent batches, renewals and the reaper cannot deadlock.
 * **Retry budget per run.** Retry limits count attempts since ``attempt_offset`` and age since
   ``run_started_at``, so a replayed delivery gets a fresh budget while ``attempt_number`` keeps
   numbering the attempt log monotonically.
@@ -302,12 +306,22 @@ def allocate(slots: Sequence[EndpointSlot], free: int) -> dict[uuid.UUID, int]:
     return {endpoint_id: n for endpoint_id, n in quotas.items() if n > 0}
 
 
+# Rows are locked in id order (``ORDER BY ... FOR UPDATE`` locks as it emits) so a renewal and
+# a batched completion of the same worker, which touch overlapping rows, cannot deadlock.
 _RENEW_SQL = text(
     """
+    WITH mine AS (
+        SELECT d.id FROM deliveries AS d
+        JOIN unnest(CAST(:ids AS uuid[]), CAST(:tokens AS uuid[])) AS l(id, token)
+          ON d.id = l.id AND d.lease_token = l.token
+        WHERE d.status = 'delivering'
+        ORDER BY d.id
+        FOR UPDATE OF d
+    )
     UPDATE deliveries AS d
     SET leased_until = now() + make_interval(secs => :lease_s)
-    FROM unnest(CAST(:ids AS uuid[]), CAST(:tokens AS uuid[])) AS l(id, token)
-    WHERE d.id = l.id AND d.lease_token = l.token AND d.status = 'delivering'
+    FROM mine
+    WHERE d.id = mine.id
     RETURNING d.id
     """
 )
@@ -323,6 +337,36 @@ _COMPLETE_SQL = text(
         last_error_class = :error_class
     WHERE id = :id AND lease_token = :token AND status = 'delivering'
     RETURNING attempt_count
+    """
+)
+
+# The batched form of _COMPLETE_SQL: one row per attempt, each fenced by its own token; rows
+# whose lease is gone are simply not returned. Locked in id order (see _RENEW_SQL).
+_COMPLETE_MANY_SQL = text(
+    """
+    WITH c AS (
+        SELECT * FROM unnest(
+            CAST(:ids AS uuid[]), CAST(:tokens AS uuid[]), CAST(:statuses AS text[]),
+            CAST(:next_attempts AS timestamptz[]), CAST(:terminals AS boolean[]),
+            CAST(:status_codes AS int[]), CAST(:error_classes AS text[])
+        ) AS c(id, token, status, next_attempt_at, terminal, status_code, error_class)
+    ), mine AS (
+        SELECT d.id, d.lease_token AS token FROM deliveries AS d
+        JOIN c ON d.id = c.id AND d.lease_token = c.token
+        WHERE d.status = 'delivering'
+        ORDER BY d.id
+        FOR UPDATE OF d
+    )
+    UPDATE deliveries AS d
+    SET status = c.status,
+        lease_token = NULL, leased_until = NULL, leased_by = NULL,
+        next_attempt_at = COALESCE(c.next_attempt_at, d.next_attempt_at),
+        completed_at = CASE WHEN c.terminal THEN now() END,
+        last_status_code = c.status_code,
+        last_error_class = c.error_class
+    FROM mine JOIN c ON c.id = mine.id AND c.token = mine.token
+    WHERE d.id = mine.id
+    RETURNING d.id, c.token
     """
 )
 
@@ -577,27 +621,7 @@ async def complete(
     )
     if updated is None:
         return None
-    session.add(
-        DeliveryAttempt(
-            tenant_id=delivery.tenant_id,
-            delivery_id=delivery.id,
-            endpoint_id=delivery.endpoint_id,
-            attempt_number=delivery.attempt_number,
-            outcome=completion.outcome.value,
-            status_code=record.status_code,
-            error_class=None if error_class is None else error_class.value,
-            error_message=record.error_message,
-            latency_ms=record.latency_ms,
-            request_url=record.request_url,
-            request_headers=record.request_headers,
-            response_body=record.response_body,
-            response_truncated=record.response_truncated,
-            worker_id=worker_id,
-            started_at=record.started_at,
-            finished_at=max(record.finished_at, record.started_at),
-            next_attempt_at=completion.next_attempt_at,
-        )
-    )
+    session.add(_attempt_row(delivery, record, completion, error_class, worker_id))
     await session.flush()
     if breaker is not None:
         await circuit_breaker.record_outcome(
@@ -609,6 +633,160 @@ async def complete(
             policy=breaker,
         )
     return completion
+
+
+@dataclass(frozen=True, slots=True)
+class CompletionItem:
+    """One finished attempt waiting to be written."""
+
+    delivery: LeasedDelivery
+    record: AttemptRecord
+
+
+def _attempt_row(
+    delivery: LeasedDelivery,
+    record: AttemptRecord,
+    completion: Completion,
+    error_class: ErrorClass | None,
+    worker_id: str,
+) -> DeliveryAttempt:
+    return DeliveryAttempt(
+        tenant_id=delivery.tenant_id,
+        delivery_id=delivery.id,
+        endpoint_id=delivery.endpoint_id,
+        attempt_number=delivery.attempt_number,
+        outcome=completion.outcome.value,
+        status_code=record.status_code,
+        error_class=None if error_class is None else error_class.value,
+        error_message=record.error_message,
+        latency_ms=record.latency_ms,
+        request_url=record.request_url,
+        request_headers=record.request_headers,
+        response_body=record.response_body,
+        response_truncated=record.response_truncated,
+        worker_id=worker_id,
+        started_at=record.started_at,
+        finished_at=max(record.finished_at, record.started_at),
+        next_attempt_at=completion.next_attempt_at,
+    )
+
+
+def breaker_signals(
+    items: Sequence[CompletionItem],
+) -> list[tuple[uuid.UUID, uuid.UUID, circuit_breaker.Signal]]:
+    """The breaker updates a batch implies, as ``(endpoint_id, tenant_id, signal)``.
+
+    Grouped by endpoint in endpoint-id order (one lock order for every batch, so two workers'
+    batches can never deadlock on ``endpoint_states``), in arrival order within an endpoint
+    (failures must be counted in sequence). Neutral signals are dropped and consecutive
+    successes collapse into one: a success on a closed breaker with no failure streak is a
+    no-op, so only the first of a run can change anything.
+    """
+    by_endpoint: dict[uuid.UUID, list[tuple[uuid.UUID, circuit_breaker.Signal]]] = {}
+    for item in items:
+        record = item.record
+        signal = circuit_breaker.classify(record.error_class, record.status_code)
+        if signal is circuit_breaker.Signal.NEUTRAL:
+            continue
+        signals = by_endpoint.setdefault(item.delivery.endpoint_id, [])
+        success = circuit_breaker.Signal.SUCCESS
+        if signal is success and signals and signals[-1][1] is success:
+            continue
+        signals.append((item.delivery.tenant_id, signal))
+    return [
+        (endpoint_id, tenant_id, signal)
+        for endpoint_id in sorted(by_endpoint)
+        for tenant_id, signal in by_endpoint[endpoint_id]
+    ]
+
+
+async def complete_many(
+    session: AsyncSession,
+    items: Sequence[CompletionItem],
+    *,
+    worker_id: str,
+    now: datetime,
+    policy: RetryPolicy,
+    breaker: BreakerPolicy | None = None,
+) -> list[Completion | None]:
+    """Apply several attempts' results in the caller's transaction (group commit).
+
+    Same semantics as calling :func:`complete` for each item in order, in one transaction:
+    each row is fenced by its own lease token, and an item whose lease was lost yields
+    ``None`` without affecting the others (and contributes no attempt row and no breaker
+    signal). Costs three statements for the whole batch (update, multi-row insert, plus one
+    breaker statement per endpoint that actually needs one) instead of three per attempt.
+    """
+    if not items:
+        return []
+    # A (delivery, lease token) pair may be completed once. The worker never submits one twice,
+    # but if a bug ever did, the duplicate is fenced out here (``None``) instead of producing a
+    # second attempt row, and the SQL sees each key once (an UPDATE ... FROM with a duplicate
+    # join row would apply an arbitrary one of them).
+    seen: set[tuple[uuid.UUID, uuid.UUID]] = set()
+    duplicate = [False] * len(items)
+    for i, item in enumerate(items):
+        key = (item.delivery.id, item.delivery.lease_token)
+        duplicate[i] = key in seen
+        seen.add(key)
+    if any(duplicate):
+        logger.error(
+            "deliveries.complete_many_duplicate",
+            duplicates=sum(duplicate),
+            batch_size=len(items),
+        )
+        unique = [item for item, dup in zip(items, duplicate, strict=True) if not dup]
+        unique_results = iter(
+            await complete_many(
+                session, unique, worker_id=worker_id, now=now, policy=policy, breaker=breaker
+            )
+        )
+        return [None if dup else next(unique_results) for dup in duplicate]
+    plans = [
+        plan_completion(
+            item.record,
+            attempt_number=item.delivery.run_attempt,
+            created_at=item.delivery.run_started_at or item.delivery.created_at,
+            now=now,
+            policy=policy,
+        )
+        for item in items
+    ]
+    rows = await session.execute(
+        _COMPLETE_MANY_SQL,
+        {
+            "ids": [item.delivery.id for item in items],
+            "tokens": [item.delivery.lease_token for item in items],
+            "statuses": [completion.status.value for completion, _ in plans],
+            "next_attempts": [completion.next_attempt_at for completion, _ in plans],
+            "terminals": [completion.status.is_terminal for completion, _ in plans],
+            "status_codes": [item.record.status_code for item in items],
+            "error_classes": [None if e is None else e.value for _, e in plans],
+        },
+    )
+    applied = {(r.id, r.token) for r in rows}
+    results: list[Completion | None] = []
+    landed: list[CompletionItem] = []
+    for item, (completion, error_class) in zip(items, plans, strict=True):
+        if (item.delivery.id, item.delivery.lease_token) not in applied:
+            results.append(None)
+            continue
+        session.add(_attempt_row(item.delivery, item.record, completion, error_class, worker_id))
+        results.append(completion)
+        landed.append(item)
+    if landed:
+        await session.flush()
+    if breaker is not None:
+        for endpoint_id, tenant_id, signal in breaker_signals(landed):
+            await circuit_breaker.record_outcome(
+                session,
+                tenant_id=tenant_id,
+                endpoint_id=endpoint_id,
+                signal=signal,
+                now=now,
+                policy=breaker,
+            )
+    return results
 
 
 @dataclass(frozen=True, slots=True)
