@@ -88,8 +88,8 @@ Legend: `[x]` done, `[ ]` planned.
 The capacity plan's next levers, plus the deployment story an operator would actually run.
 
 - [ ] Native range partitioning by `created_at` for `delivery_attempts` first (append-only, largest), then `deliveries` and `events`: daily partitions created ahead by a maintenance job, retention by `DETACH` / `DROP PARTITION` instead of batched `DELETE`s, online migration with a dual-write / backfill window and a tested downgrade
-- [ ] Batched completion writes in workers (one transaction for several finished attempts, still fenced per lease) to cut the one-completion-transaction-per-delivery cost (leases are already batched)
-- [ ] PgBouncer (transaction pooling) in compose and docs: asyncpg prepared-statement settings, connection budget per process, re-measured pool sizing
+- [x] Batched completion writes in workers (one transaction for several finished attempts, still fenced per lease) to cut the one-completion-transaction-per-delivery cost (leases are already batched)
+- [x] PgBouncer (transaction pooling) in compose and docs: asyncpg prepared-statement settings, connection budget per process, re-measured pool sizing
 - [ ] Helm chart: API / relay / worker Deployments, a pre-upgrade migration Job, liveness / readiness / heartbeat probes, PodDisruptionBudgets, `SIGTERM` grace above the drain timeout, secrets from Kubernetes Secrets
 - [ ] Autoscaling: HPA for the API on CPU, KEDA (Prometheus scaler) for workers on `deliveries_pending` / fan-out lag
 - [ ] CI: `helm lint` + a kind cluster smoke (install chart, run the k6 e2e smoke against it)
@@ -274,3 +274,35 @@ The capacity plan's next levers, plus the deployment story an operator would act
   format, mypy strict, Alembic upgrade / downgrade roundtrip + `alembic check` pass; both CI k6 smokes
   pass locally (0 lost, 0 acknowledged twice).
 - Next: Milestone 9 (time partitioning, batched completions, PgBouncer, Helm + autoscaling).
+
+### 2026-11-12: Milestone 9a (batched completions + PgBouncer)
+
+- Group commit for worker completions: `CompletionBatcher` (generic, DB-free flush policy: full,
+  every in-flight attempt waiting, `WORKER_COMPLETE_BATCH_LINGER_MS` after the oldest entry, or
+  drain) feeds `delivery_queue.complete_many()`: one `UPDATE deliveries ... FROM unnest(...)` fenced
+  per `(id, lease_token)` with rows locked in id order, one multi-row `delivery_attempts` insert, and
+  breaker updates in endpoint order (consecutive successes collapsed). A lost lease skips only its
+  row; a stale token or a duplicated `(delivery, token)` in the same batch never lands twice;
+  transient errors retry the whole batch (idempotent by fencing); any other error re-writes the
+  batch one attempt per transaction so only the poisonous row fails; drain writes queued results
+  before releasing leases; lease renewal now locks in id order too (no renewal / completion
+  deadlocks). New metrics `hookrelay_worker_completion_batch_size`,
+  `hookrelay_worker_completion_flush_seconds`, `hookrelay_worker_completion_retries_total`.
+- PgBouncer in transaction mode: compose `pgbouncer` service (`edoburu/pgbouncer:v1.26.1-p0`,
+  `deploy/pgbouncer/pgbouncer.ini`: 20 + 5 reserve server connections, cap 40) in front of the API,
+  relay, worker and retention job; `DB_PGBOUNCER=true` turns off asyncpg's statement caches, uses
+  unique prepared-statement names and moves `statement_timeout` / `idle_in_transaction_session_timeout`
+  to the pooler's `connect_query`; Alembic uses `DATABASE_DIRECT_URL`. A unit test audits that the
+  code uses no session-level Postgres feature; integration tests run against a real PgBouncer
+  (default asyncpg settings proven to break, pooled mode survives many clients on few server
+  connections, full ingest → fan-out → batched delivery through the pooler). CI installs PgBouncer
+  for the test job and adds a k6 e2e smoke behind it in the loadtest job.
+- Measured on the shared 8-vCPU box (docs/capacity.md section 11), 1 worker × 128 slots draining
+  ~12,000 deliveries against 50 ms receivers, 0 lost / 0 duplicates in every run: batch 1 → 32 took
+  388.5 → 759.6 deliveries/s (329 → 694-716 on 11-11), commits per delivery ≈ 1.08 → ≈ 0.08, worker
+  CPU per delivery ≈ 2.5 → 1.1 ms; through PgBouncer 372.2 (batch 1) and 618.5 (batch 32).
+- New settings `WORKER_COMPLETE_BATCH_MAX` (32), `WORKER_COMPLETE_BATCH_LINGER_MS` (5),
+  `DB_PGBOUNCER`, `DATABASE_DIRECT_URL`. No schema migration (head stays `0010`).
+- 992 tests (744 unit, 248 integration on Postgres 16 + Redis + PgBouncer), 97% line+branch coverage; ruff, ruff format, mypy strict, Alembic upgrade / downgrade roundtrip + `alembic check`
+  pass; integration suite runs with no skips (PgBouncer tests included).
+- Next: Milestone 9b, native range partitioning of `delivery_attempts` (then `deliveries` / `events`).

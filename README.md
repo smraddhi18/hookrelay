@@ -16,8 +16,9 @@ See the **[roadmap](ROADMAP.md)** for the plan and progress log.
 
 > **Status:** Milestones 0 (foundation), 1 (tenancy), 2 (ingestion), 3 (delivery workers),
 > 4 (back-pressure and failure isolation), 5 (operability for tenants), 6 (Redis), 7 (observability)
-> and 8 (load, chaos and capacity) are complete; Milestone 9 (time partitioning and a Kubernetes
-> deploy) is next. Tenants authenticate with hashed, role-scoped API keys, manage endpoints, event types
+> and 8 (load, chaos and capacity) are complete; Milestone 9 is in progress: batched (group-committed)
+> completion writes and PgBouncer transaction pooling have landed (9a), time partitioning and a
+> Kubernetes deploy are next. Tenants authenticate with hashed, role-scoped API keys, manage endpoints, event types
 > and wildcard subscriptions, and publish events through `POST /v1/events` with `Idempotency-Key`
 > support. Each event and its outbox row commit in one transaction; a relay process fans the
 > outbox out into exactly one `delivery` per (event, endpoint); and delivery workers lease due
@@ -76,7 +77,9 @@ See the **[roadmap](ROADMAP.md)** for the plan and progress log.
 | Scale | k6 load tests (`loadtest/`): constant-rate ingest and end-to-end delivery to `hookrelay-mock-receiver` (latency, jitter, failure / `429` / hang rates per endpoint), failing on any lost or twice-acknowledged delivery; CI smoke job | ✅ M8 |
 | Scale | Chaos tests on real Postgres: worker `SIGKILL` mid-delivery, backend-termination storms, a backend killed between the receiver's 2xx and the completion write, slow / flaky / hanging receivers, drain during an outage; a real `pg_ctl restart` under load (`CHAOS_CMD`) | ✅ M8 |
 | Scale | Restart-safe write paths: transient DB errors (incl. `57P03` while Postgres restarts) are `503` + `Retry-After` on the API and fenced, retried completions in workers; sharded HTTP connection pools; measured [capacity plan](docs/capacity.md) | ✅ M8 |
-| Scale | Time partitioning of hot tables, PgBouncer, Helm chart + autoscaling on queue depth | 🔜 M9 |
+| Scale | Group-committed completion writes in workers: up to `WORKER_COMPLETE_BATCH_MAX` finished attempts per transaction, each row still fenced by its own lease token; partial batches skip only the fenced-out rows, a poisonous row falls back to one transaction per attempt, drain writes queued results instead of releasing them | ✅ M9 |
+| Scale | PgBouncer (transaction pooling) in compose and CI: `DB_PGBOUNCER=true` disables asyncpg statement caches and uses unique prepared-statement names, server-side timeouts move to the pooler, migrations bypass it (`DATABASE_DIRECT_URL`), a unit test audits that no session-level Postgres feature is used | ✅ M9 |
+| Scale | Time partitioning of hot tables, Helm chart + autoscaling on queue depth | 🔜 M9 |
 
 ## Architecture
 
@@ -103,9 +106,12 @@ flowchart LR
 
     R[("Redis 7<br/>wake-ups, cache,<br/>token buckets")]
 
+    PGB["PgBouncer (M9)<br/>transaction pooling<br/>many clients → few<br/>server connections"]
+    MIG["alembic migrate job"]
+
     subgraph Workers["Workers (N replicas)"]
         FAN["Fan-out relay<br/>outbox → deliveries"]
-        DW["Delivery workers<br/>SKIP LOCKED leases"]
+        DW["Delivery workers<br/>SKIP LOCKED leases,<br/>group-committed completions"]
     end
 
     subgraph Edge["Egress"]
@@ -131,7 +137,11 @@ flowchart LR
     FAN -->|"per matching subscription"| DL
     FAN -. publish wake-up .-> R
     R -. wake .-> DW
-    DW -->|lease, record attempt,<br/>retry / DLQ| DL
+    DW -->|"lease; batched, fenced<br/>completions; retry / DLQ"| DL
+    API ==>|"all SQL (DB_PGBOUNCER=true)"| PGB
+    Workers ==>|all SQL| PGB
+    PGB ==>|"default_pool_size<br/>server connections"| PG
+    MIG ==>|"DATABASE_DIRECT_URL<br/>(session state)"| PG
     DW --> SSRF --> EP
     DW -. rate limit / breaker .-> R
     API -. metrics, traces .-> OBS
@@ -142,6 +152,9 @@ flowchart LR
     CHAOS -. faults .-> PG
     CHAOS -. faults .-> DW
 ```
+
+Thin arrows into Postgres show *logical* data flow; physically every API, relay and worker
+connection goes through PgBouncer (thick arrows) and only migrations connect directly.
 
 ### Tenancy and auth (Milestone 1)
 
@@ -450,6 +463,30 @@ receiver would actually process twice. The chaos tests run the same receiver in-
 reconcile it against `delivery_attempts` (every extra acknowledgement must be explained by a
 `lease_expired` attempt).
 
+### Batched completions and PgBouncer (Milestone 9a)
+
+```mermaid
+flowchart LR
+    subgraph W["Delivery worker process"]
+        T1["attempt task 1"]
+        T2["attempt task 2"]
+        TN["attempt task N<br/>(WORKER_CONCURRENCY)"]
+        B["CompletionBatcher<br/>flush when full | all in-flight waiting |<br/>linger elapsed | drain"]
+        WR["writer: one transaction per batch<br/>transient error → retry whole batch<br/>other error → one tx per attempt"]
+        REN["lease renewer / reaper"]
+    end
+    PGB["PgBouncer<br/>pool_mode = transaction"]
+    PG[("Postgres 16<br/>deliveries · delivery_attempts ·<br/>endpoint_states")]
+
+    T1 -->|"submit(attempt)"| B
+    T2 --> B
+    TN --> B
+    B --> WR
+    WR -->|"UPDATE … FROM unnest(ids, tokens, …)<br/>fenced per (id, lease_token), id order<br/>+ multi-row attempt INSERT<br/>+ breaker updates in endpoint order"| PGB
+    REN -->|"renew: same id-ordered locks"| PGB
+    PGB --> PG
+```
+
 ### Request flow (with auth)
 
 1. `RequestContextMiddleware` (pure ASGI) reads `X-Request-ID`. A caller-supplied ID is kept only
@@ -536,6 +573,14 @@ reconcile it against `delivery_attempts` (every extra acknowledgement must be ex
    `pending` with `next_attempt_at`), `last_status_code` and `last_error_class`, and clears the
    lease; the attempt row is inserted in the same transaction. Zero rows updated means another
    worker owns the delivery now: the result is discarded (`worker.lease_lost`).
+   Since Milestone 9 this step is **group-committed**: finished attempts queue in the worker's
+   `CompletionBatcher` and one transaction writes up to `WORKER_COMPLETE_BATCH_MAX` of them with a
+   single `UPDATE deliveries ... FROM unnest(:ids, :tokens, :statuses, ...)` (each row still matched
+   on its own `lease_token`; rows locked in id order), one multi-row `delivery_attempts` insert and
+   one breaker update per affected endpoint (endpoint order). A batch is written as soon as it is
+   full, as soon as every in-flight attempt is waiting on it (so an idle worker never waits), or
+   `WORKER_COMPLETE_BATCH_LINGER_MS` after its oldest entry arrived. Each attempt task gets its own
+   result back: the completion, or `None` if its lease was lost (only that row is skipped).
 6. **Retry schedule.** `delay = uniform(0, min(DELIVERY_BACKOFF_MAX_S, DELIVERY_BACKOFF_BASE_S ×
    2^(attempt-1)))` (full jitter), raised to the receiver's `Retry-After` (seconds or HTTP date,
    capped at `DELIVERY_RETRY_AFTER_MAX_S`). After `DELIVERY_MAX_ATTEMPTS`, or when the next attempt
@@ -547,6 +592,9 @@ reconcile it against `delivery_attempts` (every extra acknowledgement must be ex
 8. **Shutdown.** `SIGTERM` / `SIGINT` stop leasing, give in-flight attempts `WORKER_DRAIN_TIMEOUT_S`
    to finish, then cancel the rest and release their leases back to `pending` with the attempt
    refunded (nothing was recorded, so it does not count against `DELIVERY_MAX_ATTEMPTS`).
+   Attempts that already finished but are still queued for a group commit are written first
+   (bounded by the drain budget, at least 1 s): releasing them would redeliver a webhook the
+   receiver already acknowledged.
 
 ### Back-pressure flow (Milestone 4)
 
@@ -954,6 +1002,45 @@ reconcile it against `delivery_attempts` (every extra acknowledgement must be ex
   caveat is stated up front, an outlier run is shown and explained rather than dropped silently, and
   a step whose load generator was killed is reported as "no result".
 
+### Milestone 9a decisions (batched completions, PgBouncer)
+
+- **Group commit, not a write-behind cache.** M8 showed one completion transaction per delivery
+  (fenced `UPDATE`, attempt `INSERT`, breaker `UPDATE`, `COMMIT` = a WAL flush and a pool checkout)
+  as the per-delivery database cost. The worker now hands finished attempts to a small batcher and
+  each attempt task *awaits its own result*, so nothing is acknowledged before it is durable and a
+  crash loses only attempts that were never recorded (redelivered, as with at-least-once before).
+  The trade-off is up to `WORKER_COMPLETE_BATCH_LINGER_MS` (5 ms) of extra latency per completion
+  under load, and none when idle: the batch flushes as soon as every in-flight attempt is waiting.
+- **Fencing stays per row.** The batch statement joins `unnest(ids, tokens, ...)` on
+  `(id, lease_token)` and returns `(id, token)` for the rows it updated, so a lost lease in the
+  middle of a batch yields `None` for that attempt only (no attempt row, no breaker signal), a stale
+  attempt of a re-leased delivery cannot land next to the current one, and a duplicated
+  `(delivery, token)` is completed once. Re-running a batch after an ambiguous commit is safe for the
+  same reason: rows that already committed no longer match.
+- **Partial failure is isolated.** A transient error (`08xxx`, `57P0x`, pool timeout) retries the
+  whole batch with backoff; any other error means one row is poisonous, so the batch is re-written
+  one attempt per transaction and only the culprit fails (its lease expires into the reaper).
+- **Deadlock-free by lock ordering.** Batched completions and lease renewals touch overlapping rows
+  of the same worker; both lock `deliveries` in id order, and breaker rows are updated in endpoint
+  order, so concurrent batches, renewals and the reaper cannot form a cycle (tested with three
+  workers renewing every 50 ms). Consecutive successes on one endpoint collapse into one breaker
+  update; failures are applied in arrival order.
+- **`WORKER_COMPLETE_BATCH_MAX=1` is the old path.** Kept as an escape hatch and as the benchmark
+  baseline.
+- **PgBouncer in transaction mode, and what it costs.** A server connection belongs to a client
+  for one transaction, so N processes × pool size client connections share `default_pool_size`
+  server connections. That rules out session state: asyncpg's statement caches are disabled and
+  statements get unique names (`__asyncpg_<uuid>__`) instead of the per-connection
+  `__asyncpg_stmt_1__` that collides across clients; startup parameters PgBouncer does not track
+  (`statement_timeout`, `idle_in_transaction_session_timeout`) are refused, so they move to the
+  pooler's `connect_query` (asyncpg's `command_timeout` still bounds every query client-side);
+  and a unit test audits the code for session-level features (`LISTEN`, session advisory locks,
+  session `SET`, temp tables). Migrations need session state, so Alembic uses
+  `DATABASE_DIRECT_URL`. The integration suite proves the default asyncpg settings break behind a
+  real PgBouncer and that `DB_PGBOUNCER=true` survives many clients on few server connections.
+  The cost is a re-prepare per statement (no cache) and an extra hop; in exchange Postgres
+  connection count stops scaling with replicas.
+
 ## Getting started
 
 ### Prerequisites
@@ -1033,7 +1120,7 @@ with `ENDPOINT_ALLOW_HTTP=true ENDPOINT_ALLOW_PRIVATE_NETWORKS=true` and the wor
 ### Docker Compose
 
 ```bash
-docker compose up --build   # postgres:16 + redis:7 + one-shot migrate job + api on :8000 + relay + worker
+docker compose up --build   # postgres:16 + pgbouncer + redis:7 + one-shot migrate job + api on :8000 + relay + worker
 curl -i localhost:8000/ready
 docker compose down -v
 ```
@@ -1047,6 +1134,13 @@ runs `python -m hookrelay.worker` the same way (heartbeat health check, `stop_gr
 above the 25 s drain) and scales with `--scale worker=4`. Compose runs in production mode, so the
 worker only delivers to public addresses.
 
+Since Milestone 9 the API, relay, worker and retention job reach Postgres through the `pgbouncer`
+service (`edoburu/pgbouncer`, transaction pooling, config in `deploy/pgbouncer/pgbouncer.ini`,
+`DB_PGBOUNCER=true`), while `migrate` connects straight to Postgres through `DATABASE_DIRECT_URL`.
+Scaling `api` / `worker` replicas therefore adds client connections to PgBouncer, not server
+connections to Postgres. To bypass the pooler, run with
+`HOOKRELAY_DATABASE_URL=postgresql+asyncpg://hookrelay:hookrelay@postgres:5432/hookrelay DB_PGBOUNCER=false`.
+
 ## Configuration
 
 All settings are environment variables (or `.env`), validated at startup. See
@@ -1057,7 +1151,9 @@ All settings are environment variables (or `.env`), validated at startup. See
 | `APP_ENV` | `development` | `production` enforces JSON logs and forbids `DEBUG` / `DB_ECHO` |
 | `DATABASE_URL` | `postgresql+asyncpg://hookrelay:hookrelay@localhost:5432/hookrelay` | `postgres://` and `postgresql://` are normalised to asyncpg; other databases are rejected |
 | `DB_POOL_SIZE` / `DB_MAX_OVERFLOW` | `10` / `5` | per process |
-| `DB_STATEMENT_TIMEOUT_MS` | `15000` | applied server-side to every connection |
+| `DB_STATEMENT_TIMEOUT_MS` | `15000` | applied server-side to every connection (behind PgBouncer: set it in the pooler's `connect_query`; still enforced client-side) |
+| `DB_PGBOUNCER` | `false` | `true` when `DATABASE_URL` points at PgBouncer in transaction mode: no statement caches, unique prepared-statement names, no untracked startup parameters |
+| `DATABASE_DIRECT_URL` | unset | Postgres itself, bypassing the pooler, for Alembic; required when `DB_PGBOUNCER=true` |
 | `READINESS_TIMEOUT_S` | `2` | `/ready` gives up and returns 503 after this |
 | `LOG_FORMAT` / `LOG_LEVEL` | `json` / `INFO` | `console` for local readability |
 | `REQUEST_ID_HEADER` | `X-Request-ID` | correlation header accepted and returned |
@@ -1097,6 +1193,7 @@ All settings are environment variables (or `.env`), validated at startup. See
 | `WORKER_REFILL_LINGER_MS` | `20` | when saturated, wait up to this long for a quarter of the slots to free before leasing again (0 = lease per freed slot) |
 | `WORKER_COMPLETE_RETRIES` | `6` | retries of a completion write after a transient DB error (restart, failover, pool timeout); fenced by the lease token, so idempotent. 0 = leave it to lease expiry + reaper |
 | `WORKER_COMPLETE_RETRY_BASE_MS` / `WORKER_COMPLETE_RETRY_MAX_MS` | `100` / `2000` | exponential backoff of those retries (base ≤ max enforced) |
+| `WORKER_COMPLETE_BATCH_MAX` / `WORKER_COMPLETE_BATCH_LINGER_MS` | `32` / `5` | group commit: finished attempts per completion transaction (1 to 500; `1` = one transaction per attempt) / the most extra wait for a batch to fill (0 to 1000) |
 | `WORKER_HEARTBEAT_FILE` / `WORKER_HEARTBEAT_MAX_AGE_S` | `/tmp/hookrelay-worker.heartbeat` / `60` | liveness file for `--healthcheck` |
 | `DELIVERY_CONNECT_TIMEOUT_MS` | `5000` | TCP + TLS handshake deadline (the endpoint's `timeout_ms` bounds the whole request) |
 | `DELIVERY_RESPONSE_MAX_BYTES` | `4096` | response bytes read and kept in the attempt log (0 to 65536) |
@@ -1394,14 +1491,16 @@ src/hookrelay/
   db/                   engine/session lifecycle, declarative base, models, integrity-error mapping
   services/             business logic (framework-free): tenants, api_keys, endpoints, endpoint_rules,
                         event_types, subscriptions, pagination, events, idempotency, fanout, housekeeping,
-                        delivery_queue (lease / renew / complete / reclaim / release SQL), delivery_policy
+                        delivery_queue (lease / renew / complete / complete_many / reclaim / release
+                        SQL), completion_batcher (group-commit flush policy), delivery_policy
                         (classification, backoff, Retry-After), ssrf (address vetting + guarded backend),
                         webhook_client (httpx), deliveries (read API), circuit_breaker (breaker state
                         machine + outcome recording), notifications (outbox + notifier), replays,
                         endpoint_secrets (rotation), endpoint_health (summary), dashboard (tenant
                         rollup), retention (payload purge + ended secret overlaps, batched runner);
                         deliveries also holds search
-  deploy/               Prometheus scrape config, Grafana provisioning + starter dashboard
+  deploy/               Prometheus scrape config, Grafana provisioning + starter dashboard,
+                        pgbouncer/ (compose pgbouncer.ini + userlist, run-test-pooler.sh for tests / CI)
 alembic/                async env + versioned migrations (0001 tenants ... 0010 observability trace context)
 loadtest/               k6 scripts (ingest.js, e2e.js, lib.js) + run-local.sh (starts the stack, runs k6,
                         optional CHAOS_CMD fault injection, collects summaries and logs)
@@ -1465,8 +1564,17 @@ What the chaos suite proves on every CI run:
 
 ## Scaling notes
 
-- The API is stateless. Scale it horizontally behind a load balancer and size the total Postgres connections
-  as `replicas × (DB_POOL_SIZE + DB_MAX_OVERFLOW)`. Add PgBouncer (transaction mode) once replicas grow.
+- The API is stateless. Scale it horizontally behind a load balancer. Without a pooler Postgres sees
+  `processes × (DB_POOL_SIZE + DB_MAX_OVERFLOW)` connections; with PgBouncer in transaction mode
+  (compose default, `DB_PGBOUNCER=true`) that is only the client side, and Postgres sees at most
+  `max_db_connections` (40 in `deploy/pgbouncer/pgbouncer.ini`: `default_pool_size` 20 + reserve 5,
+  with headroom for migrations and admin sessions). See the connection budget in
+  [docs/capacity.md](docs/capacity.md#connection-budget).
+- Completion writes are group-committed (M9): one transaction per batch of up to
+  `WORKER_COMPLETE_BATCH_MAX` attempts instead of one per attempt. In the backlog-drain benchmark
+  (1 worker × 128 slots, 50 ms receivers) that took one worker from 388.5 to 759.6 deliveries/s and
+  commits per delivery from ≈ 1.08 to ≈ 0.08; behind PgBouncer the same run did 618.5/s
+  ([capacity plan](docs/capacity.md#11-milestone-9-batched-completions--pgbouncer)).
 - Relays scale independently of the API: `SKIP LOCKED` hands each replica a disjoint batch, and the
   claim query is served by a partial index over pending outbox rows (`WHERE processed_at IS NULL`),
   so its cost tracks the backlog, not table size. One fan-out statement per batch keeps round trips
@@ -1494,9 +1602,9 @@ What the chaos suite proves on every CI run:
   in-flight / due rows through the partial `ix_deliveries_endpoint_delivering` and
   `ix_deliveries_endpoint_due` indexes; a fleet with tens of thousands of active endpoints would
   move the due set into a per-endpoint queue table (Redis already holds wake / RL / cache).
-- The breaker row is a hot spot only for a single very busy endpoint (one short `UPDATE` per attempt);
-  that is the trade for fleet-wide, restart-safe state. Batch outcome recording or Redis counters
-  are the next step if it shows up in `pg_stat_activity`.
+- The breaker row is a hot spot only for a single very busy endpoint; since M9 a completion batch
+  updates it once per run of successes instead of once per attempt (failures are still applied one
+  by one, in order). Redis counters are the next step if it shows up in `pg_stat_activity`.
 - Bulk replay touches at most `REPLAY_MAX_DELIVERIES` rows per transaction via
   `ix_deliveries_tenant_created`, and replay rate limiting is a count over
   `ix_replay_requests_tenant_created` in the last minute.
