@@ -90,9 +90,9 @@ The capacity plan's next levers, plus the deployment story an operator would act
 - [ ] Native range partitioning by `created_at` for `delivery_attempts` first (append-only, largest), then `deliveries` and `events`: daily partitions created ahead by a maintenance job, retention by `DETACH` / `DROP PARTITION` instead of batched `DELETE`s, online migration with a dual-write / backfill window and a tested downgrade
 - [x] Batched completion writes in workers (one transaction for several finished attempts, still fenced per lease) to cut the one-completion-transaction-per-delivery cost (leases are already batched)
 - [x] PgBouncer (transaction pooling) in compose and docs: asyncpg prepared-statement settings, connection budget per process, re-measured pool sizing
-- [ ] Helm chart: API / relay / worker Deployments, a pre-upgrade migration Job, liveness / readiness / heartbeat probes, PodDisruptionBudgets, `SIGTERM` grace above the drain timeout, secrets from Kubernetes Secrets
-- [ ] Autoscaling: HPA for the API on CPU, KEDA (Prometheus scaler) for workers on `deliveries_pending` / fan-out lag
-- [ ] CI: `helm lint` + a kind cluster smoke (install chart, run the k6 e2e smoke against it)
+- [x] Helm chart: API / relay / worker Deployments, a pre-upgrade migration Job, liveness / readiness / heartbeat probes, PodDisruptionBudgets, `SIGTERM` grace above the drain timeout, secrets from Kubernetes Secrets
+- [x] Autoscaling: HPA for the API on CPU, KEDA (Prometheus scaler) for workers on delivery demand (new `hookrelay_deliveries_due` + `deliveries_delivering`; optional fan-out backlog trigger)
+- [x] CI: `helm lint` + a kind cluster smoke (install chart, run the k6 e2e smoke against it)
 - [ ] Re-run the M8 capacity matrix with the load generator, Postgres and hookrelay on separate nodes and publish the delta against `docs/capacity.md`
 
 ## Progress log
@@ -306,3 +306,50 @@ The capacity plan's next levers, plus the deployment story an operator would act
 - 992 tests (744 unit, 248 integration on Postgres 16 + Redis + PgBouncer), 97% line+branch coverage; ruff, ruff format, mypy strict, Alembic upgrade / downgrade roundtrip + `alembic check`
   pass; integration suite runs with no skips (PgBouncer tests included).
 - Next: Milestone 9b, native range partitioning of `delivery_attempts` (then `deliveries` / `events`).
+
+### 2026-11-13: Milestone 9b (production deploy: Helm, probes, autoscaling, kind CI)
+
+- Helm chart `deploy/helm/hookrelay` (chart 0.1.0, works with Helm 3.19 and 4.3): API / relay /
+  worker Deployments from the one image (`hookrelay`, `hookrelay-relay`, `hookrelay-worker`), a
+  retention CronJob (`concurrencyPolicy: Forbid`), API Service, ServiceAccount (token not mounted),
+  ConfigMap for non-secret settings, Secret via `envFrom` (`secrets.existingSecret`, or
+  chart-managed values for dev / CI only), `values.schema.json` (unknown keys rejected), NOTES and
+  `helm test` (`/ready` through the Service). Pods: UID 10001, read-only root FS, all capabilities
+  dropped, seccomp `RuntimeDefault`, memory-backed `/tmp`, soft topology spread, config / secret
+  checksums roll the pods.
+- Migrations: Alembic as a `pre-install,pre-upgrade` hook Job (weight 0) with a hook-scoped
+  ServiceAccount and (dev / CI) Secret at weight -10, since the chart's own do not exist yet at
+  pre-install; settings inlined, `DATABASE_DIRECT_URL` (never PgBouncer), `backoffLimit` 2.
+- Probes and shutdown: API `/health` startup + liveness, `/ready` readiness, `preStop` sleep 5 s,
+  new `API_GRACEFUL_SHUTDOWN_S` (20) for uvicorn, grace 40 s; relay / worker exec probes on their
+  heartbeat files through a new stdlib-only `python -m hookrelay.healthcheck --heartbeat relay|worker`
+  (~0.06 s vs ~0.7 s CPU per probe for `python -m hookrelay.worker --healthcheck`); worker grace 45 s
+  ≥ `WORKER_DRAIN_TIMEOUT_S` 25 + 10. The chart fails rendering when a budget is violated, when a
+  secret / credential-looking key or a chart-owned setting is put in `config`, or when
+  `DB_PGBOUNCER=true` has no direct URL for migrations. PDBs `maxUnavailable: 1` per role.
+- Autoscaling: `autoscaling/v2` HPA on CPU for the API; KEDA ScaledObject for workers on
+  `max(hookrelay_deliveries_due) + max(hookrelay_deliveries_delivering)` per 75% of
+  `WORKER_CONCURRENCY`, `ignoreNullValues: false` + fallback replicas, scale-down stabilisation,
+  optional `hookrelay_outbox_pending` trigger. New gauge `hookrelay_deliveries_due` (pending, due
+  now, endpoint breaker not cooling down) because `deliveries_pending` also counts far-future
+  retries and breaker-blocked backlogs. ServiceMonitor (API) + PodMonitor (relay / worker
+  side-car ports) with `honorLabels` so the app's `service` label survives.
+- CI: new `helm` job: `deploy/helm/ci/validate.sh` (`helm lint --strict`, `helm template` for four
+  value sets through `kubeconform -strict` with KEDA / Prometheus Operator CRD schemas, nine
+  guard-rail cases that must fail), the chart-invariant pytest (must not skip there), then kind:
+  image build + `kind load`, in-cluster Postgres 16 / Redis 7 / mock receiver
+  (`deploy/helm/ci/deps.yaml`), `helm install --wait`, schema at head, `helm test`, `/ready`, the
+  k6 e2e smoke through port-forwards (no lost / duplicated deliveries), `helm upgrade` (migration
+  hook re-runs), worker `SIGTERM` drain. The lint job now runs actionlint (with shellcheck) and the
+  existing run blocks were made shellcheck-clean.
+- Verified locally: helm lint / template / kubeconform (Kubernetes 1.34 schemas) and the guard
+  rails with Helm 4.3.1 and 3.19.0; actionlint 1.7.7 + shellcheck 0.10 clean. No docker / kind on
+  the build box, so the kind job has not run yet; instead the exact rendered commands, env and
+  probe commands of `values-kind.yaml` ran as local processes: migration Job twice (idempotent,
+  `0010 (head)`), all probes passing (exec probes ~60 ms), the k6 e2e smoke 302 / 302 deliveries
+  acknowledged, 0 lost, 0 duplicates, and a worker `SIGTERM` exit 0 with `worker.stopped`.
+- 1022 tests (773 unit, 249 integration on Postgres 16 + Redis + PgBouncer), 97% line+branch
+  coverage (missed lines 155 → 143); ruff, ruff format, mypy strict, Alembic roundtrip + `alembic
+  check` pass. No schema migration (head stays `0010`).
+- Next: native range partitioning of `delivery_attempts` (then `deliveries` / `events`) and the
+  multi-node capacity re-run.

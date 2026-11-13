@@ -17,8 +17,9 @@ See the **[roadmap](ROADMAP.md)** for the plan and progress log.
 > **Status:** Milestones 0 (foundation), 1 (tenancy), 2 (ingestion), 3 (delivery workers),
 > 4 (back-pressure and failure isolation), 5 (operability for tenants), 6 (Redis), 7 (observability)
 > and 8 (load, chaos and capacity) are complete; Milestone 9 is in progress: batched (group-committed)
-> completion writes and PgBouncer transaction pooling have landed (9a), time partitioning and a
-> Kubernetes deploy are next. Tenants authenticate with hashed, role-scoped API keys, manage endpoints, event types
+> completion writes and PgBouncer transaction pooling (9a) and a production Kubernetes deploy (9b:
+> Helm chart with a migration hook, probes, PDBs, HPA for the API and KEDA for workers, linted,
+> kubeconform-validated and smoke-tested on kind in CI) have landed; time partitioning is next. Tenants authenticate with hashed, role-scoped API keys, manage endpoints, event types
 > and wildcard subscriptions, and publish events through `POST /v1/events` with `Idempotency-Key`
 > support. Each event and its outbox row commit in one transaction; a relay process fans the
 > outbox out into exactly one `delivery` per (event, endpoint); and delivery workers lease due
@@ -79,7 +80,11 @@ See the **[roadmap](ROADMAP.md)** for the plan and progress log.
 | Scale | Restart-safe write paths: transient DB errors (incl. `57P03` while Postgres restarts) are `503` + `Retry-After` on the API and fenced, retried completions in workers; sharded HTTP connection pools; measured [capacity plan](docs/capacity.md) | ✅ M8 |
 | Scale | Group-committed completion writes in workers: up to `WORKER_COMPLETE_BATCH_MAX` finished attempts per transaction, each row still fenced by its own lease token; partial batches skip only the fenced-out rows, a poisonous row falls back to one transaction per attempt, drain writes queued results instead of releasing them | ✅ M9 |
 | Scale | PgBouncer (transaction pooling) in compose and CI: `DB_PGBOUNCER=true` disables asyncpg statement caches and uses unique prepared-statement names, server-side timeouts move to the pooler, migrations bypass it (`DATABASE_DIRECT_URL`), a unit test audits that no session-level Postgres feature is used | ✅ M9 |
-| Scale | Time partitioning of hot tables, Helm chart + autoscaling on queue depth | 🔜 M9 |
+| Deploy | Helm chart (`deploy/helm/hookrelay`): API / relay / worker Deployments from the same image, Alembic `pre-install,pre-upgrade` hook Job through `DATABASE_DIRECT_URL`, retention CronJob, ConfigMap + `existingSecret` (secrets refused in the ConfigMap), non-root read-only pods, `values.schema.json` | ✅ M9 |
+| Deploy | Probes: `/health` liveness, `/ready` readiness for the API; stdlib-only heartbeat exec probes for relay / worker (`python -m hookrelay.healthcheck --heartbeat worker`, ~0.06 s vs ~0.7 s CPU); `preStop` + `API_GRACEFUL_SHUTDOWN_S` and worker drain budgets enforced against `terminationGracePeriodSeconds`; PodDisruptionBudgets | ✅ M9 |
+| Deploy | Autoscaling: HPA (`autoscaling/v2`) on CPU for the API; KEDA Prometheus scaler for workers on delivery demand (`hookrelay_deliveries_due` + `hookrelay_deliveries_delivering`) with a fallback replica count when metrics are missing; ServiceMonitor / PodMonitor | ✅ M9 |
+| Deploy | CI `helm` job: `helm lint --strict`, `helm template` × 4 value sets through `kubeconform -strict` (+ KEDA / Prometheus Operator CRD schemas), guard-rail and chart-invariant tests, then a kind cluster: install, `helm test`, k6 e2e (no lost / duplicated deliveries), upgrade, worker `SIGTERM` drain | ✅ M9 |
+| Scale | Time partitioning of hot tables | 🔜 M9 |
 
 ## Architecture
 
@@ -486,6 +491,66 @@ flowchart LR
     REN -->|"renew: same id-ordered locks"| PGB
     PGB --> PG
 ```
+
+### Kubernetes deployment (Milestone 9b)
+
+```mermaid
+flowchart TB
+    subgraph Helm["helm install / upgrade"]
+        HOOK["pre-install / pre-upgrade hooks<br/>ServiceAccount + Secret (weight -10)<br/>Job: alembic upgrade head (weight 0)"]
+    end
+
+    subgraph NS["namespace (one release)"]
+        CM["ConfigMap<br/>non-secret settings"]
+        SEC["Secret (existingSecret)<br/>DATABASE_URL, DATABASE_DIRECT_URL,<br/>REDIS_URL, OPERATOR_TOKEN, keys"]
+        SVC["Service :80 → api :8000"]
+
+        subgraph APID["Deployment api (HPA: CPU 70%)"]
+            A1["api pod<br/>/health liveness · /ready readiness<br/>preStop 5 s + graceful 20 s < grace 40 s"]
+        end
+        subgraph RD["Deployment relay"]
+            R1["relay pod<br/>heartbeat exec probe<br/>:9100 metrics"]
+        end
+        subgraph WD["Deployment worker (KEDA ScaledObject)"]
+            W1["worker pods<br/>heartbeat exec probe · :9100 metrics<br/>drain 25 s + 10 ≤ grace 45 s"]
+        end
+        CJ["CronJob retention<br/>concurrencyPolicy: Forbid"]
+        PDB["PodDisruptionBudgets<br/>maxUnavailable: 1 per role"]
+        SM["ServiceMonitor (api) +<br/>PodMonitor (relay, worker)<br/>honorLabels"]
+        SO["ScaledObject<br/>max(deliveries_due) + max(delivering)<br/>÷ 75% of WORKER_CONCURRENCY<br/>fallback replicas on metric errors"]
+        HPA["HPA autoscaling/v2"]
+    end
+
+    PROM["Prometheus"]
+    KEDA["KEDA operator"]
+    PGB["PgBouncer<br/>(DB_PGBOUNCER=true)"]
+    PG[("Postgres 16")]
+    REDIS[("Redis 7")]
+    EP["Tenant endpoints"]
+
+    HOOK ==>|"DATABASE_DIRECT_URL<br/>(never the pooler)"| PG
+    HOOK -->|"must succeed before<br/>new pods roll out"| APID
+    CM -. envFrom .-> A1 & R1 & W1 & CJ
+    SEC -. envFrom .-> A1 & R1 & W1 & CJ
+    SVC --> A1
+    A1 & R1 & W1 & CJ ==> PGB ==> PG
+    A1 & R1 & W1 -.-> REDIS
+    W1 -->|"signed POST"| EP
+    SM --> PROM
+    PROM -->|"scrape /metrics"| A1 & R1 & W1
+    KEDA -->|"query"| PROM
+    KEDA --> SO --> WD
+    HPA --> APID
+    PDB -. limits voluntary evictions .-> APID & RD & WD
+```
+
+One image, three long-running roles and two one-shot ones. The migration Job is a Helm hook, so
+`helm upgrade` stops before any new pod starts if a migration fails, and old pods keep serving
+the (backward-compatible) schema meanwhile. Pods read settings from the ConfigMap and secrets
+from a Secret the operator manages (`secrets.existingSecret`); the chart refuses secret-looking
+keys in the ConfigMap. Every pod runs as UID 10001 with a read-only root filesystem, all
+capabilities dropped and a memory-backed `/tmp` (heartbeat files). Workers scale on queue demand
+through KEDA, the API on CPU through an HPA.
 
 ### Request flow (with auth)
 
@@ -1041,6 +1106,62 @@ flowchart LR
   The cost is a re-prepare per statement (no cache) and an extra hop; in exchange Postgres
   connection count stops scaling with replicas.
 
+### Milestone 9b decisions (Helm, probes, autoscaling)
+
+- **Migrations as a Helm hook Job, not an init container.** An init container runs once per pod:
+  ten replicas race to migrate on every rollout, every pod restart re-runs it, and a failure shows
+  up as crash-looping pods while old ones are already being replaced. A `pre-install,pre-upgrade`
+  Job runs once per release, and a failure stops `helm upgrade` before any Deployment changes.
+  The catch is that pre-install hooks run before the chart's own resources exist, so the Job
+  inlines its settings, uses a hook-scoped ServiceAccount and, in dev / CI, a hook-scoped copy of
+  only the secrets Alembic needs (production points it at `existingSecret`). It always connects
+  through `DATABASE_DIRECT_URL` (Alembic's session `SET lock_timeout` must not go through
+  transaction pooling), and each revision is its own transaction with a 5 s lock timeout, so the
+  Job's `backoffLimit` retry resumes cleanly. Because old pods run against the new schema during
+  the rollout, migrations must be expand / contract (additive first, destructive a release later).
+  GitOps tools that ignore Helm hooks (Argo CD maps them to PreSync) keep the same ordering.
+- **KEDA on queue demand for workers, HPA on CPU for the API.** A worker waiting on slow receivers
+  is nearly idle on CPU while the backlog grows, so CPU would scale workers the wrong way. The
+  ScaledObject asks Prometheus for `max(hookrelay_deliveries_due) + max(hookrelay_deliveries_delivering)`
+  and targets 75% of `WORKER_CONCURRENCY` per pod. `hookrelay_deliveries_due` is new in 9b:
+  `hookrelay_deliveries_pending` also counts retries scheduled hours ahead and backlogs behind an
+  open breaker, which no number of workers can deliver sooner, so scaling on it would pin a dead
+  endpoint's retry queue at `maxReplicaCount`. `max()` (not `sum()`) because every API / relay
+  replica reports the same database-wide count. `ignoreNullValues: false` plus `fallback.replicas`
+  means "Prometheus is down" holds a fixed, safe size instead of reading as zero demand. The API is
+  stateless and CPU-bound per request, so a plain `autoscaling/v2` HPA fits; when either
+  autoscaler is on, the Deployment omits `replicas` so `helm upgrade` does not fight it.
+- **Grace periods are derived from the code's shutdown paths and enforced.** API: `preStop` sleeps
+  5 s (endpoint removal is asynchronous, so the pod keeps serving until kube-proxy / ingress stop
+  routing), then uvicorn gets `API_GRACEFUL_SHUTDOWN_S` (20 s, now a setting) for in-flight
+  requests; `terminationGracePeriodSeconds` must exceed the sum (40 s by default). Worker:
+  `SIGTERM` stops leasing, in-flight attempts get `WORKER_DRAIN_TIMEOUT_S` (25 s), queued
+  completions are flushed and the rest of the leases released; the grace must be at least
+  drain + 10 s (45 s). The chart fails rendering if either budget is violated. A SIGKILLed worker
+  still loses nothing (its leases expire and are reclaimed), but its deliveries are retried late
+  and can be sent twice, which is what the budget avoids.
+- **PDBs with `maxUnavailable: 1`, not `minAvailable`.** It works for any replica count (a
+  `minAvailable: 1` PDB on a single replica blocks node drains forever) while keeping voluntary
+  evictions one pod at a time per role; `unhealthyPodEvictionPolicy: AlwaysAllow` lets a
+  crash-looping pod be evicted even when the budget is spent. Topology spread across nodes and
+  zones is soft (`ScheduleAnyway`) so a small cluster still schedules.
+- **Cheap, dependency-free probes.** Liveness never checks dependencies (`/health` for the API, the
+  heartbeat file for relay / worker, which they touch even on iterations whose database work
+  failed), so a Postgres outage takes API pods out of the Service via `/ready` but restarts
+  nothing. The original `python -m hookrelay.worker --healthcheck` imported the whole worker
+  (~0.7 s CPU per probe, measured); exec probes run every 10-15 s in every pod, so
+  `python -m hookrelay.healthcheck --heartbeat worker` now reads the two env vars with the stdlib
+  only (~0.06 s), with a unit test pinning its defaults to `Settings`.
+- **Secrets never in the ConfigMap or the image.** Pods get secrets with `envFrom: secretRef`, so
+  the Secret's keys are the env var names and any secret manager that writes a Secret works.
+  `secrets.values` (chart-managed Secret) exists only for dev / CI and NOTES warns about it.
+  Rendering fails if a known secret, a credential-looking key or a chart-owned setting (ports,
+  drain / shutdown budgets) is put in `config`, and `values.schema.json` rejects unknown keys.
+- **Chart facts pinned to the code.** A pytest renders the chart and checks that every env var
+  name is a real `Settings` field (Settings ignores unknown variables, so a typo would silently do
+  nothing), that commands are real console scripts, that KEDA queries only use gauges the code
+  exports, and the hook, probe, hardening and budget invariants.
+
 ## Getting started
 
 ### Prerequisites
@@ -1141,6 +1262,45 @@ Scaling `api` / `worker` replicas therefore adds client connections to PgBouncer
 connections to Postgres. To bypass the pooler, run with
 `HOOKRELAY_DATABASE_URL=postgresql+asyncpg://hookrelay:hookrelay@postgres:5432/hookrelay DB_PGBOUNCER=false`.
 
+### Kubernetes (Helm)
+
+The chart lives in [`deploy/helm/hookrelay`](deploy/helm/hookrelay) (Helm 3.x or 4.x, Kubernetes
+1.27+). Build and push the image yourself (no public image is published), create the Secret, then
+install:
+
+```bash
+docker build -t registry.example.com/hookrelay:0.1.0 . && docker push registry.example.com/hookrelay:0.1.0
+
+kubectl create namespace hookrelay
+kubectl -n hookrelay create secret generic hookrelay \
+  --from-literal=DATABASE_URL='postgresql+asyncpg://hookrelay:<password>@pgbouncer:6432/hookrelay' \
+  --from-literal=DATABASE_DIRECT_URL='postgresql+asyncpg://hookrelay:<password>@postgres:5432/hookrelay' \
+  --from-literal=REDIS_URL='redis://redis:6379/0' \
+  --from-literal=OPERATOR_TOKEN="$(python -c 'import secrets; print(secrets.token_urlsafe(32))')" \
+  --from-literal=SECRETS_ENCRYPTION_KEY="$(python -c 'import base64, secrets; print(base64.urlsafe_b64encode(secrets.token_bytes(32)).decode())')"
+
+helm upgrade --install hookrelay deploy/helm/hookrelay -n hookrelay \
+  --set image.repository=registry.example.com/hookrelay --set image.tag=0.1.0 \
+  --set secrets.existingSecret=hookrelay --set-string config.DB_PGBOUNCER=true \
+  --set api.autoscaling.enabled=true \
+  --set worker.autoscaling.enabled=true --set metrics.serviceMonitor.enabled=true \
+  --wait
+helm test hookrelay -n hookrelay
+```
+
+- The Secret must exist before `helm install`: the migration hook runs before any chart resource.
+- `config` holds non-secret settings (strings, see `.env.example`); role settings live under `api`,
+  `relay`, `worker` (`api.gracefulShutdownSeconds`, `worker.drainTimeoutSeconds`,
+  `worker.concurrency`, `*.terminationGracePeriodSeconds`, `*.metricsPort`, probes, resources,
+  PDBs). `values.schema.json` documents and validates every key.
+- `worker.autoscaling.enabled` needs [KEDA](https://keda.sh) and a Prometheus that scrapes the
+  release (`metrics.serviceMonitor.enabled` for the Prometheus Operator); override the query with
+  `worker.autoscaling.prometheus.query` if your labels differ (the default assumes one release per
+  namespace). `api.autoscaling.enabled` needs metrics-server.
+- `deploy/helm/ci/validate.sh` runs the same lint / template / kubeconform / guard-rail checks as
+  CI; `deploy/helm/ci/kind-smoke.sh` repeats the kind smoke on any kind cluster
+  (`docker build -t hookrelay:kind . && kind load docker-image hookrelay:kind`).
+
 ## Configuration
 
 All settings are environment variables (or `.env`), validated at startup. See
@@ -1155,6 +1315,7 @@ All settings are environment variables (or `.env`), validated at startup. See
 | `DB_PGBOUNCER` | `false` | `true` when `DATABASE_URL` points at PgBouncer in transaction mode: no statement caches, unique prepared-statement names, no untracked startup parameters |
 | `DATABASE_DIRECT_URL` | unset | Postgres itself, bypassing the pooler, for Alembic; required when `DB_PGBOUNCER=true` |
 | `READINESS_TIMEOUT_S` | `2` | `/ready` gives up and returns 503 after this |
+| `API_GRACEFUL_SHUTDOWN_S` | `20` | uvicorn's graceful shutdown after `SIGTERM` (Kubernetes: keep `terminationGracePeriodSeconds` above `preStop` + this; the Helm chart enforces it) |
 | `LOG_FORMAT` / `LOG_LEVEL` | `json` / `INFO` | `console` for local readability |
 | `REQUEST_ID_HEADER` | `X-Request-ID` | correlation header accepted and returned |
 | `REDIS_URL` | unset | `redis://` or `rediss://`; unset → every Redis feature off (Postgres paths unchanged) |
@@ -1224,6 +1385,12 @@ All settings are environment variables (or `.env`), validated at startup. See
 | `METRICS_ENABLED` | `true` | Serve `GET /metrics` (Prometheus text exposition). |
 | `METRICS_TOKEN` | unset | Optional bearer token for `/metrics`. Unset = scrapeable without auth (private scrape network). Never exposes tenant payloads. |
 | `METRICS_PORT` | unset | Side-car scrape HTTP port for relay/worker (`0`/unset = off). API always uses `/metrics` on its main port. |
+
+Queue gauges are refreshed from Postgres by the relay (every housekeeping interval) and by the API
+on every `/metrics` scrape: `hookrelay_outbox_pending`, `hookrelay_outbox_lag_seconds`,
+`hookrelay_deliveries_pending`, `hookrelay_deliveries_delivering` and (M9b) `hookrelay_deliveries_due`,
+the pending deliveries a worker could lease now (due, endpoint breaker not cooling down), which
+is the worker autoscaling signal.
 | `OTEL_EXPORTER_OTLP_ENDPOINT` / `TRACING_OTLP_ENDPOINT` | unset | OTLP HTTP base or `/v1/traces` URL. Tracing is **off** when unset. |
 | `TRACING_ENABLED` | auto | Force on/off; default on when an OTLP endpoint is set. |
 | `TRACING_SAMPLE_RATIO` | `1` | Parent-based trace-id ratio sampler. |
@@ -1469,7 +1636,7 @@ not followed and count as failures, so point the endpoint at the final URL.
 src/hookrelay/
   main.py               app factory + lifespan
   __main__.py           `hookrelay` / `python -m hookrelay` (uvicorn)
-  healthcheck.py        container HEALTHCHECK probe (stdlib only)
+  healthcheck.py        container / Kubernetes probes, stdlib only: API liveness, `--heartbeat relay|worker`
   relay.py              fan-out relay process (`python -m hookrelay.relay` / `hookrelay-relay`)
   worker.py             delivery worker process (`python -m hookrelay.worker` / `hookrelay-worker`)
   retention.py          one bounded retention run (`python -m hookrelay.retention` / `hookrelay-retention`)
@@ -1500,7 +1667,9 @@ src/hookrelay/
                         rollup), retention (payload purge + ended secret overlaps, batched runner);
                         deliveries also holds search
   deploy/               Prometheus scrape config, Grafana provisioning + starter dashboard,
-                        pgbouncer/ (compose pgbouncer.ini + userlist, run-test-pooler.sh for tests / CI)
+                        pgbouncer/ (compose pgbouncer.ini + userlist, run-test-pooler.sh for tests / CI),
+                        helm/hookrelay/ (the Helm chart) and helm/ci/ (validate.sh: lint + kubeconform +
+                        guard rails; kind-smoke.sh + deps.yaml + values-kind.yaml; values-full.yaml)
 alembic/                async env + versioned migrations (0001 tenants ... 0010 observability trace context)
 loadtest/               k6 scripts (ingest.js, e2e.js, lib.js) + run-local.sh (starts the stack, runs k6,
                         optional CHAOS_CMD fault injection, collects summaries and logs)
@@ -1564,6 +1733,14 @@ What the chaos suite proves on every CI run:
 
 ## Scaling notes
 
+- On Kubernetes (M9b), API replicas follow CPU through the HPA and workers follow delivery demand
+  through KEDA: `ceil((due + delivering) / (0.75 × WORKER_CONCURRENCY))`, clamped to
+  `[minReplicaCount, maxReplicaCount]`, scale-down limited to 2 pods a minute after a 5-minute
+  stabilisation window (each removed worker drains for up to 25 s). Every new replica adds
+  `DB_POOL_SIZE + DB_MAX_OVERFLOW` client connections, so with autoscaling on, run PgBouncer and
+  size `maxReplicaCount` against its `max_client_conn`, not against Postgres. The measured
+  per-worker throughput in [docs/capacity.md](docs/capacity.md) is the number to pick
+  `deliveriesPerReplica` from.
 - The API is stateless. Scale it horizontally behind a load balancer. Without a pooler Postgres sees
   `processes × (DB_POOL_SIZE + DB_MAX_OVERFLOW)` connections; with PgBouncer in transaction mode
   (compose default, `DB_PGBOUNCER=true`) that is only the client side, and Postgres sees at most
