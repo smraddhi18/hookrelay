@@ -54,6 +54,7 @@ from hookrelay.core.signing import HEADER_SIGNATURE, sign
 from hookrelay.db.engine import Database
 from hookrelay.db.integrity import is_transient_db_error
 from hookrelay.db.models import DeliveryStatus
+from hookrelay.healthcheck import heartbeat_is_fresh
 from hookrelay.observability.metrics import SERVICE_WORKER, Metrics
 from hookrelay.observability.runtime import (
     build_observability,
@@ -67,7 +68,6 @@ from hookrelay.observability.tracing import (
 )
 from hookrelay.redis_ import RedisBundle, RedisRateLimiter, WakeupSubscriber
 from hookrelay.redis_.runtime import build_redis_bundle, build_wakeup_subscriber
-from hookrelay.relay import heartbeat_is_fresh
 from hookrelay.services import delivery_queue
 from hookrelay.services.circuit_breaker import BreakerPolicy
 from hookrelay.services.clock import db_now

@@ -39,6 +39,7 @@ from hookrelay.core.config import Settings, get_settings
 from hookrelay.core.logging import configure_logging, redact_text
 from hookrelay.db.engine import Database
 from hookrelay.db.integrity import is_connection_lost
+from hookrelay.healthcheck import heartbeat_is_fresh
 from hookrelay.observability.gauges import refresh_gauges
 from hookrelay.observability.metrics import SERVICE_RELAY, Metrics
 from hookrelay.observability.runtime import (
@@ -371,14 +372,6 @@ class Relay:
             for sig in installed:
                 loop.remove_signal_handler(sig)
             logger.info("relay.stopped", **asdict(self.stats))
-
-
-def heartbeat_is_fresh(path: str, max_age_s: float, *, now: float | None = None) -> bool:
-    try:
-        modified = Path(path).stat().st_mtime
-    except OSError:
-        return False
-    return ((time.time() if now is None else now) - modified) <= max_age_s
 
 
 async def serve(settings: Settings, *, once: bool = False) -> RelayStats:

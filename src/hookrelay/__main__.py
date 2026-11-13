@@ -17,7 +17,7 @@ def main() -> None:
         log_config=None,  # logging is configured by the app factory (structlog)
         access_log=False,  # replaced by the structured access log in RequestContextMiddleware
         proxy_headers=True,
-        timeout_graceful_shutdown=20,
+        timeout_graceful_shutdown=settings.api_graceful_shutdown_s,
     )
 
 
