@@ -1,0 +1,131 @@
+# Throwaway in-cluster dependencies for the kind smoke test only (no persistence, fake
+# local-only credentials). Production uses a managed Postgres / Redis.
+apiVersion: v1
+kind: Service
+metadata:
+  name: postgres
+  labels: {app: postgres}
+spec:
+  selector: {app: postgres}
+  ports:
+    - name: postgres
+      port: 5432
+      targetPort: postgres
+---
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: postgres
+  labels: {app: postgres}
+spec:
+  serviceName: postgres
+  replicas: 1
+  selector:
+    matchLabels: {app: postgres}
+  template:
+    metadata:
+      labels: {app: postgres}
+    spec:
+      containers:
+        - name: postgres
+          image: postgres:16
+          env:
+            - {name: POSTGRES_USER, value: hookrelay}
+            - {name: POSTGRES_PASSWORD, value: hookrelay}
+            - {name: POSTGRES_DB, value: hookrelay}
+            - {name: PGDATA, value: /var/lib/postgresql/data/pgdata}
+          ports:
+            - {name: postgres, containerPort: 5432}
+          readinessProbe:
+            exec:
+              command: ["pg_isready", "-U", "hookrelay", "-d", "hookrelay", "-h", "127.0.0.1"]
+            periodSeconds: 2
+            failureThreshold: 30
+          resources:
+            requests: {cpu: 100m, memory: 256Mi}
+          volumeMounts:
+            - {name: data, mountPath: /var/lib/postgresql/data}
+      volumes:
+        - name: data
+          emptyDir: {}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: redis
+  labels: {app: redis}
+spec:
+  selector: {app: redis}
+  ports:
+    - name: redis
+      port: 6379
+      targetPort: redis
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: redis
+  labels: {app: redis}
+spec:
+  replicas: 1
+  selector:
+    matchLabels: {app: redis}
+  template:
+    metadata:
+      labels: {app: redis}
+    spec:
+      containers:
+        - name: redis
+          image: redis:7-alpine
+          args: ["--save", "", "--appendonly", "no"]
+          ports:
+            - {name: redis, containerPort: 6379}
+          readinessProbe:
+            exec:
+              command: ["redis-cli", "ping"]
+            periodSeconds: 2
+          resources:
+            requests: {cpu: 50m, memory: 64Mi}
+---
+# The repo's mock webhook receiver (hookrelay-mock-receiver) from the same image; per-endpoint
+# latency / failure behaviour comes from each endpoint URL's query string.
+apiVersion: v1
+kind: Service
+metadata:
+  name: mock-receiver
+  labels: {app: mock-receiver}
+spec:
+  selector: {app: mock-receiver}
+  ports:
+    - name: http
+      port: 9000
+      targetPort: http
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: mock-receiver
+  labels: {app: mock-receiver}
+spec:
+  replicas: 1
+  selector:
+    matchLabels: {app: mock-receiver}
+  template:
+    metadata:
+      labels: {app: mock-receiver}
+    spec:
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 10001
+      containers:
+        - name: mock-receiver
+          image: hookrelay:kind
+          imagePullPolicy: Never
+          command: ["hookrelay-mock-receiver", "--host", "0.0.0.0", "--port", "9000", "--seed", "1"]
+          ports:
+            - {name: http, containerPort: 9000}
+          readinessProbe:
+            httpGet: {path: /health, port: http}
+            periodSeconds: 2
+          resources:
+            requests: {cpu: 50m, memory: 64Mi}

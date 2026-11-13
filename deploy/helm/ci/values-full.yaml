@@ -1,0 +1,60 @@
+# Every optional feature on, as production would run it (rendered + kubeconform-validated in
+# CI; not installed). Secrets come from a pre-existing Secret; PgBouncer for the app, direct
+# Postgres for migrations.
+image:
+  repository: registry.example.com/hookrelay
+  digest: sha256:0000000000000000000000000000000000000000000000000000000000000000
+secrets:
+  existingSecret: hookrelay-prod
+config:
+  APP_ENV: production
+  LOG_FORMAT: json
+  LOG_LEVEL: INFO
+  DOCS_ENABLED: "false"
+  DB_PGBOUNCER: "true"
+  DB_POOL_SIZE: "5"
+  DB_MAX_OVERFLOW: "0"
+  REDIS_REQUIRED_FOR_READY: "false"
+  TRACING_ENABLED: "true"
+  OTEL_EXPORTER_OTLP_ENDPOINT: http://otel-collector.observability.svc:4318
+serviceAccount:
+  annotations:
+    eks.amazonaws.com/role-arn: arn:aws:iam::000000000000:role/hookrelay-example
+api:
+  autoscaling:
+    enabled: true
+    minReplicas: 3
+    maxReplicas: 12
+  service:
+    annotations:
+      example.com/team: payments
+worker:
+  concurrency: 32
+  drainTimeoutSeconds: 30
+  terminationGracePeriodSeconds: 50
+  autoscaling:
+    enabled: true
+    minReplicaCount: 2
+    maxReplicaCount: 30
+    prometheus:
+      serverAddress: http://prometheus-operated.monitoring.svc:9090
+      authenticationRef: prometheus-auth
+    fanoutTrigger:
+      enabled: true
+relay:
+  replicas: 2
+nodeSelector:
+  kubernetes.io/os: linux
+tolerations:
+  - key: dedicated
+    operator: Equal
+    value: hookrelay
+    effect: NoSchedule
+retention:
+  timeZone: Asia/Kolkata
+metrics:
+  serviceMonitor:
+    enabled: true
+    labels:
+      release: kube-prometheus-stack
+    bearerTokenSecretKey: METRICS_TOKEN

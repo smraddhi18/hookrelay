@@ -1,0 +1,47 @@
+# kind smoke test (CI): the image is built in the job and `kind load`ed; Postgres, Redis and the
+# mock receiver come from deploy/helm/ci/deps.yaml; secrets from a Secret the job creates
+# (existingSecret path, like production). Development mode only because the mock receiver is
+# an in-cluster http:// target, which production's SSRF guard refuses.
+image:
+  repository: hookrelay
+  tag: kind
+  pullPolicy: Never
+secrets:
+  existingSecret: hookrelay-ci
+config:
+  APP_ENV: development
+  LOG_FORMAT: json
+  LOG_LEVEL: INFO
+  DOCS_ENABLED: "false"
+  ENDPOINT_ALLOW_HTTP: "true"
+  ENDPOINT_ALLOW_PRIVATE_NETWORKS: "true"
+  DELIVERY_ALLOW_PRIVATE_NETWORKS: "true"
+  DELIVERY_ALLOWED_PORTS: "9000"
+  ENDPOINT_MAX_IN_FLIGHT: "500"
+  DELIVERY_BACKOFF_BASE_S: "0.5"
+  DELIVERY_BACKOFF_MAX_S: "5"
+  BREAKER_FAILURE_THRESHOLD: "50"
+  TRACING_ENABLED: "false"
+# Small runner: shrink requests so everything schedules on one kind node.
+api:
+  replicas: 2
+  resources:
+    requests: {cpu: 50m, memory: 128Mi}
+    limits: {memory: 512Mi}
+relay:
+  replicas: 1
+  resources:
+    requests: {cpu: 50m, memory: 128Mi}
+    limits: {memory: 384Mi}
+worker:
+  replicas: 2
+  concurrency: 32
+  resources:
+    requests: {cpu: 50m, memory: 128Mi}
+    limits: {memory: 512Mi}
+migrations:
+  resources:
+    requests: {cpu: 50m, memory: 128Mi}
+    limits: {memory: 384Mi}
+retention:
+  enabled: true
