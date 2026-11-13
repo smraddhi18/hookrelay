@@ -1,0 +1,23 @@
+{{- /*
+maxUnavailable (not minAvailable): it works for any replica count, including 1, without ever
+blocking a node drain forever; with 1 replica a voluntary eviction still causes a short gap.
+*/}}
+{{- range $component := list "api" "relay" "worker" }}
+{{- $role := index $.Values $component }}
+{{- if and $role.enabled $role.pdb.enabled }}
+---
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: {{ include "hookrelay.fullname" $ }}-{{ $component }}
+  labels:
+    {{- include "hookrelay.componentLabels" (dict "ctx" $ "component" $component) | nindent 4 }}
+spec:
+  maxUnavailable: {{ $role.pdb.maxUnavailable }}
+  # Pods that are not Ready (e.g. crash-looping) may be evicted even when the budget is spent.
+  unhealthyPodEvictionPolicy: AlwaysAllow
+  selector:
+    matchLabels:
+      {{- include "hookrelay.componentSelectorLabels" (dict "ctx" $ "component" $component) | nindent 6 }}
+{{- end }}
+{{- end }}

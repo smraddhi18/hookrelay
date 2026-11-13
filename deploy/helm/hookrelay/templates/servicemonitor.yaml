@@ -1,0 +1,63 @@
+{{- if .Values.metrics.serviceMonitor.enabled }}
+{{- $sm := .Values.metrics.serviceMonitor }}
+{{- if .Values.api.enabled }}
+---
+# The API's /metrics also refreshes the queue gauges from Postgres on every scrape.
+apiVersion: monitoring.coreos.com/v1
+kind: ServiceMonitor
+metadata:
+  name: {{ include "hookrelay.fullname" . }}-api
+  labels:
+    {{- include "hookrelay.componentLabels" (dict "ctx" . "component" "api") | nindent 4 }}
+    {{- with $sm.labels }}
+    {{- toYaml . | nindent 4 }}
+    {{- end }}
+spec:
+  selector:
+    matchLabels:
+      {{- include "hookrelay.componentSelectorLabels" (dict "ctx" . "component" "api") | nindent 6 }}
+  endpoints:
+    - port: http
+      path: /metrics
+      interval: {{ $sm.interval }}
+      scrapeTimeout: {{ $sm.scrapeTimeout }}
+      # Keep hookrelay's own `service` label (api|relay|worker).
+      honorLabels: true
+      {{- with $sm.bearerTokenSecretKey }}
+      authorization:
+        type: Bearer
+        credentials:
+          name: {{ include "hookrelay.secretName" $ }}
+          key: {{ . }}
+      {{- end }}
+{{- end }}
+{{- $roles := list }}
+{{- if and .Values.relay.enabled (gt (int .Values.relay.metricsPort) 0) }}{{ $roles = append $roles "relay" }}{{ end }}
+{{- if and .Values.worker.enabled (gt (int .Values.worker.metricsPort) 0) }}{{ $roles = append $roles "worker" }}{{ end }}
+{{- if $roles }}
+---
+apiVersion: monitoring.coreos.com/v1
+kind: PodMonitor
+metadata:
+  name: {{ include "hookrelay.fullname" . }}-background
+  labels:
+    {{- include "hookrelay.labels" . | nindent 4 }}
+    {{- with $sm.labels }}
+    {{- toYaml . | nindent 4 }}
+    {{- end }}
+spec:
+  selector:
+    matchLabels:
+      {{- include "hookrelay.selectorLabels" . | nindent 6 }}
+    matchExpressions:
+      - key: app.kubernetes.io/component
+        operator: In
+        values: {{ toJson $roles }}
+  podMetricsEndpoints:
+    - port: metrics
+      path: /metrics
+      interval: {{ $sm.interval }}
+      scrapeTimeout: {{ $sm.scrapeTimeout }}
+      honorLabels: true
+{{- end }}
+{{- end }}

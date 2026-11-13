@@ -1,0 +1,59 @@
+{{- if and .Values.worker.enabled .Values.worker.autoscaling.enabled }}
+{{- $a := .Values.worker.autoscaling }}
+# KEDA scales workers on queue demand, not CPU: a worker waiting on slow receivers is idle on
+# CPU while the backlog grows. Demand = deliveries a worker could lease now (due, breaker not
+# cooling down) + deliveries in flight; desired replicas = ceil(demand / deliveriesPerReplica).
+apiVersion: keda.sh/v1alpha1
+kind: ScaledObject
+metadata:
+  name: {{ include "hookrelay.fullname" . }}-worker
+  labels:
+    {{- include "hookrelay.componentLabels" (dict "ctx" . "component" "worker") | nindent 4 }}
+spec:
+  scaleTargetRef:
+    apiVersion: apps/v1
+    kind: Deployment
+    name: {{ include "hookrelay.fullname" . }}-worker
+  minReplicaCount: {{ $a.minReplicaCount }}
+  maxReplicaCount: {{ $a.maxReplicaCount }}
+  pollingInterval: {{ $a.pollingInterval }}
+  cooldownPeriod: {{ $a.cooldownPeriod }}
+  # Prometheus unreachable or the series missing: hold a fixed, safe replica count.
+  fallback:
+    failureThreshold: {{ $a.fallback.failureThreshold }}
+    replicas: {{ $a.fallback.replicas }}
+  advanced:
+    horizontalPodAutoscalerConfig:
+      {{- with $a.behavior }}
+      behavior:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+  triggers:
+    - type: prometheus
+      name: delivery-demand
+      metricType: AverageValue
+      metadata:
+        serverAddress: {{ $a.prometheus.serverAddress | quote }}
+        query: {{ include "hookrelay.kedaQuery" . | quote }}
+        threshold: {{ include "hookrelay.kedaThreshold" . | quote }}
+        activationThreshold: {{ $a.activationThreshold | quote }}
+        ignoreNullValues: {{ $a.prometheus.ignoreNullValues | toString | quote }}
+      {{- with $a.prometheus.authenticationRef }}
+      authenticationRef:
+        name: {{ . }}
+      {{- end }}
+    {{- if $a.fanoutTrigger.enabled }}
+    - type: prometheus
+      name: fanout-backlog
+      metricType: AverageValue
+      metadata:
+        serverAddress: {{ $a.prometheus.serverAddress | quote }}
+        query: {{ printf "max(hookrelay_outbox_pending{namespace=%q})" .Release.Namespace | quote }}
+        threshold: {{ $a.fanoutTrigger.threshold | quote }}
+        ignoreNullValues: {{ $a.prometheus.ignoreNullValues | toString | quote }}
+      {{- with $a.prometheus.authenticationRef }}
+      authenticationRef:
+        name: {{ . }}
+      {{- end }}
+    {{- end }}
+{{- end }}

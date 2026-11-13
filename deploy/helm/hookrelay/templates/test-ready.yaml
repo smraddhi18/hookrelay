@@ -1,0 +1,38 @@
+{{- if and .Values.tests.enabled .Values.api.enabled }}
+apiVersion: v1
+kind: Pod
+metadata:
+  name: {{ include "hookrelay.fullname" . }}-test-ready
+  labels:
+    {{- include "hookrelay.componentLabels" (dict "ctx" . "component" "test") | nindent 4 }}
+  annotations:
+    "helm.sh/hook": test
+    "helm.sh/hook-delete-policy": before-hook-creation,hook-succeeded
+spec:
+  restartPolicy: Never
+  automountServiceAccountToken: false
+  {{- include "hookrelay.podSecurity" . | nindent 2 }}
+  containers:
+    - name: ready
+      image: {{ include "hookrelay.image" . }}
+      imagePullPolicy: {{ .Values.image.pullPolicy }}
+      # Through the Service, so selector, port mapping and readiness are all exercised.
+      command:
+        - python
+        - -c
+        - |
+          import json, urllib.request
+          url = "http://{{ include "hookrelay.fullname" . }}:{{ .Values.api.service.port }}/ready"
+          with urllib.request.urlopen(url, timeout=10) as resp:
+              body = json.load(resp)
+          assert resp.status == 200 and body["status"] == "ready", body
+          print("ready:", body)
+      resources:
+        requests:
+          cpu: 10m
+          memory: 64Mi
+        limits:
+          memory: 128Mi
+      securityContext:
+        {{- toYaml .Values.containerSecurityContext | nindent 8 }}
+{{- end }}
