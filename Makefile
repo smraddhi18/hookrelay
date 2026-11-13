@@ -1,5 +1,5 @@
 # Thin wrappers over the exact commands CI runs.
-.PHONY: install lint format typecheck test test-unit test-integration test-chaos migrate migrations-roundtrip run relay worker mock-receiver loadtest-smoke check up down
+.PHONY: install lint format typecheck test test-unit test-integration test-chaos migrate migrations-roundtrip run relay worker mock-receiver loadtest-smoke check up down helm-check kind-smoke
 
 install:
 	uv sync --locked
@@ -64,3 +64,12 @@ up:
 
 down:
 	docker compose down -v
+
+# Milestone 9b: Helm chart static checks (helm + kubeconform on PATH) and the kind smoke
+# (current kubectl context = a kind cluster with hookrelay:kind loaded; see README).
+helm-check:
+	bash deploy/helm/ci/validate.sh
+	uv run pytest tests/unit/test_helm_chart.py -q
+
+kind-smoke:
+	bash deploy/helm/ci/kind-smoke.sh
