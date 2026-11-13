@@ -93,6 +93,9 @@ class Settings(BaseSettings):
     # HTTP server
     host: str = "0.0.0.0"  # noqa: S104 - binding all interfaces is intended inside a container
     port: Annotated[int, Field(ge=1, le=65535)] = 8000
+    # Seconds uvicorn waits for in-flight requests after SIGTERM before closing them. Kubernetes:
+    # keep terminationGracePeriodSeconds above preStop sleep + this (the Helm chart enforces it).
+    api_graceful_shutdown_s: Annotated[int, Field(ge=1, le=600)] = 20
     docs_enabled: bool = True
 
     # Logging
