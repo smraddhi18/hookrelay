@@ -23,7 +23,8 @@ from sqlalchemy.exc import DBAPIError
 from hookrelay import relay as relay_module
 from hookrelay.core.config import Settings
 from hookrelay.db.engine import Database
-from hookrelay.relay import Relay, heartbeat_is_fresh, main, serve
+from hookrelay.healthcheck import heartbeat_is_fresh
+from hookrelay.relay import Relay, main, serve
 from hookrelay.services import fanout
 from hookrelay.services.subscriptions import pattern_matches
 from tests.integration.conftest import (
