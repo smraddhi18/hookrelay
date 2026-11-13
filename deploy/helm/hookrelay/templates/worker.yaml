@@ -1,0 +1,88 @@
+{{- if .Values.worker.enabled }}
+{{- include "hookrelay.validate" . }}
+{{- $w := .Values.worker }}
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ include "hookrelay.fullname" . }}-worker
+  labels:
+    {{- include "hookrelay.componentLabels" (dict "ctx" . "component" "worker") | nindent 4 }}
+spec:
+  {{- if not $w.autoscaling.enabled }}
+  replicas: {{ $w.replicas }}
+  {{- end }}
+  revisionHistoryLimit: 5
+  strategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxSurge: 25%
+      maxUnavailable: 0
+  selector:
+    matchLabels:
+      {{- include "hookrelay.componentSelectorLabels" (dict "ctx" . "component" "worker") | nindent 6 }}
+  template:
+    metadata:
+      labels:
+        {{- include "hookrelay.componentLabels" (dict "ctx" . "component" "worker") | nindent 8 }}
+        {{- with (merge (deepCopy (default dict $w.podLabels)) (default dict .Values.podLabels)) }}
+        {{- toYaml . | nindent 8 }}
+        {{- end }}
+      annotations:
+        {{- include "hookrelay.checksums" . | nindent 8 }}
+        {{- with (merge (deepCopy (default dict $w.podAnnotations)) (default dict .Values.podAnnotations)) }}
+        {{- toYaml . | nindent 8 }}
+        {{- end }}
+    spec:
+      serviceAccountName: {{ include "hookrelay.serviceAccountName" . }}
+      automountServiceAccountToken: false
+      {{- include "hookrelay.podSecurity" . | nindent 6 }}
+      # >= drain timeout + 10 s (enforced): SIGTERM stops leasing, in-flight attempts get
+      # drainTimeoutSeconds, queued completions are flushed, remaining leases are released.
+      terminationGracePeriodSeconds: {{ $w.terminationGracePeriodSeconds }}
+      {{- with (include "hookrelay.scheduling" (dict "ctx" . "role" $w "component" "worker") | trim) }}
+      {{- . | nindent 6 }}
+      {{- end }}
+      containers:
+        - name: worker
+          image: {{ include "hookrelay.image" . }}
+          imagePullPolicy: {{ .Values.image.pullPolicy }}
+          command: ["hookrelay-worker"]
+          {{- if gt (int $w.metricsPort) 0 }}
+          ports:
+            - name: metrics
+              containerPort: {{ $w.metricsPort }}
+              protocol: TCP
+          {{- end }}
+          envFrom:
+            {{- include "hookrelay.envFrom" . | nindent 12 }}
+          env:
+            - name: WORKER_CONCURRENCY
+              value: {{ $w.concurrency | quote }}
+            - name: WORKER_DRAIN_TIMEOUT_S
+              value: {{ $w.drainTimeoutSeconds | quote }}
+            - name: WORKER_HEARTBEAT_FILE
+              value: /tmp/hookrelay-worker.heartbeat
+            - name: WORKER_HEARTBEAT_MAX_AGE_S
+              value: {{ $w.heartbeatMaxAgeSeconds | quote }}
+            {{- if gt (int $w.metricsPort) 0 }}
+            - name: METRICS_PORT
+              value: {{ $w.metricsPort | quote }}
+            {{- end }}
+            {{- with $w.extraEnv }}
+            {{- toYaml . | nindent 12 }}
+            {{- end }}
+          startupProbe:
+            {{- include "hookrelay.heartbeatProbe" (dict "role" "worker" "probe" $w.startupProbe) | nindent 12 }}
+          livenessProbe:
+            {{- include "hookrelay.heartbeatProbe" (dict "role" "worker" "probe" $w.livenessProbe) | nindent 12 }}
+          readinessProbe:
+            {{- include "hookrelay.heartbeatProbe" (dict "role" "worker" "probe" $w.readinessProbe) | nindent 12 }}
+          resources:
+            {{- toYaml $w.resources | nindent 12 }}
+          securityContext:
+            {{- toYaml .Values.containerSecurityContext | nindent 12 }}
+          volumeMounts:
+            {{- include "hookrelay.tmpMount" . | nindent 12 }}
+      volumes:
+        {{- include "hookrelay.tmpVolume" . | nindent 8 }}
+{{- end }}

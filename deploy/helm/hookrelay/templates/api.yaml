@@ -1,0 +1,120 @@
+{{- if .Values.api.enabled }}
+{{- include "hookrelay.validate" . }}
+{{- $api := .Values.api }}
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ include "hookrelay.fullname" . }}-api
+  labels:
+    {{- include "hookrelay.componentLabels" (dict "ctx" . "component" "api") | nindent 4 }}
+spec:
+  {{- if not $api.autoscaling.enabled }}
+  replicas: {{ $api.replicas }}
+  {{- end }}
+  revisionHistoryLimit: 5
+  strategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxSurge: 25%
+      maxUnavailable: 0
+  selector:
+    matchLabels:
+      {{- include "hookrelay.componentSelectorLabels" (dict "ctx" . "component" "api") | nindent 6 }}
+  template:
+    metadata:
+      labels:
+        {{- include "hookrelay.componentLabels" (dict "ctx" . "component" "api") | nindent 8 }}
+        {{- with (merge (deepCopy (default dict $api.podLabels)) (default dict .Values.podLabels)) }}
+        {{- toYaml . | nindent 8 }}
+        {{- end }}
+      annotations:
+        {{- include "hookrelay.checksums" . | nindent 8 }}
+        {{- with (merge (deepCopy (default dict $api.podAnnotations)) (default dict .Values.podAnnotations)) }}
+        {{- toYaml . | nindent 8 }}
+        {{- end }}
+    spec:
+      serviceAccountName: {{ include "hookrelay.serviceAccountName" . }}
+      automountServiceAccountToken: false
+      {{- include "hookrelay.podSecurity" . | nindent 6 }}
+      # > preStop sleep + uvicorn graceful shutdown (enforced by the chart).
+      terminationGracePeriodSeconds: {{ $api.terminationGracePeriodSeconds }}
+      {{- with (include "hookrelay.scheduling" (dict "ctx" . "role" $api "component" "api") | trim) }}
+      {{- . | nindent 6 }}
+      {{- end }}
+      containers:
+        - name: api
+          image: {{ include "hookrelay.image" . }}
+          imagePullPolicy: {{ .Values.image.pullPolicy }}
+          command: ["hookrelay"]
+          ports:
+            - name: http
+              containerPort: {{ $api.port }}
+              protocol: TCP
+          envFrom:
+            {{- include "hookrelay.envFrom" . | nindent 12 }}
+          env:
+            - name: PORT
+              value: {{ $api.port | quote }}
+            - name: API_GRACEFUL_SHUTDOWN_S
+              value: {{ $api.gracefulShutdownSeconds | quote }}
+            {{- with $api.extraEnv }}
+            {{- toYaml . | nindent 12 }}
+            {{- end }}
+          # /health: the process answers (never checks dependencies, so a database outage
+          # does not restart every API pod). /ready: Postgres reachable (Redis soft) and not
+          # draining; failing it only takes the pod out of the Service.
+          startupProbe:
+            httpGet:
+              path: /health
+              port: http
+            periodSeconds: {{ $api.startupProbe.periodSeconds }}
+            timeoutSeconds: {{ $api.startupProbe.timeoutSeconds }}
+            failureThreshold: {{ $api.startupProbe.failureThreshold }}
+          livenessProbe:
+            httpGet:
+              path: /health
+              port: http
+            periodSeconds: {{ $api.livenessProbe.periodSeconds }}
+            timeoutSeconds: {{ $api.livenessProbe.timeoutSeconds }}
+            failureThreshold: {{ $api.livenessProbe.failureThreshold }}
+          readinessProbe:
+            httpGet:
+              path: /ready
+              port: http
+            periodSeconds: {{ $api.readinessProbe.periodSeconds }}
+            timeoutSeconds: {{ $api.readinessProbe.timeoutSeconds }}
+            failureThreshold: {{ $api.readinessProbe.failureThreshold }}
+          lifecycle:
+            preStop:
+              # Endpoint removal propagates asynchronously; keep serving until it has.
+              exec:
+                command: ["sleep", {{ $api.preStopSleepSeconds | quote }}]
+          resources:
+            {{- toYaml $api.resources | nindent 12 }}
+          securityContext:
+            {{- toYaml .Values.containerSecurityContext | nindent 12 }}
+          volumeMounts:
+            {{- include "hookrelay.tmpMount" . | nindent 12 }}
+      volumes:
+        {{- include "hookrelay.tmpVolume" . | nindent 8 }}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ include "hookrelay.fullname" . }}
+  labels:
+    {{- include "hookrelay.componentLabels" (dict "ctx" . "component" "api") | nindent 4 }}
+  {{- with $api.service.annotations }}
+  annotations:
+    {{- toYaml . | nindent 4 }}
+  {{- end }}
+spec:
+  type: {{ $api.service.type }}
+  selector:
+    {{- include "hookrelay.componentSelectorLabels" (dict "ctx" . "component" "api") | nindent 4 }}
+  ports:
+    - name: http
+      port: {{ $api.service.port }}
+      targetPort: http
+      protocol: TCP
+{{- end }}

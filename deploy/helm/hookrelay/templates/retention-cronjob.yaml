@@ -1,0 +1,58 @@
+{{- if .Values.retention.enabled }}
+{{- include "hookrelay.validate" . }}
+{{- $r := .Values.retention }}
+apiVersion: batch/v1
+kind: CronJob
+metadata:
+  name: {{ include "hookrelay.fullname" . }}-retention
+  labels:
+    {{- include "hookrelay.componentLabels" (dict "ctx" . "component" "retention") | nindent 4 }}
+spec:
+  schedule: {{ $r.schedule | quote }}
+  {{- with $r.timeZone }}
+  timeZone: {{ . | quote }}
+  {{- end }}
+  # Never two retention runs at once (they would contend for the same batches).
+  concurrencyPolicy: Forbid
+  startingDeadlineSeconds: 600
+  successfulJobsHistoryLimit: {{ $r.successfulJobsHistoryLimit }}
+  failedJobsHistoryLimit: {{ $r.failedJobsHistoryLimit }}
+  jobTemplate:
+    spec:
+      backoffLimit: {{ $r.backoffLimit }}
+      activeDeadlineSeconds: {{ $r.activeDeadlineSeconds }}
+      template:
+        metadata:
+          labels:
+            {{- include "hookrelay.componentLabels" (dict "ctx" . "component" "retention") | nindent 12 }}
+          annotations:
+            {{- include "hookrelay.checksums" . | nindent 12 }}
+        spec:
+          restartPolicy: Never
+          serviceAccountName: {{ include "hookrelay.serviceAccountName" . }}
+          automountServiceAccountToken: false
+          {{- include "hookrelay.podSecurity" . | nindent 10 }}
+          {{- with .Values.nodeSelector }}
+          nodeSelector:
+            {{- toYaml . | nindent 12 }}
+          {{- end }}
+          {{- with .Values.tolerations }}
+          tolerations:
+            {{- toYaml . | nindent 12 }}
+          {{- end }}
+          containers:
+            - name: retention
+              image: {{ include "hookrelay.image" . }}
+              imagePullPolicy: {{ .Values.image.pullPolicy }}
+              command: ["hookrelay-retention"]
+              envFrom:
+                {{- include "hookrelay.envFrom" . | nindent 16 }}
+              resources:
+                {{- toYaml $r.resources | nindent 16 }}
+              securityContext:
+                {{- toYaml .Values.containerSecurityContext | nindent 16 }}
+              volumeMounts:
+                {{- include "hookrelay.tmpMount" . | nindent 16 }}
+          volumes:
+            {{- include "hookrelay.tmpVolume" . | nindent 12 }}
+{{- end }}

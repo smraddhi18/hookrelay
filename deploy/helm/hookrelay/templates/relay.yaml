@@ -1,0 +1,82 @@
+{{- if .Values.relay.enabled }}
+{{- include "hookrelay.validate" . }}
+{{- $r := .Values.relay }}
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ include "hookrelay.fullname" . }}-relay
+  labels:
+    {{- include "hookrelay.componentLabels" (dict "ctx" . "component" "relay") | nindent 4 }}
+spec:
+  replicas: {{ $r.replicas }}
+  revisionHistoryLimit: 5
+  strategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxSurge: 1
+      maxUnavailable: 0
+  selector:
+    matchLabels:
+      {{- include "hookrelay.componentSelectorLabels" (dict "ctx" . "component" "relay") | nindent 6 }}
+  template:
+    metadata:
+      labels:
+        {{- include "hookrelay.componentLabels" (dict "ctx" . "component" "relay") | nindent 8 }}
+        {{- with (merge (deepCopy (default dict $r.podLabels)) (default dict .Values.podLabels)) }}
+        {{- toYaml . | nindent 8 }}
+        {{- end }}
+      annotations:
+        {{- include "hookrelay.checksums" . | nindent 8 }}
+        {{- with (merge (deepCopy (default dict $r.podAnnotations)) (default dict .Values.podAnnotations)) }}
+        {{- toYaml . | nindent 8 }}
+        {{- end }}
+    spec:
+      serviceAccountName: {{ include "hookrelay.serviceAccountName" . }}
+      automountServiceAccountToken: false
+      {{- include "hookrelay.podSecurity" . | nindent 6 }}
+      terminationGracePeriodSeconds: {{ $r.terminationGracePeriodSeconds }}
+      {{- with (include "hookrelay.scheduling" (dict "ctx" . "role" $r "component" "relay") | trim) }}
+      {{- . | nindent 6 }}
+      {{- end }}
+      containers:
+        - name: relay
+          image: {{ include "hookrelay.image" . }}
+          imagePullPolicy: {{ .Values.image.pullPolicy }}
+          command: ["hookrelay-relay"]
+          {{- if gt (int $r.metricsPort) 0 }}
+          ports:
+            - name: metrics
+              containerPort: {{ $r.metricsPort }}
+              protocol: TCP
+          {{- end }}
+          envFrom:
+            {{- include "hookrelay.envFrom" . | nindent 12 }}
+          env:
+            - name: RELAY_HEARTBEAT_FILE
+              value: /tmp/hookrelay-relay.heartbeat
+            - name: RELAY_HEARTBEAT_MAX_AGE_S
+              value: {{ $r.heartbeatMaxAgeSeconds | quote }}
+            {{- if gt (int $r.metricsPort) 0 }}
+            - name: METRICS_PORT
+              value: {{ $r.metricsPort | quote }}
+            {{- end }}
+            {{- with $r.extraEnv }}
+            {{- toYaml . | nindent 12 }}
+            {{- end }}
+          # The relay touches its heartbeat file on every loop iteration, including ones whose
+          # database work failed: a Postgres outage keeps it alive, a wedged loop restarts it.
+          startupProbe:
+            {{- include "hookrelay.heartbeatProbe" (dict "role" "relay" "probe" $r.startupProbe) | nindent 12 }}
+          livenessProbe:
+            {{- include "hookrelay.heartbeatProbe" (dict "role" "relay" "probe" $r.livenessProbe) | nindent 12 }}
+          readinessProbe:
+            {{- include "hookrelay.heartbeatProbe" (dict "role" "relay" "probe" $r.readinessProbe) | nindent 12 }}
+          resources:
+            {{- toYaml $r.resources | nindent 12 }}
+          securityContext:
+            {{- toYaml .Values.containerSecurityContext | nindent 12 }}
+          volumeMounts:
+            {{- include "hookrelay.tmpMount" . | nindent 12 }}
+      volumes:
+        {{- include "hookrelay.tmpVolume" . | nindent 8 }}
+{{- end }}

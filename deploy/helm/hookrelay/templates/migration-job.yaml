@@ -1,0 +1,110 @@
+{{- if .Values.migrations.enabled }}
+{{- include "hookrelay.validate" . }}
+{{- $m := .Values.migrations }}
+{{- $name := printf "%s-migrate" (include "hookrelay.fullname" .) }}
+{{- /*
+Runs before any other chart resource on install (and before the new pods on upgrade), so it
+cannot use the chart's ConfigMap, Secret or ServiceAccount: settings are inlined, the
+chart-managed Secret is copied into a hook-scoped one, and the ServiceAccount is its own.
+Helm deletes hook resources of a phase only after the whole phase succeeded.
+*/}}
+{{- if $m.serviceAccount.create }}
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: {{ $name }}
+  labels:
+    {{- include "hookrelay.componentLabels" (dict "ctx" . "component" "migrate") | nindent 4 }}
+  annotations:
+    "helm.sh/hook": pre-install,pre-upgrade
+    "helm.sh/hook-weight": "-10"
+    "helm.sh/hook-delete-policy": before-hook-creation,hook-succeeded
+    {{- with $m.serviceAccount.annotations }}
+    {{- toYaml . | nindent 4 }}
+    {{- end }}
+automountServiceAccountToken: false
+---
+{{- end }}
+{{- if not .Values.secrets.existingSecret }}
+apiVersion: v1
+kind: Secret
+metadata:
+  name: {{ $name }}
+  labels:
+    {{- include "hookrelay.componentLabels" (dict "ctx" . "component" "migrate") | nindent 4 }}
+  annotations:
+    "helm.sh/hook": pre-install,pre-upgrade
+    "helm.sh/hook-weight": "-10"
+    "helm.sh/hook-delete-policy": before-hook-creation,hook-succeeded
+type: Opaque
+stringData:
+  {{- /* Only what Alembic needs (Settings validation requires the key in production). */}}
+  {{- range $k := list "DATABASE_URL" "DATABASE_DIRECT_URL" "SECRETS_ENCRYPTION_KEY" "SECRETS_ENCRYPTION_KEY_PREVIOUS" }}
+  {{- with (get $.Values.secrets.values $k) }}
+  {{ $k }}: {{ . | quote }}
+  {{- end }}
+  {{- end }}
+---
+{{- end }}
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: {{ $name }}
+  labels:
+    {{- include "hookrelay.componentLabels" (dict "ctx" . "component" "migrate") | nindent 4 }}
+  annotations:
+    "helm.sh/hook": pre-install,pre-upgrade
+    "helm.sh/hook-weight": "0"
+    # A failed Job is kept for `kubectl logs` and replaced by the next attempt.
+    "helm.sh/hook-delete-policy": before-hook-creation,hook-succeeded
+spec:
+  # Each Alembic revision is its own transaction with lock_timeout 5s: a retry after a lock
+  # timeout resumes at the first revision that did not commit.
+  backoffLimit: {{ $m.backoffLimit }}
+  activeDeadlineSeconds: {{ $m.activeDeadlineSeconds }}
+  template:
+    metadata:
+      labels:
+        {{- include "hookrelay.componentLabels" (dict "ctx" . "component" "migrate") | nindent 8 }}
+      {{- with (merge (deepCopy (default dict $m.podAnnotations)) (default dict .Values.podAnnotations)) }}
+      annotations:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+    spec:
+      restartPolicy: Never
+      {{- if $m.serviceAccount.create }}
+      serviceAccountName: {{ $name }}
+      {{- else }}
+      serviceAccountName: {{ include "hookrelay.serviceAccountName" . }}
+      {{- end }}
+      automountServiceAccountToken: false
+      {{- include "hookrelay.podSecurity" . | nindent 6 }}
+      {{- with .Values.nodeSelector }}
+      nodeSelector:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.tolerations }}
+      tolerations:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      containers:
+        - name: migrate
+          image: {{ include "hookrelay.image" . }}
+          imagePullPolicy: {{ .Values.image.pullPolicy }}
+          # alembic/env.py connects with Settings.migration_dsn: DATABASE_DIRECT_URL when set,
+          # and refuses DB_PGBOUNCER=true without it (session-level SETs through a pooler).
+          command: ["alembic", "upgrade", "head"]
+          envFrom:
+            - secretRef:
+                name: {{ if .Values.secrets.existingSecret }}{{ .Values.secrets.existingSecret }}{{ else }}{{ $name }}{{ end }}
+          env:
+            {{- include "hookrelay.configEnv" . | trim | nindent 12 }}
+          resources:
+            {{- toYaml $m.resources | nindent 12 }}
+          securityContext:
+            {{- toYaml .Values.containerSecurityContext | nindent 12 }}
+          volumeMounts:
+            {{- include "hookrelay.tmpMount" . | nindent 12 }}
+      volumes:
+        {{- include "hookrelay.tmpVolume" . | nindent 8 }}
+{{- end }}
