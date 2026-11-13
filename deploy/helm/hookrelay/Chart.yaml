@@ -1,0 +1,21 @@
+apiVersion: v2
+name: hookrelay
+description: >-
+  Multi-tenant webhook delivery platform: API, fan-out relay and delivery workers on Postgres
+  (Redis optional), with a pre-install/pre-upgrade Alembic migration Job.
+type: application
+# Chart version (bump on any chart change) and the hookrelay version it deploys by default.
+version: 0.1.0
+appVersion: "0.1.0"
+kubeVersion: ">=1.27.0-0"
+home: https://github.com/smraddhi18/hookrelay
+sources:
+  - https://github.com/smraddhi18/hookrelay
+keywords:
+  - webhooks
+  - fastapi
+  - postgres
+  - keda
+maintainers:
+  - name: Smraddhi Rathore
+    url: https://github.com/smraddhi18

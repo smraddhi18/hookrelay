@@ -1,0 +1,324 @@
+# hookrelay Helm chart values. Every key is validated by values.schema.json.
+#
+# Three long-running Deployments share one image and one configuration:
+#   api     FastAPI ingest + tenant/operator API      (HPA on CPU, optional)
+#   relay   transactional-outbox fan-out              (horizontal-safe: FOR UPDATE SKIP LOCKED)
+#   worker  leased, fenced webhook delivery           (KEDA on due deliveries, optional)
+# plus a pre-install/pre-upgrade Alembic Job and an optional retention CronJob.
+
+nameOverride: ""
+fullnameOverride: ""
+
+image:
+  # Build with the repo's Dockerfile and push to your registry (no public image is published).
+  repository: ghcr.io/smraddhi18/hookrelay
+  # Defaults to the chart's appVersion. Prefer an immutable digest in production.
+  tag: ""
+  digest: ""
+  pullPolicy: IfNotPresent
+
+imagePullSecrets: []
+
+# Non-secret settings, rendered into a ConfigMap (env var name -> value; see .env.example and
+# src/hookrelay/core/config.py). Values must be strings. Secrets are refused here (the chart
+# fails rendering), and role-owned settings (ports, drain/shutdown timeouts, concurrency) are
+# set under api / relay / worker so the grace-period checks below can see them.
+config:
+  APP_ENV: production
+  LOG_FORMAT: json
+  LOG_LEVEL: INFO
+  DOCS_ENABLED: "false"
+  # true when DATABASE_URL points at PgBouncer (transaction pooling); migrations then need
+  # DATABASE_DIRECT_URL in the Secret (the app refuses to migrate through the pooler).
+  DB_PGBOUNCER: "false"
+  DB_POOL_SIZE: "10"
+  DB_MAX_OVERFLOW: "5"
+  READINESS_TIMEOUT_S: "2"
+  TRACING_ENABLED: "false"
+
+# Secrets reach the pods as environment variables through `envFrom: secretRef`, so the Secret's
+# keys are the env var names: DATABASE_URL (required), DATABASE_DIRECT_URL, REDIS_URL (may carry
+# a password), OPERATOR_TOKEN, SECRETS_ENCRYPTION_KEY (required when APP_ENV=production),
+# SECRETS_ENCRYPTION_KEY_PREVIOUS, METRICS_TOKEN.
+secrets:
+  # Production: name of a Secret you manage (External Secrets, Sealed Secrets, Vault, kubectl).
+  # It must exist before `helm install`, because the migration Job runs before any chart
+  # resource is created.
+  existingSecret: ""
+  # Development / CI only: the chart creates the Secret from these values (they end up in the
+  # Helm release object, so never put production credentials here). Empty values are skipped.
+  values: {}
+
+serviceAccount:
+  create: true
+  name: ""
+  annotations: {}
+  # hookrelay never talks to the Kubernetes API.
+  automountServiceAccountToken: false
+
+podSecurityContext:
+  runAsNonRoot: true
+  runAsUser: 10001
+  runAsGroup: 10001
+  fsGroup: 10001
+  seccompProfile:
+    type: RuntimeDefault
+
+containerSecurityContext:
+  allowPrivilegeEscalation: false
+  readOnlyRootFilesystem: true
+  capabilities:
+    drop: ["ALL"]
+
+# Writable scratch for /tmp (heartbeat files, Python temp files) with a read-only root FS.
+tmpVolume:
+  sizeLimit: 64Mi
+
+# Applied to every pod; per-role values below are merged on top.
+podAnnotations: {}
+podLabels: {}
+nodeSelector: {}
+tolerations: []
+affinity: {}
+# Spread each role's replicas across nodes and zones (soft: ScheduleAnyway).
+topologySpread:
+  enabled: true
+
+api:
+  enabled: true
+  # Ignored when api.autoscaling.enabled (the HPA owns the replica count).
+  replicas: 2
+  port: 8000
+  # uvicorn's graceful shutdown (API_GRACEFUL_SHUTDOWN_S): in-flight requests get this long
+  # after SIGTERM.
+  gracefulShutdownSeconds: 20
+  # Sleep before SIGTERM so kube-proxy / ingress stop routing to the pod first.
+  preStopSleepSeconds: 5
+  # Must exceed preStopSleepSeconds + gracefulShutdownSeconds (the chart fails otherwise).
+  terminationGracePeriodSeconds: 40
+  resources:
+    requests:
+      cpu: 250m
+      memory: 256Mi
+    limits:
+      memory: 512Mi
+  livenessProbe:
+    periodSeconds: 10
+    timeoutSeconds: 3
+    failureThreshold: 3
+  readinessProbe:
+    periodSeconds: 5
+    timeoutSeconds: 3
+    failureThreshold: 2
+  startupProbe:
+    periodSeconds: 2
+    timeoutSeconds: 3
+    failureThreshold: 30
+  service:
+    type: ClusterIP
+    port: 80
+    annotations: {}
+  autoscaling:
+    enabled: false
+    minReplicas: 2
+    maxReplicas: 10
+    targetCPUUtilizationPercentage: 70
+    behavior:
+      scaleUp:
+        stabilizationWindowSeconds: 0
+        policies:
+          - type: Percent
+            value: 100
+            periodSeconds: 30
+      scaleDown:
+        stabilizationWindowSeconds: 300
+        policies:
+          - type: Percent
+            value: 50
+            periodSeconds: 60
+  pdb:
+    enabled: true
+    maxUnavailable: 1
+  extraEnv: []
+  podAnnotations: {}
+  podLabels: {}
+  nodeSelector: {}
+  tolerations: []
+  affinity: {}
+
+relay:
+  enabled: true
+  # Several relays are safe (each claims outbox rows with FOR UPDATE SKIP LOCKED).
+  replicas: 1
+  # The relay finishes its in-flight batch on SIGTERM; batches are bounded by RELAY_BATCH_SIZE.
+  terminationGracePeriodSeconds: 30
+  # Side-car Prometheus port (METRICS_PORT); 0 disables it.
+  metricsPort: 9100
+  # Liveness fails when the heartbeat file is older than this (RELAY_HEARTBEAT_MAX_AGE_S).
+  heartbeatMaxAgeSeconds: 60
+  resources:
+    requests:
+      cpu: 100m
+      memory: 192Mi
+    limits:
+      memory: 384Mi
+  livenessProbe:
+    periodSeconds: 15
+    timeoutSeconds: 5
+    failureThreshold: 3
+  readinessProbe:
+    periodSeconds: 10
+    timeoutSeconds: 5
+    failureThreshold: 3
+  startupProbe:
+    periodSeconds: 2
+    timeoutSeconds: 5
+    failureThreshold: 45
+  pdb:
+    enabled: true
+    maxUnavailable: 1
+  extraEnv: []
+  podAnnotations: {}
+  podLabels: {}
+  nodeSelector: {}
+  tolerations: []
+  affinity: {}
+
+worker:
+  enabled: true
+  # Ignored when worker.autoscaling.enabled (KEDA owns the replica count).
+  replicas: 2
+  # Concurrent deliveries per pod (WORKER_CONCURRENCY).
+  concurrency: 16
+  # SIGTERM: stop leasing, let in-flight attempts finish for this long, flush the completion
+  # batch, release the rest of the leases (WORKER_DRAIN_TIMEOUT_S).
+  drainTimeoutSeconds: 25
+  # Must be at least drainTimeoutSeconds + 10 (completion flush + lease release + exit); the
+  # chart fails otherwise. A SIGKILLed worker loses nothing (leases expire after WORKER_LEASE_S
+  # and are reclaimed) but its in-flight deliveries are retried late and may be sent twice.
+  terminationGracePeriodSeconds: 45
+  metricsPort: 9100
+  heartbeatMaxAgeSeconds: 60
+  resources:
+    requests:
+      cpu: 250m
+      memory: 256Mi
+    limits:
+      memory: 512Mi
+  livenessProbe:
+    periodSeconds: 15
+    timeoutSeconds: 5
+    failureThreshold: 3
+  readinessProbe:
+    periodSeconds: 10
+    timeoutSeconds: 5
+    failureThreshold: 3
+  startupProbe:
+    periodSeconds: 2
+    timeoutSeconds: 5
+    failureThreshold: 45
+  pdb:
+    enabled: true
+    maxUnavailable: 1
+  # KEDA ScaledObject (requires KEDA in the cluster and a Prometheus scraping hookrelay, e.g.
+  # metrics.serviceMonitor.enabled). Scales on delivery demand:
+  #   max(hookrelay_deliveries_due) + max(hookrelay_deliveries_delivering)
+  # i.e. work leasable now plus work in flight, divided by deliveriesPerReplica.
+  autoscaling:
+    enabled: false
+    minReplicaCount: 1
+    maxReplicaCount: 20
+    pollingInterval: 15
+    cooldownPeriod: 300
+    # Per-replica target; empty = 75% of worker.concurrency.
+    deliveriesPerReplica: ""
+    # Scale from minReplicaCount only above this much demand (also the 0 -> 1 threshold).
+    activationThreshold: "0"
+    prometheus:
+      serverAddress: http://prometheus-operated.monitoring.svc:9090
+      # Empty = the default demand query above, scoped to the release namespace.
+      query: ""
+      # Missing series (Prometheus not scraping) is an error, not "0": KEDA then holds
+      # fallback.replicas instead of scaling everything down.
+      ignoreNullValues: false
+      # Name of a KEDA TriggerAuthentication for an authenticated Prometheus.
+      authenticationRef: ""
+    fallback:
+      failureThreshold: 3
+      replicas: 4
+    # Optional leading indicator: un-fanned-out outbox rows become deliveries within seconds.
+    fanoutTrigger:
+      enabled: false
+      threshold: "500"
+    behavior:
+      scaleUp:
+        stabilizationWindowSeconds: 0
+        policies:
+          - type: Percent
+            value: 100
+            periodSeconds: 30
+      scaleDown:
+        stabilizationWindowSeconds: 300
+        policies:
+          - type: Pods
+            value: 2
+            periodSeconds: 60
+  extraEnv: []
+  podAnnotations: {}
+  podLabels: {}
+  nodeSelector: {}
+  tolerations: []
+  affinity: {}
+
+migrations:
+  # Alembic `upgrade head` as a Helm pre-install / pre-upgrade hook. It always connects to
+  # DATABASE_DIRECT_URL when set (never through PgBouncer). Migrations must stay backward
+  # compatible with the previous release (expand / contract): old pods keep running against
+  # the new schema until the rollout finishes.
+  enabled: true
+  backoffLimit: 2
+  activeDeadlineSeconds: 600
+  # A dedicated, hook-scoped ServiceAccount (the chart's own does not exist yet at pre-install).
+  serviceAccount:
+    create: true
+    annotations: {}
+  resources:
+    requests:
+      cpu: 100m
+      memory: 192Mi
+    limits:
+      memory: 384Mi
+  podAnnotations: {}
+
+retention:
+  # Batched payload / attempt retention (`hookrelay-retention`, one bounded run per schedule).
+  enabled: true
+  schedule: "17 3 * * *"
+  timeZone: ""
+  # Exit code 3 = the run hit RETENTION_MAX_BATCHES: the next run continues (failed Job = alert).
+  backoffLimit: 0
+  activeDeadlineSeconds: 3600
+  successfulJobsHistoryLimit: 1
+  failedJobsHistoryLimit: 3
+  resources:
+    requests:
+      cpu: 50m
+      memory: 128Mi
+    limits:
+      memory: 256Mi
+
+metrics:
+  serviceMonitor:
+    # Prometheus Operator: a ServiceMonitor for the API's /metrics and a PodMonitor for the
+    # relay / worker side-car ports. honorLabels keeps hookrelay's own `service` label
+    # (api|relay|worker) instead of renaming it to exported_service.
+    enabled: false
+    interval: 30s
+    scrapeTimeout: 10s
+    labels: {}
+    # Set when METRICS_TOKEN is in the Secret: the Secret key holding the bearer token.
+    bearerTokenSecretKey: ""
+
+tests:
+  # `helm test`: a pod that requires 200 from the API's /ready through the Service.
+  enabled: true
