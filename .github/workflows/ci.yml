@@ -37,6 +37,10 @@ jobs:
         run: uv run ruff format --check .
       - name: mypy
         run: uv run mypy
+      - name: actionlint (workflow syntax, expressions, shellcheck of every run block)
+        run: |
+          bash <(curl -fsSL https://raw.githubusercontent.com/rhysd/actionlint/v1.7.7/scripts/download-actionlint.bash) 1.7.7
+          ./actionlint -color
 
   test:
     name: Migrations & tests (Postgres 16, PgBouncer)
@@ -172,7 +176,8 @@ jobs:
           sudo systemctl stop pgbouncer || true
           bash deploy/pgbouncer/run-test-pooler.sh
           # Every process goes through the pooler; Alembic uses the direct URL.
-          DATABASE_DIRECT_URL="$DATABASE_URL" DB_PGBOUNCER=true \
+          DIRECT_URL="$DATABASE_URL"
+          DATABASE_DIRECT_URL="$DIRECT_URL" DB_PGBOUNCER=true \
           DATABASE_URL=postgresql+asyncpg://hookrelay:hookrelay@127.0.0.1:6439/hookrelay \
             bash loadtest/run-local.sh e2e.js -e RATE=25 -e DURATION=15s -e ENDPOINTS=2 \
             -e 'RECEIVER_QUERY=latency_ms=10&jitter_ms=20&failure_rate=0.05&failure_status=500,503' \
@@ -227,7 +232,7 @@ jobs:
           docker run -d --name hookrelay-api --network host \
             -e DATABASE_URL -e SECRETS_ENCRYPTION_KEY -e OPERATOR_TOKEN \
             -e ENDPOINT_ALLOW_HTTP=true -e ENDPOINT_ALLOW_PRIVATE_NETWORKS=true hookrelay:ci
-          for i in $(seq 1 30); do
+          for _ in $(seq 1 30); do
             if curl -fsS http://127.0.0.1:8000/ready; then echo; break; fi
             sleep 1
           done
@@ -266,7 +271,7 @@ jobs:
           HTTPServer(("127.0.0.1", 8080), Hook).serve_forever()
           PY
           nohup python3 receiver.py > receiver.log 2>&1 &
-          for i in $(seq 1 20); do
+          for _ in $(seq 1 20); do
             if curl -s -o /dev/null http://127.0.0.1:8080/; then break; fi
             sleep 0.5
           done
@@ -320,7 +325,7 @@ jobs:
           test "$(jq '.data | length' attempts.json)" = "1"
           test "$(jq -r '.data[0].outcome' attempts.json)" = "succeeded"
           test "$(jq -r '.data[0].request_headers["webhook-signature"]' attempts.json)" = "v1,[redacted]"
-          test "$(ls received/*.json | wc -l)" = "1"
+          test "$(find received -name '*.json' | wc -l)" = "1"
           test "$(jq -r .path received/1.json)" = "/hook"
           # Verify the Standard Webhooks signature with the library receivers can copy.
           docker run --rm -v "$PWD:/smoke:ro" hookrelay:ci python -c '
@@ -339,7 +344,7 @@ jobs:
         run: |
           docker run -d --name hookrelay-worker --network host \
             -e DATABASE_URL -e SECRETS_ENCRYPTION_KEY hookrelay:ci python -m hookrelay.worker
-          for i in $(seq 1 20); do
+          for _ in $(seq 1 20); do
             if docker exec hookrelay-worker python -m hookrelay.worker --healthcheck; then break; fi
             sleep 1
           done
@@ -351,7 +356,7 @@ jobs:
         run: |
           docker run -d --name hookrelay-relay --network host \
             -e DATABASE_URL -e SECRETS_ENCRYPTION_KEY hookrelay:ci python -m hookrelay.relay
-          for i in $(seq 1 20); do
+          for _ in $(seq 1 20); do
             if docker exec hookrelay-relay python -m hookrelay.relay --healthcheck; then break; fi
             sleep 1
           done
@@ -366,3 +371,66 @@ jobs:
           docker logs hookrelay-relay || true
           docker logs hookrelay-worker || true
           cat receiver.log || true
+
+  helm:
+    name: Helm chart (lint, kubeconform, kind smoke + k6 e2e)
+    # Milestone 9b. Static: helm lint --strict, helm template for four value sets validated by
+    # kubeconform -strict (Kubernetes + KEDA / Prometheus Operator CRD schemas), guard rails that
+    # must refuse bad values, and the chart-invariant pytest. Dynamic: install the chart on kind
+    # against in-cluster Postgres / Redis / mock receiver, then the k6 e2e smoke, an upgrade
+    # and a worker SIGTERM drain.
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    env:
+      HELM_VERSION: v4.3.1
+      KUBECONFORM_VERSION: v0.7.0
+    steps:
+      - uses: actions/checkout@v4
+      - uses: azure/setup-helm@v5.0.1
+        with:
+          version: ${{ env.HELM_VERSION }}
+      - name: Install kubeconform
+        run: |
+          mkdir -p "$HOME/.local/bin"
+          curl -fsSL "https://github.com/yannh/kubeconform/releases/download/${KUBECONFORM_VERSION}/kubeconform-linux-amd64.tar.gz" \
+            | tar xz -C "$HOME/.local/bin" kubeconform
+          echo "$HOME/.local/bin" >> "$GITHUB_PATH"
+      - name: helm lint, helm template | kubeconform, guard rails
+        env:
+          OUT_DIR: helm-rendered
+        run: bash deploy/helm/ci/validate.sh
+      - uses: astral-sh/setup-uv@v10.3.3
+        with:
+          version: ${{ env.UV_VERSION }}
+          python-version: ${{ env.PYTHON_VERSION }}
+          enable-cache: true
+      - name: Chart invariants (pytest renders the chart; must not skip here)
+        run: |
+          uv sync --locked
+          uv run pytest tests/unit/test_helm_chart.py -q -rs | tee helm-pytest.log
+          if grep -q "SKIPPED" helm-pytest.log; then echo "helm chart tests were skipped" >&2; exit 1; fi
+      - name: docker build
+        run: docker build --tag hookrelay:kind .
+      - uses: helm/kind-action@v1.15.1
+        with:
+          cluster_name: hookrelay
+          wait: 120s
+      - name: Load the image into kind
+        run: kind load docker-image hookrelay:kind --name hookrelay
+      - name: Setup k6
+        uses: grafana/setup-k6-action@v1
+        with:
+          k6-version: "2.3.0"
+      - name: kind smoke (install, migration hook, helm test, k6 e2e, upgrade, worker drain)
+        env:
+          OUT_DIR: kind-smoke
+        run: bash deploy/helm/ci/kind-smoke.sh
+      - name: Upload rendered manifests and smoke artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: helm-kind
+          path: |
+            helm-rendered/
+            kind-smoke/
+          retention-days: 7
