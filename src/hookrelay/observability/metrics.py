@@ -62,6 +62,7 @@ class Metrics:
     outbox_pending: Gauge
     outbox_lag_seconds: Gauge
     deliveries_pending: Gauge
+    deliveries_due: Gauge
     deliveries_delivering: Gauge
     breaker_endpoints: Gauge
     relay_batches: Counter
@@ -120,11 +121,15 @@ class Metrics:
         outbox_pending: int,
         outbox_lag_seconds: float,
         deliveries_pending: int,
+        deliveries_due: int,
         deliveries_delivering: int,
     ) -> None:
         self.outbox_pending.labels(service=self.service).set(outbox_pending)
         self.outbox_lag_seconds.labels(service=self.service).set(max(outbox_lag_seconds, 0.0))
         self.deliveries_pending.labels(service=self.service).set(deliveries_pending)
+        # The worker autoscaling signal: ``pending`` also counts retries scheduled hours ahead
+        # and backlogs behind an open circuit breaker, which no number of workers can speed up.
+        self.deliveries_due.labels(service=self.service).set(deliveries_due)
         self.deliveries_delivering.labels(service=self.service).set(deliveries_delivering)
 
     def set_breaker_counts(self, *, closed: int, open_: int, half_open: int) -> None:
@@ -191,6 +196,12 @@ def build_metrics(service: str) -> Metrics:
         deliveries_pending=Gauge(
             "hookrelay_deliveries_pending",
             "Deliveries waiting in status=pending.",
+            ["service"],
+            registry=registry,
+        ),
+        deliveries_due=Gauge(
+            "hookrelay_deliveries_due",
+            "Pending deliveries a worker could lease now (due, endpoint breaker not cooling down).",
             ["service"],
             registry=registry,
         ),
