@@ -23,6 +23,7 @@ def test_metrics_record_and_render() -> None:
         outbox_pending=3,
         outbox_lag_seconds=1.5,
         deliveries_pending=7,
+        deliveries_due=5,
         deliveries_delivering=2,
     )
     m.set_breaker_counts(closed=4, open_=1, half_open=0)
@@ -33,6 +34,8 @@ def test_metrics_record_and_render() -> None:
     assert 'service="api"' in text
     assert "hookrelay_delivery_attempts_total" in text
     assert "hookrelay_outbox_pending" in text
+    assert 'hookrelay_deliveries_due{service="api"} 5.0' in text
+    assert 'hookrelay_deliveries_pending{service="api"} 7.0' in text
     assert "hookrelay_circuit_breaker_endpoints" in text
 
 

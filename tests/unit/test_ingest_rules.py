@@ -15,7 +15,7 @@ from sqlalchemy.exc import DBAPIError
 from hookrelay.core.config import EVENT_ENVELOPE_HEADROOM_BYTES
 from hookrelay.core.errors import BadRequestError
 from hookrelay.db.integrity import LOCK_NOT_AVAILABLE, sqlstate
-from hookrelay.relay import heartbeat_is_fresh
+from hookrelay.healthcheck import heartbeat_is_fresh
 from hookrelay.services import idempotency
 from hookrelay.services.fanout import retry_delay_s
 from tests.conftest import make_settings
