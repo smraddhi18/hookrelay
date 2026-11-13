@@ -1,0 +1,36 @@
+hookrelay {{ .Chart.AppVersion }} is installed as release "{{ .Release.Name }}" in namespace "{{ .Release.Namespace }}".
+
+{{- if .Values.migrations.enabled }}
+Migrations ran as the pre-install/pre-upgrade Job "{{ include "hookrelay.fullname" . }}-migrate"
+(alembic upgrade head through DATABASE_DIRECT_URL when set). A failed Job is kept:
+  kubectl -n {{ .Release.Namespace }} logs job/{{ include "hookrelay.fullname" . }}-migrate
+{{- else }}
+Migrations are disabled (migrations.enabled=false): run `alembic upgrade head` yourself first.
+{{- end }}
+
+Components:
+{{- if .Values.api.enabled }}
+  api     {{ if .Values.api.autoscaling.enabled }}HPA {{ .Values.api.autoscaling.minReplicas }}-{{ .Values.api.autoscaling.maxReplicas }} on CPU{{ else }}{{ .Values.api.replicas }} replica(s){{ end }}, Service {{ include "hookrelay.fullname" . }}:{{ .Values.api.service.port }}
+{{- end }}
+{{- if .Values.relay.enabled }}
+  relay   {{ .Values.relay.replicas }} replica(s)
+{{- end }}
+{{- if .Values.worker.enabled }}
+  worker  {{ if .Values.worker.autoscaling.enabled }}KEDA {{ .Values.worker.autoscaling.minReplicaCount }}-{{ .Values.worker.autoscaling.maxReplicaCount }} on delivery demand (threshold {{ include "hookrelay.kedaThreshold" . }}/replica){{ else }}{{ .Values.worker.replicas }} replica(s){{ end }}, concurrency {{ .Values.worker.concurrency }}, drain {{ .Values.worker.drainTimeoutSeconds }}s / grace {{ .Values.worker.terminationGracePeriodSeconds }}s
+{{- end }}
+{{- if .Values.retention.enabled }}
+  retention CronJob "{{ .Values.retention.schedule }}"
+{{- end }}
+
+Check it:
+  kubectl -n {{ .Release.Namespace }} get pods -l app.kubernetes.io/instance={{ .Release.Name }}
+  kubectl -n {{ .Release.Namespace }} port-forward svc/{{ include "hookrelay.fullname" . }} 8000:{{ .Values.api.service.port }}
+  curl -fsS http://127.0.0.1:8000/ready
+{{- if .Values.tests.enabled }}
+  helm test {{ .Release.Name }} -n {{ .Release.Namespace }}
+{{- end }}
+{{- if not .Values.secrets.existingSecret }}
+
+WARNING: secrets come from chart values (secrets.values) and are stored in the Helm release.
+That is for development and CI only; use secrets.existingSecret in production.
+{{- end }}

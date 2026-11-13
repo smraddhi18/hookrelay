@@ -1,0 +1,11 @@
+{{- include "hookrelay.validate" . }}
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: {{ include "hookrelay.configMapName" . }}
+  labels:
+    {{- include "hookrelay.labels" . | nindent 4 }}
+data:
+  {{- range $k, $v := .Values.config }}
+  {{ $k }}: {{ $v | quote }}
+  {{- end }}
