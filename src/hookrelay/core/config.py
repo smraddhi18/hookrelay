@@ -273,6 +273,16 @@ class Settings(BaseSettings):
     retention_batch_size: Annotated[int, Field(ge=1, le=10_000)] = 500
     retention_max_batches: Annotated[int, Field(ge=1, le=100_000)] = 200
     retention_batch_pause_ms: Annotated[int, Field(ge=0, le=60_000)] = 50
+    # Partition maintenance (Milestone 9c, hookrelay-partitions): daily delivery_attempts
+    # partitions are kept PARTITION_PREMAKE_DAYS ahead of today (UTC) and dropped once their
+    # whole day is older than PARTITION_RETENTION_DAYS (0 = EVENT_RETENTION_DAYS; never less:
+    # an attempt is never older than its event, so a partition past the event retention only
+    # holds attempts of expired events). DDL waits at most PARTITION_LOCK_TIMEOUT_MS for its
+    # lock and is retried PARTITION_DDL_RETRIES times before the run reports incomplete.
+    partition_premake_days: Annotated[int, Field(ge=1, le=90)] = 7
+    partition_retention_days: Annotated[int, Field(ge=0, le=3_650)] = 0
+    partition_lock_timeout_ms: Annotated[int, Field(ge=50, le=60_000)] = 2_000
+    partition_ddl_retries: Annotated[int, Field(ge=0, le=20)] = 5
 
     # Observability (Milestone 7).
     # /metrics is scrapeable without tenant auth. Set METRICS_TOKEN to require
@@ -426,6 +436,22 @@ class Settings(BaseSettings):
                 "(or 0 to keep payloads until the event expires)"
             )
         return self
+
+    @model_validator(mode="after")
+    def _check_partition_retention(self) -> Self:
+        days = self.partition_retention_days
+        if days and days < self.event_retention_days:
+            raise ValueError(
+                "PARTITION_RETENTION_DAYS must be at least EVENT_RETENTION_DAYS (or 0 to follow "
+                "it): dropping a partition must never take attempts of a retained event"
+            )
+        return self
+
+    @property
+    def partition_retention_days_effective(self) -> int:
+        """Days of delivery_attempts partitions to keep (PARTITION_RETENTION_DAYS or the event
+        retention)."""
+        return self.partition_retention_days or self.event_retention_days
 
     @property
     def event_payload_retention_s(self) -> int | None:
