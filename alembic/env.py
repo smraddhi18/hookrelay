@@ -19,6 +19,7 @@ from sqlalchemy.ext.asyncio import async_engine_from_config
 from hookrelay.core.config import Settings, normalize_database_url
 from hookrelay.db import models  # noqa: F401 - registers every model on Base.metadata
 from hookrelay.db.base import Base
+from hookrelay.db.partitioning import include_name
 
 config = context.config
 
@@ -60,6 +61,7 @@ def _do_run_migrations(connection: Connection) -> None:
         target_metadata=target_metadata,
         compare_type=True,
         compare_server_default=True,
+        include_name=include_name,  # daily partitions are runtime objects, not schema
         transaction_per_migration=True,
     )
     with context.begin_transaction():
