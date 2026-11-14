@@ -69,9 +69,11 @@ async def test_attempts_stay_inside_the_tenant_and_are_numbered_once(
         "fk_delivery_attempts_delivery_same_tenant"
     )
     await pg.execute(_ATTEMPT, world["a"], d, 1, "retrying", 503, "http_status")
-    assert await _violation(pg, _ATTEMPT, world["a"], d, 1, "failed", 500, "http_status") == (
-        "uq_delivery_attempts_number"
-    )
+    # M9c: delivery_attempts is partitioned, so Postgres names the partition's copy of
+    # uq_delivery_attempts_number (delivery_id, attempt_number, created_at) in the error.
+    violated = await _violation(pg, _ATTEMPT, world["a"], d, 1, "failed", 500, "http_status")
+    assert violated.startswith("delivery_attempts_p")
+    assert violated.endswith("_delivery_id_attempt_number_crea_key")
     await pg.execute("DELETE FROM deliveries WHERE id = $1", d)
     assert (
         await pg.fetchval("SELECT count(*) FROM delivery_attempts WHERE delivery_id = $1", d) == 0

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+from datetime import UTC, datetime, timedelta
 from typing import Any
 
 import asyncpg
@@ -13,6 +14,7 @@ from sqlalchemy.engine import Connection
 from sqlalchemy.ext.asyncio import create_async_engine
 
 from hookrelay.db.base import Base
+from hookrelay.db.partitioning import include_name
 from tests.integration.conftest import _asyncpg_dsn, alembic_config
 
 M1_TABLES = {"api_keys", "endpoints", "event_types", "subscriptions"}
@@ -54,7 +56,12 @@ def _schema_diff(url: str) -> list[Any]:
 
                 def compare(sync_conn: Connection) -> list[Any]:
                     ctx = MigrationContext.configure(
-                        sync_conn, opts={"compare_type": True, "compare_server_default": True}
+                        sync_conn,
+                        opts={
+                            "compare_type": True,
+                            "compare_server_default": True,
+                            "include_name": include_name,  # as alembic/env.py
+                        },
                     )
                     return list(compare_metadata(ctx, Base.metadata))
 
@@ -139,6 +146,7 @@ def test_each_revision_downgrades_one_step(scratch_database_url: str) -> None:
     script = ScriptDirectory.from_config(cfg)
     command.upgrade(cfg, "head")
     expected_removed = {
+        "0011": set(),  # delivery_attempts swapped for an unpartitioned copy (same name)
         "0010": set(),  # traceparent/tracestate columns only
         "0009": set(),  # columns, indexes and triggers only
         "0008": {"endpoint_states", "notifications", "replay_requests"},
@@ -278,3 +286,95 @@ def test_m4_upgrade_dead_letters_exhausted_rows_and_backfills_state(
     assert [r["status"] for r in rows] == ["failed"]
     command.upgrade(cfg, "head")
     assert _schema_diff(scratch_database_url) == []
+
+
+async def _seed_attempts_across_days(url: str) -> list[tuple[int, str]]:
+    """Attempts on three UTC days (one far in the past) as 0010 stored them."""
+    from tests.integration.test_m1_schema import _endpoint, _event_type, _tenant  # noqa: PLC0415
+    from tests.integration.test_m2_schema import _event  # noqa: PLC0415
+
+    conn = await asyncpg.connect(_asyncpg_dsn(url))
+    try:
+        tenant = await _tenant(conn, "m9c-partitions")
+        await _event_type(conn, tenant, "x.y")
+        endpoint = await _endpoint(conn, tenant, "https://a.example.com/")
+        delivery = await conn.fetchval(
+            "INSERT INTO deliveries (tenant_id, event_id, endpoint_id, retain_until, "
+            "attempt_count) VALUES ($1, $2, $3, now() + interval '1 day', 3) RETURNING id",
+            tenant,
+            await _event(conn, tenant, "x.y"),
+            endpoint,
+        )
+        now = await conn.fetchval("SELECT now()")
+        old = datetime(2026, 1, 2, 23, 59, 59, 500_000, tzinfo=UTC)
+        for n, at in enumerate((old, now - timedelta(days=1), now), start=1):
+            await conn.execute(
+                "INSERT INTO delivery_attempts (tenant_id, delivery_id, attempt_number, outcome, "
+                "status_code, error_class, request_url, worker_id, started_at, finished_at, "
+                "created_at) VALUES ($1, $2, $3, 'retrying', 503, 'http_status', "
+                "'https://a.example.com/', 'w', $4, $4, $4)",
+                tenant,
+                delivery,
+                n,
+                at,
+            )
+        rows = await conn.fetch(
+            "SELECT attempt_number, to_char(created_at AT TIME ZONE 'UTC', 'YYYYMMDD') AS day "
+            "FROM delivery_attempts ORDER BY attempt_number"
+        )
+        return [(r["attempt_number"], r["day"]) for r in rows]
+    finally:
+        await conn.close()
+
+
+def test_m9c_partitioning_roundtrip_keeps_every_attempt(scratch_database_url: str) -> None:
+    url = scratch_database_url
+    cfg = alembic_config(url)
+    command.upgrade(cfg, "0010")
+    seeded = asyncio.run(_seed_attempts_across_days(url))
+    command.upgrade(cfg, "0011")
+    rows = asyncio.run(
+        _fetch(
+            url,
+            "SELECT attempt_number, tableoid::regclass::text AS partition "
+            "FROM delivery_attempts ORDER BY attempt_number",
+        )
+    )
+    # Each row sits in the daily partition of its UTC day (one was created for the old day).
+    assert [(r["attempt_number"], r["partition"]) for r in rows] == [
+        (n, f"delivery_attempts_p{day}") for n, day in seeded
+    ]
+    kind = asyncio.run(
+        _fetch(url, "SELECT relkind::text AS k FROM pg_class WHERE relname = 'delivery_attempts'")
+    )
+    assert kind[0]["k"] == "p"
+    assert "delivery_attempts_m0010" not in _tables(url)
+    assert _schema_diff(url) == []
+
+    command.downgrade(cfg, "0010")
+    back = asyncio.run(
+        _fetch(
+            url,
+            "SELECT attempt_number, to_char(created_at AT TIME ZONE 'UTC', 'YYYYMMDD') AS day "
+            "FROM delivery_attempts ORDER BY attempt_number",
+        )
+    )
+    assert [(r["attempt_number"], r["day"]) for r in back] == seeded
+    kind = asyncio.run(
+        _fetch(url, "SELECT relkind::text AS k FROM pg_class WHERE relname = 'delivery_attempts'")
+    )
+    assert kind[0]["k"] == "r"
+    leftovers = asyncio.run(
+        _fetch(url, "SELECT relname FROM pg_class WHERE relname LIKE 'delivery_attempts_%'")
+    )
+    assert [r["relname"] for r in leftovers if "_p" in r["relname"] or "_m0" in r["relname"]] == []
+    pk = asyncio.run(
+        _fetch(
+            url,
+            "SELECT pg_get_constraintdef(oid) AS d FROM pg_constraint "
+            "WHERE conname = 'pk_delivery_attempts'",
+        )
+    )
+    assert pk[0]["d"] == "PRIMARY KEY (id)"
+    command.upgrade(cfg, "head")
+    assert _schema_diff(url) == []
