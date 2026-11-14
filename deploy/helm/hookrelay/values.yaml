@@ -307,6 +307,26 @@ retention:
     limits:
       memory: 256Mi
 
+partitions:
+  # Daily delivery_attempts partition maintenance (`hookrelay-partitions`): premake
+  # PARTITION_PREMAKE_DAYS ahead, move stray rows out of the DEFAULT partition, detach + drop
+  # partitions past PARTITION_RETENTION_DAYS. Hourly so one missed run never matters; alert on
+  # hookrelay_partition_premade_seconds / hookrelay_partition_default_rows instead.
+  # Exit code 3 = a lock timeout outlasted the retries (the next run continues).
+  enabled: true
+  schedule: "7 * * * *"
+  timeZone: ""
+  backoffLimit: 0
+  activeDeadlineSeconds: 1800
+  successfulJobsHistoryLimit: 1
+  failedJobsHistoryLimit: 3
+  resources:
+    requests:
+      cpu: 20m
+      memory: 96Mi
+    limits:
+      memory: 192Mi
+
 metrics:
   serviceMonitor:
     # Prometheus Operator: a ServiceMonitor for the API's /metrics and a PodMonitor for the
