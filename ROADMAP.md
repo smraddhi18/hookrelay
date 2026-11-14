@@ -87,7 +87,8 @@ Legend: `[x]` done, `[ ]` planned.
 
 The capacity plan's next levers, plus the deployment story an operator would actually run.
 
-- [ ] Native range partitioning by `created_at` for `delivery_attempts` first (append-only, largest), then `deliveries` and `events`: daily partitions created ahead by a maintenance job, retention by `DETACH` / `DROP PARTITION` instead of batched `DELETE`s, online migration with a dual-write / backfill window and a tested downgrade
+- [x] Native range partitioning by `created_at` for `delivery_attempts` (append-only, largest): daily partitions + DEFAULT (migration `0011`, tested downgrade), premade by a maintenance job (`hookrelay-partitions`, Helm CronJob), retention by `DETACH` + `DROP`, online migration path documented in [docs/partitioning.md](docs/partitioning.md)
+- [ ] Partition `deliveries` and `events` too, and key attempts by their delivery's creation day so expiry is the partition drop alone (today the event purge cascades most attempt rows first); relay-driven premake as a second safety net; tooling for the online (legacy-partition / dual-write + backfill) migration
 - [x] Batched completion writes in workers (one transaction for several finished attempts, still fenced per lease) to cut the one-completion-transaction-per-delivery cost (leases are already batched)
 - [x] PgBouncer (transaction pooling) in compose and docs: asyncpg prepared-statement settings, connection budget per process, re-measured pool sizing
 - [x] Helm chart: API / relay / worker Deployments, a pre-upgrade migration Job, liveness / readiness / heartbeat probes, PodDisruptionBudgets, `SIGTERM` grace above the drain timeout, secrets from Kubernetes Secrets
@@ -353,3 +354,51 @@ The capacity plan's next levers, plus the deployment story an operator would act
   check` pass. No schema migration (head stays `0010`).
 - Next: native range partitioning of `delivery_attempts` (then `deliveries` / `events`) and the
   multi-node capacity re-run.
+
+### 2026-11-14: Milestone 9c (partitioned `delivery_attempts`, kind CI fix)
+
+- CI fix first: the kind job of run #141 failed because `hookrelay-mock-receiver` crash-looped.
+  Kubernetes injects service-link variables for every Service in the namespace, so the CI Service
+  `mock-receiver` produced `MOCK_RECEIVER_PORT=tcp://10.96.23.64:9000`, and the receiver converted its
+  env defaults with an eager `int()`. The later "Error: release: not found" was only the
+  diagnostics calling `helm history` before `helm install` had run. Now every pod spec (chart and
+  `deploy/helm/ci/deps.yaml`) sets `enableServiceLinks: false`. The same collision was latent for
+  the app: a Service named `metrics` would set `METRICS_PORT`. The receiver reports a bad port or
+  number as a usage error naming the variable, with an `enableServiceLinks` hint. A chart test
+  checks every rendered pod and the kind dependencies. `kind-smoke.sh` prints previous-container
+  logs and restart counts, guards `helm history`, skips terminating worker pods, and runs the
+  partition CronJob once as a Job.
+- Migration `0011`: `delivery_attempts` is `PARTITION BY RANGE (created_at)`, one partition per UTC
+  day that has rows plus today .. today + 7, and a DEFAULT. Rows are copied before indexes exist;
+  keys, indexes, FKs and the trigger are re-created on the parent (cloned to partitions). The PK
+  is now `(id, created_at)` and the attempt-number unique key gained `created_at` (Postgres
+  requires the partition key). Uniqueness across days rests on the lease fence; a test pins that.
+  The downgrade copies back into the `0010` shape and fails loudly on a duplicate. Alembic ignores
+  partitions (`include_name`), so `alembic check` stays clean.
+- `hookrelay-partitions` (`python -m hookrelay.partitions [--dry-run]`; compose `partitions`,
+  profile `ops`; Helm `partitions` CronJob, hourly): session advisory lock on a direct connection
+  (single runner, a second one exits 0), `FINALIZE` of pending detaches, idempotent premake via
+  `CREATE TABLE LIKE` + bound `CHECK` + `ATTACH` (moving rows out of DEFAULT first), retention by
+  `DETACH` (plain while a DEFAULT exists, since Postgres refuses `CONCURRENTLY` then; `CONCURRENTLY`
+  otherwise) + `DROP`, orphan drop, batched DEFAULT sweep. Every DDL statement runs under
+  `lock_timeout` with capped-backoff retries; exhausted steps are deferred to the next run (exit
+  3). New settings `PARTITION_PREMAKE_DAYS` (7), `PARTITION_RETENTION_DAYS` (0 = follow
+  `EVENT_RETENTION_DAYS`, validated `>=` it), `PARTITION_LOCK_TIMEOUT_MS` (2000),
+  `PARTITION_DDL_RETRIES` (5). New gauges `hookrelay_partitions`,
+  `hookrelay_partition_premade_seconds`, `hookrelay_partition_default_rows`.
+- Integration tests on Postgres 16: routing (including DEFAULT and the endpoint trigger), FKs and
+  cascade, `EXPLAIN` plan-time pruning and run-time pruning (`Subplans Removed`), premake
+  idempotency, the DEFAULT → partition move, retention drop + sweep + orphan + dry run, a
+  concurrent detach without DEFAULT, `FINALIZE` of an interrupted one, lock-timeout retries then
+  deferral, a second runner, gauges, CLI exit codes, and a data-carrying `0010 → 0011 → 0010 →
+  0011` roundtrip.
+- Known limitation, recorded above: the event purge (`ON DELETE CASCADE`) still removes most
+  attempt rows before their day can be dropped. [docs/partitioning.md](docs/partitioning.md)
+  covers this, the online migration paths and the alerts.
+- 1066 tests (800 unit, 266 integration on Postgres 16 + Redis + PgBouncer, no skips), 97%
+  line+branch coverage; ruff, ruff format, mypy strict, Alembic upgrade / downgrade roundtrip +
+  `alembic check`, helm lint / template / kubeconform / guard rails, actionlint and shellcheck pass.
+  Migration head `0011`. The kind job itself still runs only in GitHub Actions (no docker on the
+  build box).
+- Next: partition `deliveries` / `events` with the partition key aligned to the delivery's
+  creation day, and the multi-node capacity re-run.
