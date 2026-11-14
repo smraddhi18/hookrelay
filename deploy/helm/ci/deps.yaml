@@ -1,5 +1,8 @@
 # Throwaway in-cluster dependencies for the kind smoke test only (no persistence, fake
-# local-only credentials). Production uses a managed Postgres / Redis.
+# local-only credentials). Production uses a managed Postgres / Redis. Every pod sets
+# enableServiceLinks: false: the Service named mock-receiver would otherwise inject
+# MOCK_RECEIVER_PORT=tcp://<ip>:9000 and clobber the receiver's own setting (CI run #141).
+# tests/unit/test_helm_chart.py checks every pod spec here and in the chart.
 apiVersion: v1
 kind: Service
 metadata:
@@ -26,6 +29,7 @@ spec:
     metadata:
       labels: {app: postgres}
     spec:
+      enableServiceLinks: false
       containers:
         - name: postgres
           image: postgres:16
@@ -74,6 +78,7 @@ spec:
     metadata:
       labels: {app: redis}
     spec:
+      enableServiceLinks: false
       containers:
         - name: redis
           image: redis:7-alpine
@@ -114,6 +119,7 @@ spec:
     metadata:
       labels: {app: mock-receiver}
     spec:
+      enableServiceLinks: false
       securityContext:
         runAsNonRoot: true
         runAsUser: 10001

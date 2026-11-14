@@ -8,7 +8,8 @@
 #   bash deploy/helm/ci/kind-smoke.sh
 #
 # Steps: in-cluster Postgres / Redis / mock receiver -> Secret (existingSecret path) ->
-# helm install --wait (pre-install migration Job) -> schema at head -> helm test -> /ready ->
+# helm install --wait (pre-install migration Job) -> schema at head -> helm test -> one run of
+# the partitions CronJob -> /ready ->
 # k6 e2e through port-forwards (no lost / duplicated deliveries) -> helm upgrade (pre-upgrade
 # migration Job re-runs) -> worker SIGTERM drain logs worker.stopped.
 # Env: NS (hookrelay-ci)  RELEASE (hookrelay)  OUT_DIR (./kind-smoke)  K6_ARGS (extra k6 args)
@@ -27,9 +28,24 @@ diagnostics() {
   k get all,jobs,pdb,cm,secret -o wide || true
   k get events --sort-by=.lastTimestamp | tail -50 || true
   for pod in $(k get pods -o name 2>/dev/null); do
-    echo "--- $pod"; k logs "$pod" --all-containers --tail=80 || true
+    echo "--- $pod"
+    k logs "$pod" --all-containers --tail=80 || true
+    # A crash-looping container's current log may be empty; the previous one has the error.
+    restarts=$(k get "$pod" -o json | jq '[.status.containerStatuses[]?.restartCount] | add // 0' || echo 0)
+    if [ "$restarts" != 0 ]; then
+      echo "--- $pod (previous container)"; k logs "$pod" --all-containers --previous --tail=40 || true
+    fi
+    if [ "$(k get "$pod" -o jsonpath='{.status.conditions[?(@.type=="Ready")].status}')" != True ]; then
+      k describe "$pod" | tail -30 || true
+    fi
   done
-  helm -n "$NS" history "$RELEASE" || true
+  # Only once `helm install` ran: before that the release does not exist and helm prints
+  # "Error: release: not found", which reads like a second failure (CI run #141).
+  if helm -n "$NS" status "$RELEASE" >/dev/null 2>&1; then
+    helm -n "$NS" history "$RELEASE" || true
+  else
+    echo "(release $RELEASE not installed yet: the failure happened before helm install)"
+  fi
   echo "::endgroup::"
 }
 pids=()
@@ -67,6 +83,12 @@ grep -q '(head)' "$OUT_DIR/alembic-current.txt"
 echo "== helm test"
 helm test "$RELEASE" -n "$NS" --logs --timeout 2m
 
+echo "== partition maintenance CronJob, run once (premake is idempotent at head)"
+k create job partitions-smoke --from="cronjob/$RELEASE-partitions"
+k wait --for=condition=complete job/partitions-smoke --timeout=180s
+k logs job/partitions-smoke | tee "$OUT_DIR/partitions.log"
+grep -q '"event": "partitions.finished"' "$OUT_DIR/partitions.log"
+
 echo "== port-forwards"
 k port-forward "svc/$RELEASE" 8000:80 >"$OUT_DIR/pf-api.log" 2>&1 &
 pids+=($!)
@@ -103,7 +125,10 @@ test "$(k get "deployment/$RELEASE-worker" -o jsonpath='{.status.readyReplicas}'
 test "$(helm -n "$NS" history "$RELEASE" -o json | jq -r '.[-1].status')" = deployed
 
 echo "== worker SIGTERM: drains and exits cleanly within the grace period"
-POD=$(k get pods -l app.kubernetes.io/component=worker -o jsonpath='{.items[0].metadata.name}')
+# A pod that is not already terminating (scale-up just happened; old pods may linger).
+POD=$(k get pods -l app.kubernetes.io/component=worker -o json \
+  | jq -r '[.items[] | select(.metadata.deletionTimestamp == null)][0].metadata.name')
+test -n "$POD" && test "$POD" != null
 k logs -f "$POD" >"$OUT_DIR/worker-drain.log" 2>&1 &
 pids+=($!)
 sleep 2

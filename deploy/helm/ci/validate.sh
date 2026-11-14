@@ -38,8 +38,12 @@ render minimal "${DEV[@]}"
 render kind -f "$HERE/values-kind.yaml"
 render full -f "$HERE/values-full.yaml"
 render no-optional "${DEV[@]}" --set migrations.enabled=false --set retention.enabled=false \
-  --set tests.enabled=false --set api.pdb.enabled=false --set relay.metricsPort=0 \
+  --set partitions.enabled=false --set tests.enabled=false --set api.pdb.enabled=false --set relay.metricsPort=0 \
   --set worker.metricsPort=0 --set serviceAccount.create=false --set topologySpread.enabled=false
+
+# The kind smoke's own dependencies (Postgres / Redis / mock receiver) are plain manifests.
+kubeconform -strict -summary -kubernetes-version "$KUBE_VERSION" "$HERE/deps.yaml"
+echo "ok: kind dependencies ($(grep -c '^kind:' "$HERE/deps.yaml") objects)"
 
 must_fail "a secret in the ConfigMap" "is a secret|invalid propertyName" "${DEV[@]}" --set config.OPERATOR_TOKEN=x
 must_fail "a credential-looking ConfigMap key" "looks like a credential" "${DEV[@]}" --set config.PGPASSWORD=x

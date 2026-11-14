@@ -52,6 +52,8 @@ tolerations:
     effect: NoSchedule
 retention:
   timeZone: Asia/Kolkata
+partitions:
+  schedule: "*/30 * * * *"
 metrics:
   serviceMonitor:
     enabled: true
