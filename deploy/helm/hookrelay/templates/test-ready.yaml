@@ -11,6 +11,9 @@ metadata:
 spec:
   restartPolicy: Never
   automountServiceAccountToken: false
+  # No Kubernetes service-link env vars ({SVC}_PORT=tcp://...): they collide with
+  # settings (a Service named "metrics" would set METRICS_PORT). DNS is the discovery path.
+  enableServiceLinks: false
   {{- include "hookrelay.podSecurity" . | nindent 2 }}
   containers:
     - name: ready
