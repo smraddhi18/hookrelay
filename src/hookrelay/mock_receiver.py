@@ -491,26 +491,100 @@ async def serve_in_background(
         sock.close()
 
 
+_MAX_PORT = 65_535
+# Kubernetes "service links" inject ``<SERVICE>_PORT=tcp://<cluster-ip>:<port>`` for every
+# Service in the namespace; a Service named ``mock-receiver`` therefore sets
+# ``MOCK_RECEIVER_PORT``. Recognise the shape so the error says what to change.
+_SERVICE_LINK_PREFIXES = ("tcp://", "udp://", "sctp://")
+
+
 def _env(name: str, default: str) -> str:
+    """Raw ``MOCK_RECEIVER_<name>`` value. Left as a string: argparse converts (and validates)
+    a string default with the option's ``type`` only when the option is not on the command
+    line, so a bad env var never breaks a run that passes the flag explicitly."""
     return os.environ.get(ENV_PREFIX + name, default)
+
+
+def _number_type(
+    kind: Callable[[str], float], label: str, *, env: str, low: float | None = None
+) -> Callable[[str], Any]:
+    """argparse ``type=`` that names the flag *and* the env var instead of a bare traceback."""
+
+    def convert(raw: str) -> Any:
+        try:
+            value = kind(raw)
+        except ValueError:
+            hint = ""
+            if raw.strip().lower().startswith(_SERVICE_LINK_PREFIXES):
+                hint = (
+                    f"; {ENV_PREFIX}{env} looks like a Kubernetes service link injected for a "
+                    "Service named mock-receiver: set enableServiceLinks: false on the pod "
+                    "(or pass the flag explicitly)"
+                )
+            msg = f"expected {label}, got {raw!r} (from the flag or {ENV_PREFIX}{env}){hint}"
+            raise argparse.ArgumentTypeError(msg) from None
+        if low is not None and value < low:
+            msg = f"expected {label}, got {raw!r} (from the flag or {ENV_PREFIX}{env})"
+            raise argparse.ArgumentTypeError(msg)
+        return value
+
+    return convert
+
+
+def _port(raw: str) -> int:
+    value = int(raw)
+    if not 0 <= value <= _MAX_PORT:  # 0 = any free port (tests)
+        raise ValueError(raw)
+    return value
 
 
 def build_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(
         prog="hookrelay-mock-receiver",
         description="Mock webhook receiver for load/chaos tests (latency, failures, accounting)",
+        epilog=f"Every option defaults to the {ENV_PREFIX}<OPTION> env var (e.g. "
+        f"{ENV_PREFIX}PORT); a flag on the command line wins.",
     )
+    num = _number_type
     p.add_argument("--host", default=_env("HOST", "127.0.0.1"))
-    p.add_argument("--port", type=int, default=int(_env("PORT", "9000")))
-    p.add_argument("--latency-ms", type=float, default=float(_env("LATENCY_MS", "0")))
-    p.add_argument("--jitter-ms", type=float, default=float(_env("JITTER_MS", "0")))
-    p.add_argument("--failure-rate", type=float, default=float(_env("FAILURE_RATE", "0")))
+    p.add_argument(
+        "--port",
+        type=num(_port, "a TCP port (0-65535)", env="PORT"),
+        default=_env("PORT", "9000"),
+    )
+    p.add_argument(
+        "--latency-ms",
+        type=num(float, "milliseconds >= 0", env="LATENCY_MS", low=0),
+        default=_env("LATENCY_MS", "0"),
+    )
+    p.add_argument(
+        "--jitter-ms",
+        type=num(float, "milliseconds >= 0", env="JITTER_MS", low=0),
+        default=_env("JITTER_MS", "0"),
+    )
+    p.add_argument(
+        "--failure-rate",
+        type=num(float, "a number", env="FAILURE_RATE"),
+        default=_env("FAILURE_RATE", "0"),
+    )
     p.add_argument("--failure-status", default=_env("FAILURE_STATUS", "500"))
     p.add_argument("--retry-after-s", default=_env("RETRY_AFTER_S", ""))
-    p.add_argument("--hang-rate", type=float, default=float(_env("HANG_RATE", "0")))
-    p.add_argument("--hang-ms", type=float, default=float(_env("HANG_MS", "30000")))
-    p.add_argument("--status", type=int, default=int(_env("STATUS", "204")))
-    p.add_argument("--seed", type=int, default=int(_env("SEED", "0")))
+    p.add_argument(
+        "--hang-rate",
+        type=num(float, "a number", env="HANG_RATE"),
+        default=_env("HANG_RATE", "0"),
+    )
+    p.add_argument(
+        "--hang-ms",
+        type=num(float, "milliseconds >= 0", env="HANG_MS", low=0),
+        default=_env("HANG_MS", "30000"),
+    )
+    p.add_argument(
+        "--status",
+        type=num(int, "an HTTP status code", env="STATUS"),
+        default=_env("STATUS", "204"),
+    )
+    p.add_argument("--seed", type=num(int, "an integer", env="SEED"), default=_env("SEED", "0"))
     p.add_argument("--log-level", default=_env("LOG_LEVEL", "warning"))
     return p
 
