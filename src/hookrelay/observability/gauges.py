@@ -1,4 +1,4 @@
-"""Refresh queue-depth and circuit-breaker gauges from Postgres (no tenant payloads)."""
+"""Refresh queue-depth, circuit-breaker and partition gauges from Postgres (no tenant payloads)."""
 
 from __future__ import annotations
 
@@ -7,6 +7,7 @@ from dataclasses import dataclass
 from sqlalchemy import text
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from hookrelay.db.partitioning import DELIVERY_ATTEMPTS, PartitionedTable
 from hookrelay.observability.metrics import Metrics
 
 _QUEUE_SQL = text(
@@ -35,6 +36,67 @@ _BREAKER_SQL = text(
     GROUP BY breaker_state
     """
 )
+
+
+# Catalog-only (no table scan): daily partitions, the newest upper bound, and whether a DEFAULT
+# partition exists. pg_get_expr renders bounds with an explicit offset, so the cast is exact.
+_PARTITIONS_SQL = text(
+    r"""
+    SELECT count(*) FILTER (WHERE b.expr <> 'DEFAULT') AS partitions,
+           extract(epoch FROM (
+               max((regexp_match(b.expr, 'TO \(''([^'']+)''\)'))[1]::timestamptz) - now()
+           )) AS premade_seconds,
+           bool_or(b.expr = 'DEFAULT') AS has_default
+    FROM pg_inherits AS i
+    JOIN pg_class AS c ON c.oid = i.inhrelid
+    CROSS JOIN LATERAL (SELECT pg_get_expr(c.relpartbound, c.oid) AS expr) AS b
+    WHERE i.inhparent = to_regclass(:table) AND NOT i.inhdetachpending
+    """
+)
+# Rows routed to DEFAULT mean premaking fell behind; bounded so a huge one stays cheap.
+DEFAULT_ROWS_CAP = 10_000
+
+
+@dataclass(frozen=True, slots=True)
+class PartitionSnapshot:
+    table: str
+    partitions: int
+    premade_seconds: float
+    default_rows: int
+
+
+async def snapshot_partitions(
+    session: AsyncSession, table: PartitionedTable = DELIVERY_ATTEMPTS
+) -> PartitionSnapshot:
+    row = (await session.execute(_PARTITIONS_SQL, {"table": table.name})).one()
+    default_rows = 0
+    if row.has_default:
+        default_rows = int(
+            await session.scalar(
+                text(
+                    f'SELECT count(*) FROM (SELECT 1 FROM ONLY "{table.default_partition}" '  # noqa: S608 - our own identifier
+                    f"LIMIT {DEFAULT_ROWS_CAP}) AS s"
+                )
+            )
+            or 0
+        )
+    return PartitionSnapshot(
+        table=table.name,
+        partitions=int(row.partitions or 0),
+        premade_seconds=float(row.premade_seconds or 0),
+        default_rows=default_rows,
+    )
+
+
+async def refresh_partition_gauges(session: AsyncSession, metrics: Metrics) -> PartitionSnapshot:
+    snap = await snapshot_partitions(session)
+    metrics.set_partition_state(
+        table=snap.table,
+        partitions=snap.partitions,
+        premade_seconds=snap.premade_seconds,
+        default_rows=snap.default_rows,
+    )
+    return snap
 
 
 @dataclass(frozen=True, slots=True)
@@ -76,4 +138,5 @@ async def refresh_gauges(session: AsyncSession, metrics: Metrics) -> QueueSnapsh
     metrics.set_breaker_counts(
         closed=snap.breaker_closed, open_=snap.breaker_open, half_open=snap.breaker_half_open
     )
+    await refresh_partition_gauges(session, metrics)
     return snap

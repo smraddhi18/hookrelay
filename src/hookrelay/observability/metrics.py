@@ -73,6 +73,9 @@ class Metrics:
     worker_completion_batch_size: Histogram
     worker_completion_flush_seconds: Histogram
     worker_completion_retries: Counter
+    partitions: Gauge
+    partition_premade_seconds: Gauge
+    partition_default_rows: Gauge
 
     def record_event_ingested(self) -> None:
         self.events_ingested.labels(service=self.service).inc()
@@ -131,6 +134,15 @@ class Metrics:
         # and backlogs behind an open circuit breaker, which no number of workers can speed up.
         self.deliveries_due.labels(service=self.service).set(deliveries_due)
         self.deliveries_delivering.labels(service=self.service).set(deliveries_delivering)
+
+    def set_partition_state(
+        self, *, table: str, partitions: int, premade_seconds: float, default_rows: int
+    ) -> None:
+        self.partitions.labels(service=self.service, table=table).set(partitions)
+        self.partition_premade_seconds.labels(service=self.service, table=table).set(
+            premade_seconds
+        )
+        self.partition_default_rows.labels(service=self.service, table=table).set(default_rows)
 
     def set_breaker_counts(self, *, closed: int, open_: int, half_open: int) -> None:
         self.breaker_endpoints.labels(service=self.service, state="closed").set(closed)
@@ -265,6 +277,25 @@ def build_metrics(service: str) -> Metrics:
             "hookrelay_worker_completion_retries_total",
             "Completion transactions retried after a transient database error.",
             ["service"],
+            registry=registry,
+        ),
+        partitions=Gauge(
+            "hookrelay_partitions",
+            "Attached daily range partitions of a partitioned table (DEFAULT not counted).",
+            ["service", "table"],
+            registry=registry,
+        ),
+        partition_premade_seconds=Gauge(
+            "hookrelay_partition_premade_seconds",
+            "Seconds until the newest daily partition ends; alert well before 0 (rows then "
+            "land in the DEFAULT partition).",
+            ["service", "table"],
+            registry=registry,
+        ),
+        partition_default_rows=Gauge(
+            "hookrelay_partition_default_rows",
+            "Rows in the DEFAULT partition (capped at 10000); > 0 means maintenance fell behind.",
+            ["service", "table"],
             registry=registry,
         ),
     )
