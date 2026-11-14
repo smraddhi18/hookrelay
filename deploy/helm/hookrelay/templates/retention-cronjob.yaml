@@ -31,6 +31,9 @@ spec:
           restartPolicy: Never
           serviceAccountName: {{ include "hookrelay.serviceAccountName" . }}
           automountServiceAccountToken: false
+          # No Kubernetes service-link env vars ({SVC}_PORT=tcp://...): they collide with
+          # settings (a Service named "metrics" would set METRICS_PORT). DNS is the discovery path.
+          enableServiceLinks: false
           {{- include "hookrelay.podSecurity" . | nindent 10 }}
           {{- with .Values.nodeSelector }}
           nodeSelector:

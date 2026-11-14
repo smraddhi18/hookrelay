@@ -21,6 +21,9 @@ Components:
 {{- if .Values.retention.enabled }}
   retention CronJob "{{ .Values.retention.schedule }}"
 {{- end }}
+{{- if .Values.partitions.enabled }}
+  partitions CronJob "{{ .Values.partitions.schedule }}" (delivery_attempts daily partitions)
+{{- end }}
 
 Check it:
   kubectl -n {{ .Release.Namespace }} get pods -l app.kubernetes.io/instance={{ .Release.Name }}
