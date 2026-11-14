@@ -221,11 +221,13 @@ Strategy (implemented pieces in **bold**, the rest is Milestone 9):
    payloads are larger than this benchmark's 0.5 KB.
 2. **Row expiry by `retain_until`** (M2) keeps the hot set bounded today, but as batched `DELETE`s it
    costs WAL and vacuum work proportional to the rows removed.
-3. Native range partitioning of `delivery_attempts`, `deliveries` and `events` by `created_at`
-   (daily partitions, created ahead by a maintenance job): expiry becomes `DROP`/`DETACH PARTITION`
-   (O(1), no vacuum debt), and the hot indexes stay the size of a few days. `delivery_attempts` goes
-   first: it is append-only, the largest table and never updated. The partial "due" indexes on
-   `deliveries` keep the lease query O(due rows) inside each partition.
+3. **Native range partitioning of `delivery_attempts`** by `created_at` (M9c, migration `0011`,
+   [partitioning.md](partitioning.md)): daily partitions premade by `hookrelay-partitions`, and
+   expired days are detached and dropped as tables (no vacuum debt for what is left in them).
+   Until the partition key follows the delivery's creation day, the event purge still cascades
+   most attempt rows away first, so the WAL and delete cost of item 2 is not gone yet for attempts.
+   `deliveries` and `events` are still to do. For `deliveries`, the partial "due" indexes must keep
+   the lease query O(due rows) inside each partition.
 
 ## 10. Scaling limits and next bottlenecks
 
@@ -234,7 +236,7 @@ Strategy (implemented pieces in **bold**, the rest is Milestone 9):
 | API (ingest) | ~200 req/s per process at p99 ≈ 108 ms; ~800 req/s with 4 | processes / replicas (stateless) | Postgres write rate and connection count; PgBouncer past ~20 processes |
 | Relay (fan-out) | 3.5-4% of a core while feeding 430-547 deliveries/s | replicas (`SKIP LOCKED` batches) | not near a limit in any run |
 | Workers | ~265-430 deliveries/s per process (CPU-bound); 547/s with 2 workers on 16 endpoints | processes, *if* active endpoints ≫ workers | per-endpoint planner row; very hot single endpoints are capped by `max_in_flight` by design |
-| Postgres | not saturated in isolation (shared CPU was) | vertical first; partition hot tables; read replica for dashboards / search | completions are group-committed since M9 (~13x fewer commits per delivery, section 11); partitioning is next |
+| Postgres | not saturated in isolation (shared CPU was) | vertical first; partition hot tables; read replica for dashboards / search | completions are group-committed since M9 (~13x fewer commits per delivery, section 11); `delivery_attempts` partitioned by day since M9c, `deliveries` / `events` next |
 | Redis | accelerator only (wake-ups, cache, token buckets) | single primary is ample | losing it costs latency, not correctness |
 
 Capacity formula for a target delivery rate `D` (deliveries/s) and ingest rate `I` (events/s), with
