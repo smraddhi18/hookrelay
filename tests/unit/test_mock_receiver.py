@@ -248,6 +248,60 @@ def test_cli_builds_the_server_config(monkeypatch: pytest.MonkeyPatch) -> None:
         mock_receiver.main(["--failure-rate", "3"], run=captured.append)
 
 
+def test_service_link_port_env_is_a_clear_error(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """CI run #141: a Service named mock-receiver injects MOCK_RECEIVER_PORT=tcp://ip:port."""
+    monkeypatch.setenv("MOCK_RECEIVER_PORT", "tcp://10.96.23.64:9000")
+    captured: list[uvicorn.Config] = []
+    with pytest.raises(SystemExit) as exc:
+        mock_receiver.main([], run=captured.append)
+    assert exc.value.code == 2  # argparse usage error, not a traceback
+    err = capsys.readouterr().err
+    assert "argument --port" in err
+    assert "MOCK_RECEIVER_PORT" in err
+    assert "enableServiceLinks: false" in err
+    assert captured == []
+    # An explicit flag wins and the bad env var is never parsed.
+    assert mock_receiver.main(["--port", "9000"], run=captured.append) == 0
+    assert captured[0].port == 9000
+
+
+@pytest.mark.parametrize(
+    ("env", "value", "message"),
+    [
+        ("PORT", "70000", "a TCP port"),
+        ("PORT", "nine", "a TCP port"),
+        ("LATENCY_MS", "-5", "milliseconds >= 0"),
+        ("SEED", "1.5", "an integer"),
+        ("STATUS", "ok", "an HTTP status code"),
+        ("FAILURE_RATE", "lots", "a number"),
+    ],
+)
+def test_bad_env_values_name_the_variable(
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+    env: str,
+    value: str,
+    message: str,
+) -> None:
+    monkeypatch.setenv(f"MOCK_RECEIVER_{env}", value)
+    with pytest.raises(SystemExit):
+        mock_receiver.main([], run=lambda _c: None)
+    err = capsys.readouterr().err
+    assert message in err
+    assert f"MOCK_RECEIVER_{env}" in err
+    assert "service link" not in err
+
+
+def test_env_defaults_are_parsed(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("MOCK_RECEIVER_PORT", "9555")
+    monkeypatch.setenv("MOCK_RECEIVER_SEED", "7")
+    monkeypatch.setenv("MOCK_RECEIVER_JITTER_MS", "2.5")
+    args = mock_receiver.build_parser().parse_args([])
+    assert (args.port, args.seed, args.jitter_ms) == (9555, 7, 2.5)
+
+
 def test_running_receiver_urls() -> None:
     running = mock_receiver.RunningReceiver(app=MockReceiver(), host="127.0.0.1", port=9)
     assert running.url() == "http://127.0.0.1:9/hook"

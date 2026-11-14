@@ -172,6 +172,7 @@ def test_commands_are_real_console_scripts(full: list[dict[str, Any]]) -> None:
         "hr-hookrelay-relay": "hookrelay-relay",
         "hr-hookrelay-worker": "hookrelay-worker",
         "hr-hookrelay-retention": "hookrelay-retention",
+        "hr-hookrelay-partitions": "hookrelay-partitions",
     }
     assert set(commands.values()) <= set(scripts)
 
@@ -208,7 +209,7 @@ def test_every_env_var_is_a_real_setting(full: list[dict[str, Any]]) -> None:
 
 def test_pods_are_hardened(full: list[dict[str, Any]]) -> None:
     pods = [d for d in full if d["kind"] in ("Deployment", "CronJob", "Job", "Pod")]
-    assert len(pods) == 6
+    assert len(pods) == 7
     for doc in pods:
         spec = pod_spec(doc)
         assert spec["securityContext"]["runAsNonRoot"] is True
@@ -221,6 +222,78 @@ def test_pods_are_hardened(full: list[dict[str, Any]]) -> None:
             assert "limits" in container["resources"]
             if doc["kind"] != "Pod":
                 assert {"name": "tmp", "mountPath": "/tmp"} in container["volumeMounts"]  # noqa: S108
+
+
+_POD_KINDS = ("Deployment", "StatefulSet", "DaemonSet", "Job", "CronJob", "Pod")
+
+
+def _pod_specs(docs: list[dict[str, Any]]) -> list[tuple[str, dict[str, Any]]]:
+    return [
+        (f"{d['kind']}/{d['metadata']['name']}", pod_spec(d))
+        for d in docs
+        if d["kind"] in _POD_KINDS
+    ]
+
+
+@pytest.mark.parametrize("values", ["dev", "full", "kind"])
+def test_service_links_are_disabled_on_every_pod(
+    values: str, dev: list[dict[str, Any]], full: list[dict[str, Any]]
+) -> None:
+    """CI run #141: Kubernetes injects ``<SERVICE>_PORT=tcp://ip:port`` (and ``_SERVICE_HOST``,
+    ``_PORT_<n>_TCP...``) for every Service in the namespace. Our settings read plain env vars
+    with role prefixes (``METRICS_PORT``, ``WORKER_*``, ``RELAY_*``, ``REDIS_*``), so a Service
+    with the wrong name would silently override or break them. Every pod opts out."""
+    docs = {
+        "dev": dev,
+        "full": full,
+        "kind": render("-f", str(CI_VALUES / "values-kind.yaml")) if values == "kind" else [],
+    }[values]
+    specs = _pod_specs(docs)
+    assert len(specs) >= 6, [name for name, _ in specs]
+    for name, spec in specs:
+        assert spec.get("enableServiceLinks") is False, name
+
+
+def test_kind_dependencies_disable_service_links() -> None:
+    docs = [d for d in yaml.safe_load_all((CI_VALUES / "deps.yaml").read_text()) if d]
+    specs = _pod_specs(docs)
+    assert sorted(name for name, _ in specs) == [
+        "Deployment/mock-receiver",
+        "Deployment/redis",
+        "StatefulSet/postgres",
+    ]
+    for name, spec in specs:
+        assert spec.get("enableServiceLinks") is False, name
+
+
+def test_service_link_names_would_collide_with_settings() -> None:
+    """Why the opt-out matters: the env var a Service named after a settings prefix would get
+    is a real setting (or the mock receiver's own MOCK_RECEIVER_PORT)."""
+    fields = {name.upper() for name in Settings.model_fields}
+
+    def link_vars(service: str) -> set[str]:
+        prefix = service.upper().replace("-", "_")
+        return {f"{prefix}_PORT", f"{prefix}_SERVICE_HOST", f"{prefix}_SERVICE_PORT"}
+
+    assert link_vars("metrics") & fields == {"METRICS_PORT"}
+    assert "MOCK_RECEIVER_PORT" in link_vars("mock-receiver")
+
+
+def test_partition_maintenance_cronjob(
+    full: list[dict[str, Any]], dev: list[dict[str, Any]]
+) -> None:
+    jobs = by_kind(full, "CronJob")
+    job = jobs["hr-hookrelay-partitions"]
+    assert job["spec"]["schedule"] == "*/30 * * * *"  # values-full overrides the hourly default
+    assert job["spec"]["concurrencyPolicy"] == "Forbid"
+    spec = pod_spec(job)
+    assert spec["restartPolicy"] == "Never"
+    [container] = spec["containers"]
+    refs = [next(iter(ref.values()))["name"] for ref in container["envFrom"]]
+    assert refs == ["hr-hookrelay-config", "hookrelay-prod"]  # values-full: existingSecret
+    assert by_kind(dev, "CronJob")["hr-hookrelay-partitions"]["spec"]["schedule"] == "7 * * * *"
+    off = render(*DEV, "--set", "partitions.enabled=false")
+    assert "hr-hookrelay-partitions" not in by_kind(off, "CronJob")
 
 
 def test_autoscalers_own_the_replica_counts(full: list[dict[str, Any]]) -> None:

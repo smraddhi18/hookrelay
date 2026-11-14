@@ -33,8 +33,28 @@ SESSION_FEATURES: dict[str, re.Pattern[str]] = {
 }
 
 
+# Modules that never use the pooled engine: they open their own connection to Postgres itself
+# (``Settings.migration_dsn``, i.e. DATABASE_DIRECT_URL behind PgBouncer), like Alembic does.
+DIRECT_CONNECTION_MODULES = {
+    # Milestone 9c: single-runner advisory lock + DETACH CONCURRENTLY (no transaction block).
+    Path("services/partitions.py"): Path("partitions.py"),
+}
+
+
 def _sources() -> dict[Path, str]:
-    return {p: p.read_text(encoding="utf-8") for p in sorted(SRC.rglob("*.py"))}
+    return {
+        p: p.read_text(encoding="utf-8")
+        for p in sorted(SRC.rglob("*.py"))
+        if p.relative_to(SRC) not in DIRECT_CONNECTION_MODULES
+    }
+
+
+def test_direct_connection_modules_connect_with_the_migration_dsn() -> None:
+    for module, entrypoint in DIRECT_CONNECTION_MODULES.items():
+        assert (SRC / module).exists(), module
+        source = (SRC / entrypoint).read_text(encoding="utf-8")
+        assert "settings.migration_dsn" in source, entrypoint
+        assert "database_dsn" not in source, entrypoint
 
 
 def test_application_code_uses_no_session_level_postgres_features() -> None:
