@@ -5,6 +5,11 @@ parent delivery, so ``deliveries.attempt_count`` always equals the number of att
 the delivery is not in flight. Rows hold what an operator needs to debug a receiver (status,
 latency, a truncated response body, an error class) and nothing secret: the signature header
 and custom header values are redacted before they are stored.
+
+Milestone 9c: the table is ``PARTITION BY RANGE (created_at)``, one partition per UTC day plus
+a ``DEFAULT`` partition (migration 0011, :mod:`hookrelay.db.partitioning`). Postgres requires
+the partition key in every unique constraint, hence the ``(id, created_at)`` primary key and
+``created_at`` in the attempt-number constraint.
 """
 
 from __future__ import annotations
@@ -61,7 +66,11 @@ class DeliveryAttempt(Base):
             ondelete="CASCADE",
             name="fk_delivery_attempts_endpoint_same_tenant",
         ),
-        UniqueConstraint("delivery_id", "attempt_number", name="uq_delivery_attempts_number"),
+        # Per partition (a Postgres rule for partitioned tables): attempt numbers are assigned
+        # under the delivery's lease fence; this is the backstop, see docs/partitioning.md.
+        UniqueConstraint(
+            "delivery_id", "attempt_number", "created_at", name="uq_delivery_attempts_number"
+        ),
         CheckConstraint(f"outcome IN ({_OUTCOMES})", name="outcome_valid"),
         CheckConstraint("attempt_number >= 1", name="attempt_number_positive"),
         CheckConstraint(
@@ -103,6 +112,7 @@ class DeliveryAttempt(Base):
             "created_at",
             postgresql_where=text("outcome <> 'succeeded'"),
         ),
+        {"postgresql_partition_by": "RANGE (created_at)"},
     )
     __mapper_args__ = {"eager_defaults": True}  # noqa: RUF012
 
@@ -131,8 +141,9 @@ class DeliveryAttempt(Base):
     started_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
     finished_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
     next_attempt_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    # Partition key, so part of the primary key.
     created_at: Mapped[datetime] = mapped_column(
-        DateTime(timezone=True), server_default=func.now(), nullable=False
+        DateTime(timezone=True), server_default=func.now(), nullable=False, primary_key=True
     )
 
     def __repr__(self) -> str:
