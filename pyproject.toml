@@ -50,6 +50,7 @@ hookrelay = "hookrelay.__main__:main"
 hookrelay-relay = "hookrelay.relay:main"
 hookrelay-worker = "hookrelay.worker:main"
 hookrelay-retention = "hookrelay.retention:main"
+hookrelay-partitions = "hookrelay.partitions:main"
 hookrelay-mock-receiver = "hookrelay.mock_receiver:main"
 
 [build-system]
@@ -95,6 +96,10 @@ known-third-party = ["alembic"]
 "tests/integration/test_completion_batches.py" = ["F811"]
 "tests/integration/test_pgbouncer.py" = ["F811"]
 "alembic/**" = ["ANN"]
+# DDL takes no bind parameters: identifiers are generated (and quoted) from our own naming
+# scheme and the catalog, never from input. Values still go through bind parameters.
+"alembic/versions/0011_partition_delivery_attempts.py" = ["ANN", "S608"]
+"src/hookrelay/services/partitions.py" = ["S608"]
 
 [tool.ruff.lint.flake8-bugbear]
 extend-immutable-calls = ["fastapi.Depends", "fastapi.Query", "fastapi.Header"]

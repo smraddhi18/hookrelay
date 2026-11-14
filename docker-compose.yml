@@ -1,6 +1,6 @@
 # Local stack: Postgres 16 + PgBouncer (transaction pooling) + Redis 7 + a one-shot migration job
 # + the API + the fan-out relay + the delivery worker + Prometheus / Grafana / Jaeger
-# (+ an on-demand retention job, profile "ops").
+# (+ on-demand retention and partition-maintenance jobs, profile "ops").
 # The API, relays and workers reach Postgres through PgBouncer (DB_PGBOUNCER=true); migrations
 # go straight to Postgres (DATABASE_DIRECT_URL). To bypass the pooler, set
 # HOOKRELAY_DATABASE_URL=postgresql+asyncpg://hookrelay:hookrelay@postgres:5432/hookrelay and
@@ -57,6 +57,8 @@ x-app-env: &app-env
   EVENT_PAYLOAD_RETENTION_DAYS: ${EVENT_PAYLOAD_RETENTION_DAYS:-0}
   RETENTION_BATCH_SIZE: ${RETENTION_BATCH_SIZE:-500}
   RETENTION_MAX_BATCHES: ${RETENTION_MAX_BATCHES:-200}
+  PARTITION_PREMAKE_DAYS: ${PARTITION_PREMAKE_DAYS:-7}
+  PARTITION_RETENTION_DAYS: ${PARTITION_RETENTION_DAYS:-0}
   # Observability (Milestone 7). /metrics is public; set METRICS_TOKEN to require a bearer.
   METRICS_ENABLED: ${METRICS_ENABLED:-true}
   METRICS_TOKEN: ${METRICS_TOKEN:-}
@@ -203,6 +205,22 @@ services:
       migrate:
         condition: service_completed_successfully
       pgbouncer:
+        condition: service_healthy
+    restart: "no"
+
+  # One-shot delivery_attempts partition maintenance (Milestone 9c): premake daily partitions,
+  # detach + drop the ones past retention. `docker compose run --rm partitions` (cron it
+  # hourly; the Helm chart ships it as a CronJob). Connects with DATABASE_DIRECT_URL (advisory
+  # lock + DETACH CONCURRENTLY must not go through PgBouncer's transaction pooling).
+  partitions:
+    image: hookrelay:local
+    command: ["python", "-m", "hookrelay.partitions"]
+    environment: *app-env
+    profiles: ["ops"]
+    depends_on:
+      migrate:
+        condition: service_completed_successfully
+      postgres:
         condition: service_healthy
     restart: "no"
 
