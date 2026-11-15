@@ -273,8 +273,9 @@ class Settings(BaseSettings):
     retention_batch_size: Annotated[int, Field(ge=1, le=10_000)] = 500
     retention_max_batches: Annotated[int, Field(ge=1, le=100_000)] = 200
     retention_batch_pause_ms: Annotated[int, Field(ge=0, le=60_000)] = 50
-    # Partition maintenance (Milestone 9c, hookrelay-partitions): daily delivery_attempts
-    # partitions are kept PARTITION_PREMAKE_DAYS ahead of today (UTC) and dropped once their
+    # Partition maintenance (Milestones 9c / 9d, hookrelay-partitions): the daily partitions of
+    # events, deliveries and delivery_attempts are kept PARTITION_PREMAKE_DAYS ahead of today
+    # (UTC) and dropped once their
     # whole day is older than PARTITION_RETENTION_DAYS (0 = EVENT_RETENTION_DAYS; never less:
     # an attempt is never older than its event, so a partition past the event retention only
     # holds attempts of expired events). DDL waits at most PARTITION_LOCK_TIMEOUT_MS for its
@@ -283,6 +284,16 @@ class Settings(BaseSettings):
     partition_retention_days: Annotated[int, Field(ge=0, le=3_650)] = 0
     partition_lock_timeout_ms: Annotated[int, Field(ge=50, le=60_000)] = 2_000
     partition_ddl_retries: Annotated[int, Field(ge=0, le=20)] = 5
+    # Since Milestone 9d events, deliveries and delivery_attempts are all partitioned by the
+    # event's day and dropped together. Row-by-row event expiry (cascading DELETEs) therefore
+    # only runs as a backstop, for events this many seconds past retain_until: the partition
+    # drop normally got there first. 0 purges rows as soon as they expire (no partition job).
+    retention_event_purge_grace_s: Annotated[int, Field(ge=0, le=30 * 86_400)] = 2 * 86_400
+    # Relay safety net: every RELAY_PARTITION_CHECK_INTERVAL_S (0 = off) the relay makes sure
+    # partitions exist through today + RELAY_PARTITION_MIN_DAYS_AHEAD, premaking under the same
+    # advisory locks as hookrelay-partitions, in case that CronJob is dead.
+    relay_partition_check_interval_s: Annotated[int, Field(ge=0, le=86_400)] = 300
+    relay_partition_min_days_ahead: Annotated[int, Field(ge=1, le=30)] = 2
 
     # Observability (Milestone 7).
     # /metrics is scrapeable without tenant auth. Set METRICS_TOKEN to require
@@ -449,7 +460,7 @@ class Settings(BaseSettings):
 
     @property
     def partition_retention_days_effective(self) -> int:
-        """Days of delivery_attempts partitions to keep (PARTITION_RETENTION_DAYS or the event
+        """Days of event-graph partitions to keep (PARTITION_RETENTION_DAYS or the event
         retention)."""
         return self.partition_retention_days or self.event_retention_days
 
