@@ -308,11 +308,15 @@ retention:
       memory: 256Mi
 
 partitions:
-  # Daily delivery_attempts partition maintenance (`hookrelay-partitions`): premake
-  # PARTITION_PREMAKE_DAYS ahead, move stray rows out of the DEFAULT partition, detach + drop
-  # partitions past PARTITION_RETENTION_DAYS. Hourly so one missed run never matters; alert on
-  # hookrelay_partition_premade_seconds / hookrelay_partition_default_rows instead.
-  # Exit code 3 = a lock timeout outlasted the retries (the next run continues).
+  # Daily partition maintenance (`hookrelay-partitions`) of events, deliveries and
+  # delivery_attempts (all keyed by the event's UTC day): premake PARTITION_PREMAKE_DAYS ahead,
+  # move stray attempt rows out of the DEFAULT partition, detach + drop partitions past
+  # PARTITION_RETENTION_DAYS, children first. Hourly so one missed run never matters; alert on
+  # hookrelay_partition_premade_seconds / hookrelay_partition_default_rows instead. The relay
+  # premakes as a second safety net (config.RELAY_PARTITION_CHECK_INTERVAL_S / _MIN_DAYS_AHEAD;
+  # 0 interval = off) and counts it in hookrelay_partition_safety_premakes_total: alert on that.
+  # Exit code 3 = a lock timeout outlasted the retries, a day is blocked by DEFAULT rows or a
+  # drop is blocked by referencing rows (the next run continues; see docs/partitioning.md).
   enabled: true
   schedule: "7 * * * *"
   timeZone: ""
