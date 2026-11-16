@@ -88,7 +88,8 @@ Legend: `[x]` done, `[ ]` planned.
 The capacity plan's next levers, plus the deployment story an operator would actually run.
 
 - [x] Native range partitioning by `created_at` for `delivery_attempts` (append-only, largest): daily partitions + DEFAULT (migration `0011`, tested downgrade), premade by a maintenance job (`hookrelay-partitions`, Helm CronJob), retention by `DETACH` + `DROP`, online migration path documented in [docs/partitioning.md](docs/partitioning.md)
-- [ ] Partition `deliveries` and `events` too, and key attempts by their delivery's creation day so expiry is the partition drop alone (today the event purge cascades most attempt rows first); relay-driven premake as a second safety net; tooling for the online (legacy-partition / dual-write + backfill) migration
+- [x] Partition `events` and `deliveries` too, keyed (with `delivery_attempts`) by the **event's** UTC day, so expiry is the partition drop alone, child first (migration `0012`, tested data-carrying roundtrip); relay-driven premake as a second safety net; row-level event purge demoted to a grace-period backstop; `external_id` uniqueness moved to a claim table
+- [ ] Remaining from the partitioning item: a cascade-safe automatic repair of rows stranded in `events` / `deliveries` DEFAULT partitions (today reported, not moved); tooling for the online (legacy-partition / dual-write + backfill) migration paths; a cheaper parent `DETACH` and a smaller lease-pick tax at high volume (measured in [docs/partitioning.md](docs/partitioning.md))
 - [x] Batched completion writes in workers (one transaction for several finished attempts, still fenced per lease) to cut the one-completion-transaction-per-delivery cost (leases are already batched)
 - [x] PgBouncer (transaction pooling) in compose and docs: asyncpg prepared-statement settings, connection budget per process, re-measured pool sizing
 - [x] Helm chart: API / relay / worker Deployments, a pre-upgrade migration Job, liveness / readiness / heartbeat probes, PodDisruptionBudgets, `SIGTERM` grace above the drain timeout, secrets from Kubernetes Secrets
@@ -402,3 +403,59 @@ The capacity plan's next levers, plus the deployment story an operator would act
   build box).
 - Next: partition `deliveries` / `events` with the partition key aligned to the delivery's
   creation day, and the multi-node capacity re-run.
+
+### 2026-11-15: Milestone 9d (the whole event graph partitioned by the event's day; built 2026-11-15, landed on main 2026-11-16)
+
+- Migration `0012`: `events` is `PARTITION BY RANGE (created_at)`; `deliveries` and
+  `delivery_attempts` by a new `event_created_at` (the event's day, copied at fan-out and then
+  carried by every lease and fenced write). `event_outbox` stays a plain table and gains the
+  key. The composite FKs carry it, so day D of the three tables is one connected component. It
+  creates one partition per UTC day that has events plus today .. today + 7 plus a DEFAULT per
+  table, copies the rows (deliveries and attempts joined to their parent), and re-adds keys,
+  indexes, FKs and triggers. The downgrade restores the 0011 layout, keeps every row, drops
+  idempotency records left dangling and refuses to drop a duplicated `external_id`.
+- Consequences made explicit: unique keys gained the partition key (per-event invariants stay
+  exact because an event, its deliveries and its attempts share a day); `external_id` uniqueness
+  moved to `event_external_ids` (claimed in the ingest transaction, taken over once expired, so
+  `409 event_exists` and reuse-after-expiry behave as before); `idempotency_keys` lost its FK to
+  `events` and expires by its own TTL; a `BEFORE ROW` trigger cannot fill a partition key, so
+  writers pass `event_created_at` (a wrong one is rejected by the composite FK); Alembic hides
+  the per-partition FK clones with `include_object`.
+- `hookrelay-partitions` maintains all three tables: premake parents first, retire children
+  first (`DETACH` + `DROP` of the same day), per-table advisory locks, `blocked` when Postgres
+  refuses to detach a still-referenced parent partition, `blocked_days` when rows of a parent
+  table sit in DEFAULT (moving them would cascade; only `delivery_attempts` moves rows). Exit 3
+  on either. The event purge in housekeeping / `hookrelay-retention` now waits
+  `RETENTION_EVENT_PURGE_GRACE_S` (default 2 days) past `retain_until`, so the drop gets there
+  first.
+- Relay safety net: every `RELAY_PARTITION_CHECK_INTERVAL_S` (300, 0 = off) it premakes through
+  today + `RELAY_PARTITION_MIN_DAYS_AHEAD` (2) under the same advisory locks on a direct
+  connection, never retiring or sweeping; counted in
+  `hookrelay_partition_safety_premakes_total{table}` and logged as a warning. Partition gauges
+  are now per table.
+- Measured on the build box (`loadtest/partition_bench.py`, Postgres 16.16, 31 days x 15,000
+  events, 465k deliveries, 930k attempts, 39 partitions per table; medians of 25 runs, one
+  shared machine): retiring the oldest day took 10.9 + 9.7 ms (attempts), 278.5 + 9.0 ms
+  (deliveries) and 113.6 + 3.5 ms (events) for detach + drop, against 1,704 ms for the
+  row-by-row cascade `DELETE` of one day (before vacuum). The parent detach scans the
+  referencing side under `ACCESS EXCLUSIVE` and scales with the data (15.9 ms for deliveries at
+  300 events/day). The costs: endpoint-health window +1.3 ms plan / +0.15 ms exec (attempts can
+  no longer prune on `created_at`), and the lease candidate pick 4.21 ms against 0.32 ms on a
+  plain table (every partition probed per endpoint). Not measured: behaviour at larger volume,
+  `DETACH CONCURRENTLY` cost, multi-node.
+- Integration tests on Postgres 16 (rewritten `test_partitions.py` for three tables, plus new
+  ones): routing incl. DEFAULT and the derived-column triggers, wrong or missing key rejected,
+  event delete cascading through all partitions, `EXPLAIN` pruning (day windows, keyed vs id-only
+  lookups, run-time pruning), per-delivery attempt-number uniqueness across days, premake on all
+  tables, DEFAULT move for attempts, blocked parents, child-first aligned drop, blocked detach
+  with children skipped, DEFAULT sweep + orphans, concurrent drop without DEFAULTs, relay premake
+  and its loop hook (failure survives, off switch), external-id claim / conflict / reclaim,
+  the retention grace, expired-claim purge, lease and completion keyed for an old event, and a
+  data-carrying `0011 -> 0012 -> 0011 -> 0012` roundtrip with an empty schema diff each time.
+- 1086 tests (805 unit, 281 integration on Postgres 16 + Redis + PgBouncer, no skips), 97%
+  line+branch coverage; ruff, ruff format, mypy strict, Alembic upgrade (twice) / downgrade to
+  base / upgrade + `alembic check`, helm lint / template / kubeconform / guard rails, actionlint
+  and shellcheck pass (`/workspace/hookrelay-ci-local-m9d.sh`, the local mirror of CI). Migration
+  head `0012`. The kind job itself still runs only in GitHub Actions (no docker on the build box).
+- Next: a cascade-safe repair of stranded parent-table DEFAULT rows, online-migration tooling,
+  and the multi-node capacity re-run.

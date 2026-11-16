@@ -20,7 +20,8 @@ See the **[roadmap](ROADMAP.md)** for the plan and progress log.
 > completion writes and PgBouncer transaction pooling (9a) and a production Kubernetes deploy (9b:
 > Helm chart with a migration hook, probes, PDBs, HPA for the API and KEDA for workers, linted,
 > kubeconform-validated and smoke-tested on kind in CI) and native daily range partitioning of
-> `delivery_attempts` with a maintenance job (9c) have landed. Tenants authenticate with hashed, role-scoped API keys, manage endpoints, event types
+> `delivery_attempts` with a maintenance job (9c), and partitioning of the whole event graph by the
+> event's day so expiry is the partition drop (9d), have landed. Tenants authenticate with hashed, role-scoped API keys, manage endpoints, event types
 > and wildcard subscriptions, and publish events through `POST /v1/events` with `Idempotency-Key`
 > support. Each event and its outbox row commit in one transaction; a relay process fans the
 > outbox out into exactly one `delivery` per (event, endpoint); and delivery workers lease due
@@ -54,7 +55,7 @@ See the **[roadmap](ROADMAP.md)** for the plan and progress log.
 | Tenancy | Endpoints CRUD: URL policy, header deny-list, timeout bounds, AES-256-GCM-encrypted signing secret (admin-only reveal), soft delete | ✅ M1 |
 | Tenancy | Event-type registry (archive / unarchive) and subscriptions with `*` / `invoice.*` wildcards, fan-out preview | ✅ M1 |
 | API | Keyset cursor pagination, `ETag` / `If-Match` optimistic concurrency (428 / 412), OpenAPI examples + security schemes | ✅ M1 |
-| Ingestion | `POST /v1/events`: strict JSON (media type, size limits checked before and while reading, depth limit, no `NaN` / `\u0000`), registered non-archived types, `external_id` uniqueness, `occurred_at` skew check | ✅ M2 |
+| Ingestion | `POST /v1/events`: strict JSON (media type, size limits checked before and while reading, depth limit, no `NaN` / `\u0000`), registered non-archived types, `external_id` uniqueness (a claim table since M9d, reusable once the event expires), `occurred_at` skew check | ✅ M2 |
 | Ingestion | `Idempotency-Key`: tenant-scoped, request fingerprint, replayed response (`Idempotent-Replayed: true`), `422` on mismatch, concurrent duplicates serialised (`409` + `Retry-After` past a lock timeout), TTL, errors never cached | ✅ M2 |
 | Ingestion | Transactional outbox: event + outbox row (+ idempotency record) in one transaction | ✅ M2 |
 | Ingestion | Fan-out relay process: `SKIP LOCKED` batches, `ON CONFLICT DO NOTHING` deliveries (exactly one per event and endpoint), poison-row isolation with backoff, adaptive polling, heartbeat health check, graceful `SIGTERM` | ✅ M2 |
@@ -86,7 +87,9 @@ See the **[roadmap](ROADMAP.md)** for the plan and progress log.
 | Deploy | Autoscaling: HPA (`autoscaling/v2`) on CPU for the API; KEDA Prometheus scaler for workers on delivery demand (`hookrelay_deliveries_due` + `hookrelay_deliveries_delivering`) with a fallback replica count when metrics are missing; ServiceMonitor / PodMonitor | ✅ M9 |
 | Deploy | CI `helm` job: `helm lint --strict`, `helm template` × 4 value sets through `kubeconform -strict` (+ KEDA / Prometheus Operator CRD schemas), guard-rail and chart-invariant tests, then a kind cluster: install, `helm test`, k6 e2e (no lost / duplicated deliveries), upgrade, worker `SIGTERM` drain | ✅ M9 |
 | Scale | Native range partitioning of `delivery_attempts` by UTC day (migration `0011`, DEFAULT safety net) with `hookrelay-partitions`: idempotent premake (`PARTITION_PREMAKE_DAYS`), retention by `DETACH` + `DROP` under `lock_timeout` with retries, advisory-lock single runner, Helm CronJob, partition gauges ([docs/partitioning.md](docs/partitioning.md)) | ✅ M9 |
-| Scale | Partitioning `deliveries` / `events`; attempts expiring by partition drop alone (today the event cascade still deletes most attempt rows first) | 🔜 |
+| Scale | The whole event graph partitioned by the **event's** UTC day (migration `0012`): `events`, `deliveries` and `delivery_attempts` share one key (`event_created_at`, carried by every lease and fenced write), composite FKs carry it, so one day is one connected component and retention is child-first `DETACH` + `DROP` with no cascade left to run; Postgres' own FK check enforces the order; the row-level event purge is a grace-period backstop (`RETENTION_EVENT_PURGE_GRACE_S`) | ✅ M9 |
+| Scale | The relay premakes partitions as a second safety net (`RELAY_PARTITION_CHECK_INTERVAL_S`, `RELAY_PARTITION_MIN_DAYS_AHEAD`) under the same advisory locks as `hookrelay-partitions`, never retiring; counted in `hookrelay_partition_safety_premakes_total`. Rows stranded in a parent table's DEFAULT are reported (`blocked_days`), never moved (the move would cascade) | ✅ M9 |
+| Scale | Cascade-safe automatic repair of stranded `events` / `deliveries` DEFAULT rows; tooling for the online (legacy-partition / dual-write) migration paths | 🔜 |
 
 ## Architecture
 
@@ -558,24 +561,33 @@ through KEDA, the API on CPU through an HPA. No pod gets Kubernetes service-link
 (`enableServiceLinks: false`): a Service named like a setting (`metrics` → `METRICS_PORT=tcp://…`)
 would otherwise override it.
 
-### Partitioned attempt log (Milestone 9c)
+### Partitioned event graph (Milestones 9c and 9d)
 
 ```mermaid
 flowchart LR
-    W["worker<br/>INSERT attempt"] --> P["delivery_attempts<br/>PARTITION BY RANGE (created_at)"]
-    P --> D1["…_p20261114<br/>(today)"]
-    P --> D2["…_p20261115 … p20261121<br/>premade 7 days"]
-    P --> DF["…_default<br/>should stay empty"]
-    P -.-> OLD["…_p20261014<br/>past retention"]
-    J["hookrelay-partitions<br/>hourly CronJob<br/>pg_try_advisory_lock"] -->|"CREATE LIKE + CHECK,<br/>move DEFAULT rows, ATTACH"| D2
-    J -->|"DETACH (lock_timeout, retried)<br/>then DROP TABLE"| OLD
-    J -->|"gauges: partitions,<br/>premade_seconds, default_rows"| M["Prometheus"]
+    API["API<br/>INSERT event"] --> EV["events<br/>PARTITION BY RANGE (created_at)"]
+    API --> XID["event_external_ids<br/>(plain table: tenant, external_id)"]
+    RL["relay fan-out<br/>INSERT deliveries<br/>(event_created_at)"] --> DV["deliveries<br/>PARTITION BY RANGE (event_created_at)"]
+    WK["worker lease / complete<br/>(id, event_created_at)"] --> DV
+    WK --> AT["delivery_attempts<br/>PARTITION BY RANGE (event_created_at)"]
+    EV --- D1["day D: events_pD · deliveries_pD · delivery_attempts_pD<br/>(one connected component of the FK graph)"]
+    DV --- D1
+    AT --- D1
+    DF["…_default per table<br/>should stay empty"]
+    J["hookrelay-partitions<br/>hourly CronJob<br/>advisory lock per table"] -->|"premake: parents first"| D1
+    J -->|"retire past the cutoff:<br/>attempts → deliveries → events<br/>DETACH then DROP"| OLD["day D − N<br/>dropped as a unit"]
+    RL2["relay safety net<br/>premake only, same locks"] -.->|"missing partitions"| D1
+    J -->|"gauges"| M["Prometheus"]
 ```
 
-`delivery_attempts` is range-partitioned by UTC day since migration `0011`. The job keeps
-`PARTITION_PREMAKE_DAYS` of partitions ready, moves any rows that landed in DEFAULT into a proper
-partition, and detaches and drops days past the retention cutoff. Every step is idempotent and
-bounded by `lock_timeout`, so the job can be re-run at any time. Details, trade-offs and the
+Since migration `0012` all three tables are range-partitioned by UTC day on **the event's**
+`created_at`: `events` by `created_at`, `deliveries` and `delivery_attempts` by a copied
+`event_created_at`, with the composite FKs carrying the key. One day is therefore one connected
+component, and retention is `DETACH` + `DROP` of its three partitions, children first;
+Postgres itself refuses to detach a referenced partition while a referencing row remains, so a
+deferred child drop leaves the parent untouched instead of orphaning anything. The job keeps
+`PARTITION_PREMAKE_DAYS` of partitions ready, the relay premakes a short horizon as a safety net,
+and every step is idempotent and bounded by `lock_timeout`. Details, the measured costs and the
 online migration path are in [docs/partitioning.md](docs/partitioning.md).
 
 ### Request flow (with auth)
@@ -626,18 +638,21 @@ online migration path are in [docs/partitioning.md](docs/partitioning.md).
      lock; past the timeout it gets `409 idempotency_key_in_progress` with `Retry-After: 1`.
 4. **Write the event:** check the type is registered and not archived, `occurred_at` is at most
    `EVENT_OCCURRED_AT_MAX_FUTURE_S` ahead, then insert the `events` row (`retain_until = now() +
-   EVENT_RETENTION_DAYS`) and its `event_outbox` row, and store the response on the idempotency row.
+   EVENT_RETENTION_DAYS`), claim its `external_id` (if any) in `event_external_ids`, insert its
+   `event_outbox` row (carrying the event's `created_at`, the partition key), and store the response on the idempotency row.
    One commit covers all three; any error rolls everything back, including the key claim.
 5. Return `202 Accepted` with `Location: /v1/events/{id}`.
 6. **Relay:** each relay loop claims up to `RELAY_BATCH_SIZE` due outbox rows `FOR UPDATE SKIP LOCKED`,
    inserts deliveries with one `INSERT ... SELECT` over enabled, non-deleted endpoints whose
-   subscriptions match (exact or prefix wildcard) using `ON CONFLICT (event_id, endpoint_id) DO NOTHING`,
+   subscriptions match (exact or prefix wildcard) using `ON CONFLICT (event_id, endpoint_id, event_created_at) DO NOTHING`,
    and sets `processed_at` in the same transaction. If the batch statement fails, it retries row by
    row inside savepoints; a failing row gets `attempts + 1`, `last_error` and
    `available_at = now() + min(2^(attempts-1), RELAY_RETRY_MAX_S)` seconds so it cannot block the others.
 7. **Housekeeping** (every `RELAY_HOUSEKEEPING_INTERVAL_S`, in bounded batches): delete expired idempotency
-   keys, processed outbox rows older than `RELAY_OUTBOX_RETENTION_S`, and events past `retain_until`
-   (their outbox rows and deliveries cascade).
+   keys and external-id claims, processed outbox rows older than `RELAY_OUTBOX_RETENTION_S`, and, as a backstop
+   for when `hookrelay-partitions` is not running, events more than `RETENTION_EVENT_PURGE_GRACE_S` past
+   `retain_until` (their outbox rows and deliveries cascade). With the partition job healthy, whole days are
+   dropped first and this finds nothing.
 
 ### Delivery flow (Milestone 3)
 
@@ -779,7 +794,7 @@ online migration path are in [docs/partitioning.md](docs/partitioning.md).
   row atomically removes the classic dual-write bug (DB commit succeeds, broker publish fails).
   `SKIP LOCKED` gives a correct multi-worker queue without another stateful system. The trade-off is
   a lower throughput ceiling than a log-based broker. M8's capacity plan measures it, and
-  partitioning (attempts since M9c) plus retention are the levers before adding a broker.
+  partitioning (the whole event graph since M9d) plus retention are the levers before adding a broker.
 - **At-least-once delivery.** Exactly-once over HTTP to third-party receivers is impossible. Workers
   can crash after the receiver got the request but before the attempt is recorded. hookrelay
   therefore guarantees at-least-once delivery and sends a stable `webhook-id` so receivers can de-duplicate.
@@ -894,9 +909,10 @@ online migration path are in [docs/partitioning.md](docs/partitioning.md).
 - **Poison rows back off, healthy rows flow.** A set-based batch is fast; when it fails the relay
   falls back to per-row savepoints, parks only the failing row with exponential backoff and records
   the error, so one bad row costs one retry per backoff period rather than a stuck queue.
-- **Retention is a column, plus partitions for attempts.** `retain_until` is indexed on events and
-  deliveries and purged in bounded batches by the relay. Since M9c `delivery_attempts` is also
-  range-partitioned by day and old days are dropped as tables (see the Milestone 9c decisions).
+- **Retention is a column, plus partitions.** `retain_until` is indexed on events and
+  deliveries and purged in bounded batches by the relay as a backstop. Since M9c/M9d the whole event
+  graph is range-partitioned by the event's day and old days are dropped as tables (see the
+  Milestone 9c and 9d decisions).
 - **Relay health is a heartbeat file.** The relay serves no HTTP, so the container probe
   (`python -m hookrelay.relay --healthcheck`) checks that the loop touched its heartbeat within
   `RELAY_HEARTBEAT_MAX_AGE_S`. A wedged loop is restarted even if the process is alive.
@@ -1190,6 +1206,10 @@ online migration path are in [docs/partitioning.md](docs/partitioning.md).
 
 ### Milestone 9c decisions (partitioning `delivery_attempts`)
 
+> M9d supersedes the key choice and the cascade limitation below: all three tables are now keyed
+> by the event's day. The DEFAULT, `LIKE` + `CHECK` + `ATTACH`, advisory-lock and migration
+> decisions still hold.
+
 - **Attempts first, by UTC day.** `delivery_attempts` is append-only and the largest table, and
   its reads are time-windowed (health, dashboard, listings), so it gains most and risks least.
   `deliveries` (mutable, leased) and `events` (referenced by FKs) need their own designs.
@@ -1221,6 +1241,53 @@ online migration path are in [docs/partitioning.md](docs/partitioning.md).
   transaction (writes wait for the copy). Its downgrade is tested with data on three days. For a
   table too big for that, docs/partitioning.md describes attaching the old table as a legacy
   partition or dual-write + backfill + rename.
+
+### Milestone 9d decisions (the whole event graph by the event's day)
+
+- **One key for the graph: the event's `created_at`.** `events` is partitioned by `created_at`;
+  `deliveries` and `delivery_attempts` by `event_created_at`, copied from the event and then the
+  delivery. Keyed by their own timestamps, the three tables could not be dropped together (an
+  event created on D expires during D + N, but its attempts live in later partitions), so the
+  event cascade kept deleting rows first. Keyed by the event's day, day D of every table holds
+  exactly one connected component of the FK graph and expiry is the drop alone. Retention is
+  global (`retain_until = created_at + N`), so the cutoff is the same for all three.
+- **Composite FKs carry the key; writers pass it.** `(tenant_id, event_id, event_created_at)`
+  and friends keep the same-tenant guarantee and let the planner prune. A `BEFORE ROW` trigger
+  cannot fill a partition key (the row is routed first), so fan-out and the worker pass
+  `event_created_at`, and the lease carries it into every fenced write; a wrong value is
+  rejected by the FK. The derived-column triggers (`event_type`, `endpoint_id`) look the parent
+  up by primary key, so they stay one-partition lookups.
+- **Order is enforced by Postgres, not by hope.** Retention detaches `delivery_attempts`, then
+  `deliveries`, then `events`. Detaching a partition that referencing rows still point at fails,
+  so a skipped child drop makes the parent report `blocked` and keep every row. I kept
+  `ON DELETE CASCADE` (the backstop purge and tenant deletion still need it) rather than
+  redesigning every FK, and chose not to automate moving rows out of a parent table's DEFAULT:
+  the move is a DELETE, which would cascade into the children. Those days are reported
+  (`blocked_days`, exit 3, gauge) instead; only the leaf `delivery_attempts` moves rows.
+- **`external_id` moved to a claim table, the idempotency FK went away.** Postgres cannot keep
+  a unique index on `(tenant_id, external_id)` across partitions. `event_external_ids`
+  (`PRIMARY KEY (tenant_id, external_id)`, `expires_at = retain_until`) is written in the ingest
+  transaction with `ON CONFLICT DO UPDATE … WHERE expires_at <= now()`, so the API contract
+  (`409 event_exists` with the original id) and "reusable once the event expired" are unchanged
+  and now hold even before the partition drop. `idempotency_keys` stored the replayed response
+  and an FK that only cascaded cleanup, so it simply expires by its own `expires_at`.
+- **Honest costs.** Lookups by id alone probe every partition (about 39); hot paths carry the
+  day and hit one. Attempt windows on `created_at` (endpoint health, dashboard) can no longer
+  prune, because replays make attempts under old days: measured here at about +1.3 ms to plan
+  and +0.15 ms to run per query. The lease candidate pick probes every partition per endpoint:
+  4.2 ms against 0.3 ms on a plain table (50 endpoints, 465k deliveries). Parent `DETACH` scans
+  the referencing side under `ACCESS EXCLUSIVE`: 114 ms (events) and 279 ms (deliveries) for a
+  15,000-event day, versus 1.7 s for the row-by-row delete it replaces. All measured on one
+  shared box with `loadtest/partition_bench.py` (see [docs/partitioning.md](docs/partitioning.md));
+  the scaling beyond that size is unmeasured, and the doc says so.
+- **The relay is a second safety net, premake only.** If the CronJob dies, partitions run out
+  and rows spill into DEFAULT (parents cannot be moved back). So every
+  `RELAY_PARTITION_CHECK_INTERVAL_S` the relay premakes `RELAY_PARTITION_MIN_DAYS_AHEAD` days
+  under the same per-table advisory locks, on a direct connection, and never retires or sweeps,
+  so it cannot fight the job. Each premake it does is a warning and a counter to alert on.
+- **In-migration copy, tested both ways.** `0012` is the same simple copy as `0011` (writes wait
+  for it); the downgrade is tested with data on three days (one 40 days old), refuses to drop a
+  duplicated `external_id`, and removes dangling idempotency records.
 
 ## Getting started
 
@@ -1360,9 +1427,13 @@ helm test hookrelay -n hookrelay
   `worker.autoscaling.prometheus.query` if your labels differ (the default assumes one release per
   namespace). `api.autoscaling.enabled` needs metrics-server.
 - The `partitions` CronJob (`partitions.schedule`, default hourly at minute 7) runs
-  `hookrelay-partitions` with `DATABASE_DIRECT_URL`. It is idempotent, so a missed or overlapping
-  run is harmless (`concurrencyPolicy: Forbid` plus an advisory lock). Alert on
-  `hookrelay_partition_premade_seconds < 172800` and `hookrelay_partition_default_rows > 0`.
+  `hookrelay-partitions` with `DATABASE_DIRECT_URL` over `events`, `deliveries` and
+  `delivery_attempts`. It is idempotent, so a missed or overlapping run is harmless
+  (`concurrencyPolicy: Forbid` plus an advisory lock per table). The relay premakes a short
+  horizon as a safety net (`config.RELAY_PARTITION_CHECK_INTERVAL_S`; it already receives
+  `DATABASE_DIRECT_URL` through the shared Secret). Alert on
+  `hookrelay_partition_premade_seconds < 172800`, `hookrelay_partition_default_rows > 0` and any
+  increase of `hookrelay_partition_safety_premakes_total`.
 - `deploy/helm/ci/validate.sh` runs the same lint / template / kubeconform / guard-rail checks as
   CI; `deploy/helm/ci/kind-smoke.sh` repeats the kind smoke on any kind cluster
   (`docker build -t hookrelay:kind . && kind load docker-image hookrelay:kind`).
@@ -1443,8 +1514,10 @@ All settings are environment variables (or `.env`), validated at startup. See
 | `ENDPOINT_HEALTH_MAX_ATTEMPTS` | `10000` | newest attempts aggregated per health request (`sampled: true` beyond) |
 | `EVENT_PAYLOAD_RETENTION_DAYS` | `0` | drop event payloads (and stored response bodies) this long after the event once every delivery is settled; must be `< EVENT_RETENTION_DAYS`; `0` = keep until the event expires |
 | `RETENTION_BATCH_SIZE` / `RETENTION_MAX_BATCHES` / `RETENTION_BATCH_PAUSE_MS` | `500` / `200` / `50` | rows per retention transaction / batches per task per run / pause between batches |
-| `PARTITION_PREMAKE_DAYS` | `7` | daily `delivery_attempts` partitions kept ready ahead of today (1-90) |
-| `PARTITION_RETENTION_DAYS` | `0` | drop attempt partitions past this many days; `0` = follow `EVENT_RETENTION_DAYS`, otherwise must be `>=` it |
+| `PARTITION_PREMAKE_DAYS` | `7` | daily partitions of `events`, `deliveries` and `delivery_attempts` kept ready ahead of today (1-90) |
+| `PARTITION_RETENTION_DAYS` | `0` | drop day partitions (children first) past this many days; `0` = follow `EVENT_RETENTION_DAYS`, otherwise must be `>=` it |
+| `RETENTION_EVENT_PURGE_GRACE_S` | `172800` | the row-by-row expired-event purge (housekeeping / `hookrelay-retention`) waits this long past `retain_until`, so the partition drop gets there first (0-30 d; `0` = purge on expiry, i.e. no partition job) |
+| `RELAY_PARTITION_CHECK_INTERVAL_S` / `RELAY_PARTITION_MIN_DAYS_AHEAD` | `300` / `2` | relay safety net: how often (`0` = off) and how many days ahead (1-30) it premakes missing partitions, under the same advisory locks as the job (never retires) |
 | `PARTITION_LOCK_TIMEOUT_MS` / `PARTITION_DDL_RETRIES` | `2000` / `5` | `lock_timeout` per partition DDL statement / retries on lock timeout (capped backoff) before deferring to the next run |
 
 ### Observability (Milestone 7)
@@ -1460,7 +1533,8 @@ on every `/metrics` scrape: `hookrelay_outbox_pending`, `hookrelay_outbox_lag_se
 `hookrelay_deliveries_pending`, `hookrelay_deliveries_delivering` and (M9b) `hookrelay_deliveries_due`,
 the pending deliveries a worker could lease now (due, endpoint breaker not cooling down), which
 is the worker autoscaling signal. M9c adds `hookrelay_partitions`,
-`hookrelay_partition_premade_seconds` and `hookrelay_partition_default_rows` (label `table`).
+`hookrelay_partition_premade_seconds` and `hookrelay_partition_default_rows` (label `table`, one series per partitioned table since M9d); M9d adds the relay counter
+`hookrelay_partition_safety_premakes_total` (alert on any increase: the CronJob is behind).
 | `OTEL_EXPORTER_OTLP_ENDPOINT` / `TRACING_OTLP_ENDPOINT` | unset | OTLP HTTP base or `/v1/traces` URL. Tracing is **off** when unset. |
 | `TRACING_ENABLED` | auto | Force on/off; default on when an OTLP endpoint is set. |
 | `TRACING_SAMPLE_RATIO` | `1` | Parent-based trace-id ratio sampler. |
@@ -1744,11 +1818,12 @@ src/hookrelay/
                         helm/hookrelay/ (the Helm chart) and helm/ci/ (validate.sh: lint + kubeconform +
                         guard rails; kind-smoke.sh + deps.yaml + values-kind.yaml; values-full.yaml)
 alembic/                async env + versioned migrations (0001 tenants ... 0010 observability trace context,
-                        0011 delivery_attempts range partitioning)
+                        0011 delivery_attempts range partitioning, 0012 events / deliveries partitioned by the event day)
 loadtest/               k6 scripts (ingest.js, e2e.js, lib.js) + run-local.sh (starts the stack, runs k6,
-                        optional CHAOS_CMD fault injection, collects summaries and logs)
+                        optional CHAOS_CMD fault injection, collects summaries and logs);
+                        partition_bench.py (measures partition read / lease / retention costs)
 docs/capacity.md        measured capacity plan (throughput per worker, scaling, pool sizing, storage, limits)
-docs/partitioning.md    delivery_attempts partitioning: layout, keys trade-off, maintenance job, online migration
+docs/partitioning.md    event-graph partitioning: layout, keys trade-off, measured costs, retention order, maintenance job + relay safety net, migration
 tests/receiver.py       raw-asyncio HTTP receiver + fake resolver used by delivery tests
 tests/unit/             fast tests (fake database / mocked Redis): config, security, rules, pagination,
                         auth wiring audit, signing vectors, backoff / Retry-After, SSRF ranges, HTTP
@@ -1879,11 +1954,16 @@ What the chaos suite proves on every CI run:
   and pause keep it from competing with deliveries. Purging payloads keeps `events` rows small
   (TOASTed `jsonb` is most of their size) long before the rows themselves expire.
 - At the measured ~2.1 KB per delivery + attempt and ~1.4 KB per event, 300 deliveries/s is on the
-  order of 65 GB/day before payload retention. Since M9c `delivery_attempts` is partitioned by
-  day: time-windowed reads prune to the days they touch, and expired days are dropped as tables
-  (no vacuum debt). Per-delivery attempt lookups and the event-expiry cascade probe one index per
-  partition (about 38 at 30 + 7 days), and `deliveries` / `events` are still unpartitioned (next
-  step, see [docs/partitioning.md](docs/partitioning.md)).
+  order of 65 GB/day before payload retention. Since M9d `events`, `deliveries` and
+  `delivery_attempts` are partitioned by the event's day and an expired day is dropped as a unit
+  (no cascade, no vacuum debt): on the build box, retiring a 15,000-event day took about 0.4 s
+  of detach + drop against 1.7 s for the row-by-row delete it replaces. The costs are lookups by
+  id alone (one index probe per partition, about 39), attempt `created_at` windows that can no
+  longer prune (+~1 ms per query measured), and the lease candidate pick, which probes every
+  partition per endpoint (4.2 ms vs 0.3 ms on a plain table at 465k deliveries). Parent
+  `DETACH` scales with the referencing side and holds `ACCESS EXCLUSIVE` while it checks
+  (279 ms for `deliveries` at that size): run the job off-peak and re-measure at your volume with
+  `loadtest/partition_bench.py` ([docs/partitioning.md](docs/partitioning.md)).
 - Redis only accelerates (wake-ups, subscription cache,
   rate-limit tokens). Losing it degrades latency / hot-path contention, not correctness or
   at-least-once delivery.
