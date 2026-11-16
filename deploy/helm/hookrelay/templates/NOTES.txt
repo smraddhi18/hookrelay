@@ -22,7 +22,7 @@ Components:
   retention CronJob "{{ .Values.retention.schedule }}"
 {{- end }}
 {{- if .Values.partitions.enabled }}
-  partitions CronJob "{{ .Values.partitions.schedule }}" (delivery_attempts daily partitions)
+  partitions CronJob "{{ .Values.partitions.schedule }}" (events, deliveries, delivery_attempts daily partitions)
 {{- end }}
 
 Check it:

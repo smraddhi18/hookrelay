@@ -12,7 +12,7 @@ spec:
   {{- with $r.timeZone }}
   timeZone: {{ . | quote }}
   {{- end }}
-  # Premake / retire delivery_attempts partitions (Milestone 9c). Runs hourly: every step is
+  # Premake / retire the daily partitions of events, deliveries and delivery_attempts (9c/9d). Runs hourly: every step is
   # idempotent and an advisory lock makes an overlapping run a no-op anyway. Connects with
   # DATABASE_DIRECT_URL when DB_PGBOUNCER=true (session advisory lock, DETACH CONCURRENTLY).
   concurrencyPolicy: Forbid
