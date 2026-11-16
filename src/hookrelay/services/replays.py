@@ -227,6 +227,7 @@ def _candidates(tenant_id: uuid.UUID, flt: ReplayFilter, limit: int) -> Any:
         .where(
             Event.tenant_id == Delivery.tenant_id,
             Event.id == Delivery.event_id,
+            Event.created_at == Delivery.event_created_at,
             Event.payload_purged_at.is_(None),
         )
         .exists()
@@ -265,7 +266,9 @@ async def replay_delivery(
     _raise_if_purged(
         await session.scalar(
             select(Event.payload_purged_at).where(
-                Event.tenant_id == tenant_id, Event.id == delivery.event_id
+                Event.tenant_id == tenant_id,
+                Event.id == delivery.event_id,
+                Event.created_at == delivery.event_created_at,
             )
         ),
         delivery.event_id,

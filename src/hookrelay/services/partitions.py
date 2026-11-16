@@ -1,34 +1,48 @@
-"""Partition maintenance for ``delivery_attempts`` (Milestone 9c): premake, retire, sweep.
+"""Partition maintenance for ``events``, ``deliveries`` and ``delivery_attempts``: premake,
+retire, sweep (Milestones 9c / 9d).
 
-One run (``hookrelay-partitions``, an hourly CronJob) does, in order:
+One run (``hookrelay-partitions``, an hourly CronJob) works through the three tables of the
+event graph (:data:`hookrelay.db.partitioning.PARTITIONED_TABLES`), each under its own advisory
+lock, and does, in order:
 
 1. **finalize** partitions an interrupted ``DETACH ... CONCURRENTLY`` left "detach pending";
-2. **premake** a daily partition for today .. today + ``premake_days`` (UTC), and for every
-   day that has rows in the ``DEFAULT`` partition (a missed run let inserts land there): the
-   new partition is created standalone (``LIKE`` the parent, with a CHECK matching its bound
-   so ``ATTACH`` needs no validation scan), those rows are moved into it, and it is attached,
-   all in one transaction. ``ATTACH`` takes ``SHARE UPDATE EXCLUSIVE`` on the parent, so
-   inserts and reads keep going (``CREATE TABLE ... PARTITION OF`` would take ``ACCESS
-   EXCLUSIVE``);
-3. **retire** every partition whose whole day is older than ``retention_days``: ``DETACH``
-   then ``DROP``. Postgres refuses ``DETACH ... CONCURRENTLY`` while a ``DEFAULT`` partition
-   exists, so with one (the default layout) the detach is the plain form, which needs a brief
-   ``ACCESS EXCLUSIVE`` on the parent; without a default partition it is ``CONCURRENTLY``
-   (never blocks readers or writers). Tables a crashed run detached but did not drop are
-   dropped too (only names this module generates, only past the cutoff);
+2. **premake** a daily partition for today .. today + ``premake_days`` (UTC), parents first
+   (``events``, ``deliveries``, ``delivery_attempts``). For ``delivery_attempts``, which no
+   foreign key references, every day that has rows in the ``DEFAULT`` partition (a missed run
+   let inserts land there) gets a partition too: it is created standalone (``LIKE`` the parent,
+   with a CHECK matching its bound so ``ATTACH`` needs no validation scan), those rows are
+   moved into it, and it is attached, all in one transaction. For ``events`` and
+   ``deliveries`` the move is impossible: it is a ``DELETE`` + ``INSERT`` and the ``DELETE``
+   would cascade into the referencing rows. A day that has rows in their ``DEFAULT`` is
+   reported as *blocked* (``blocked_days``, a warning, an incomplete run) instead, and those rows
+   expire through the ``DEFAULT`` sweep (step 4) or the row-by-row backstop purge. ``ATTACH``
+   takes ``SHARE UPDATE EXCLUSIVE`` on the parent, so inserts and reads keep going
+   (``CREATE TABLE ... PARTITION OF`` would take ``ACCESS EXCLUSIVE``);
+3. **retire** every partition whose whole day is older than ``retention_days``, children first
+   (``delivery_attempts``, ``deliveries``, ``events``): ``DETACH`` then ``DROP``. All three
+   tables of a day expire together because the partition key is the *event's* creation time, and
+   Postgres refuses to detach a referenced ``events`` / ``deliveries`` partition while a
+   referencing row is left (an ``ForeignKeyViolationError``, reported as ``blocked``: the child
+   drop of that day was deferred). Postgres refuses ``DETACH ... CONCURRENTLY`` while a
+   ``DEFAULT`` partition exists, so with one (the default layout) the detach is the plain form,
+   which needs a brief ``ACCESS EXCLUSIVE`` on the parent; without a default partition it is
+   ``CONCURRENTLY`` (never blocks readers or writers). Tables a crashed run detached but did
+   not drop are dropped too (only names this module generates, only past the cutoff);
 4. **sweep** rows older than the cutoff out of the ``DEFAULT`` partition in bounded batches.
 
 Every DDL statement runs under ``lock_timeout`` (``PARTITION_LOCK_TIMEOUT_MS``): it either gets
-its lock quickly or gives up, instead of queueing every attempt insert behind it, and is retried
-with backoff ``PARTITION_DDL_RETRIES`` times; a statement that still cannot get its lock is
-reported (``deferred``) and the run exits incomplete. Runs are single-flight through a
-session-level advisory lock, so the connection must go to Postgres itself (``migration_dsn``),
-never through PgBouncer's transaction pooling.
+its lock quickly or gives up, instead of queueing every insert behind it, and is retried with
+backoff ``PARTITION_DDL_RETRIES`` times; a statement that still cannot get its lock is reported
+(``deferred``) and the run exits incomplete. Runs are single-flight through session-level
+advisory locks, so the connection must go to Postgres itself (``migration_dsn``), never through
+PgBouncer's transaction pooling.
 
-Why the retention cannot lose data an event still needs: an attempt is never older than its
-event, so a partition whose upper bound is older than the event retention only holds attempts
-of events past ``retain_until`` (the settings refuse a partition retention below the event
-retention).
+The relay runs the same code with ``premake_only`` as a second safety net against a dead
+CronJob (:func:`ensure_premade`): it never retires or sweeps.
+
+Why the retention cannot lose data an event still needs: every row of a partition belongs to an
+event created that day, so a partition whose upper bound is older than the event retention
+only holds expired events (the settings refuse a partition retention below the event retention).
 """
 
 from __future__ import annotations
@@ -36,8 +50,8 @@ from __future__ import annotations
 import asyncio
 import functools
 import time
-from collections.abc import Awaitable, Callable
-from dataclasses import dataclass, field
+from collections.abc import Awaitable, Callable, Sequence
+from dataclasses import dataclass, field, replace
 from datetime import date, datetime, timedelta
 from typing import Any, TypeVar
 
@@ -47,6 +61,7 @@ import structlog
 from hookrelay.core.config import Settings
 from hookrelay.db.partitioning import (
     DELIVERY_ATTEMPTS,
+    PARTITIONED_TABLES,
     PartitionedTable,
     RangeBound,
     day_bounds,
@@ -121,6 +136,7 @@ class PartitionPolicy:
     sweep_batch_size: int = 500
     sweep_max_batches: int = 200
     dry_run: bool = False
+    premake_only: bool = False  # the relay's safety net: never retire, never sweep
 
     @classmethod
     def from_settings(cls, settings: Settings, *, dry_run: bool = False) -> PartitionPolicy:
@@ -145,6 +161,8 @@ class PartitionReport:
     detached: list[str] = field(default_factory=list)
     dropped: list[str] = field(default_factory=list)
     deferred: list[str] = field(default_factory=list)
+    blocked_days: list[str] = field(default_factory=list)  # DEFAULT rows prevent the partition
+    blocked: list[str] = field(default_factory=list)  # detach refused: referencing rows left
     default_rows_deleted: int = 0
     default_rows: int = 0  # left in DEFAULT after the run, capped at DEFAULT_ROWS_CAP
     partitions: int = 0  # daily partitions attached after the run
@@ -165,6 +183,8 @@ class PartitionReport:
             "detached": self.detached,
             "dropped": self.dropped,
             "deferred": self.deferred,
+            "blocked_days": self.blocked_days,
+            "blocked": self.blocked,
             "default_rows_deleted": self.default_rows_deleted,
             "default_rows": self.default_rows,
             "partitions": self.partitions,
@@ -215,6 +235,7 @@ class Plan:
     retire: list[Partition]
     finalize: list[Partition]
     orphans: list[str]
+    blocked: list[date] = field(default_factory=list)
 
 
 def plan_maintenance(
@@ -231,7 +252,14 @@ def plan_maintenance(
     cutoff = day_bounds(today - timedelta(days=policy.retention_days))[0]
     attached = [p for p in partitions if p.bound is not None and not p.pending_detach]
     wanted = {today + timedelta(days=k) for k in range(policy.premake_days + 1)}
-    wanted.update(d for d in default_days if day_bounds(d)[1] > cutoff)
+    blocked: list[date] = []
+    if table.movable:
+        wanted.update(d for d in default_days if day_bounds(d)[1] > cutoff)
+    else:
+        # Rows of that day sit in DEFAULT and cannot be moved (see the module docstring):
+        # creating the partition would fail, so it is reported instead.
+        blocked = sorted(wanted & set(default_days))
+        wanted -= set(blocked)
     create = sorted(
         day
         for day in wanted
@@ -244,11 +272,15 @@ def plan_maintenance(
         day = table.day_of(name)
         if day is not None and day_bounds(day)[1] <= cutoff:
             stale_orphans.append(name)
-    return Plan(now, cutoff, create, retire, finalize, stale_orphans)
+    return Plan(now, cutoff, create, retire, finalize, stale_orphans, blocked)
 
 
 class PartitionMaintainer:
-    """One maintenance run over one partitioned table on one dedicated connection."""
+    """One maintenance run over one partitioned table on one dedicated connection.
+
+    :meth:`run` does everything for this table. :func:`maintain` drives several tables through
+    the phases (:meth:`premake_phase` parents first, :meth:`retire_phase` children first) so the
+    cross-table order the foreign keys need holds."""
 
     def __init__(
         self,
@@ -264,27 +296,45 @@ class PartitionMaintainer:
         self.table = table
         self._should_stop = should_stop
         self._sleep = sleep
+        self.report = PartitionReport(table=table.name, dry_run=policy.dry_run)
+        self._started = time.monotonic()
+        self._plan: Plan | None = None
+        self._default: Partition | None = None
 
     async def run(self) -> PartitionReport:
-        started = time.monotonic()
-        report = PartitionReport(table=self.table.name, dry_run=self.policy.dry_run)
-        key = advisory_key(self.table)
-        if not await self.conn.fetchval(
-            "SELECT pg_try_advisory_lock(hashtextextended($1, 0))", key
-        ):
-            report.skipped_locked = True
-            logger.info("partitions.skipped_locked", table=self.table.name)
-            return report
+        if not await self.acquire():
+            return self.report
         try:
-            await self._run(report)
+            await self.prepare()
+            await self.premake_phase()
+            await self.retire_phase()
+            await self.summarise()
         finally:
-            await self.conn.execute("SELECT pg_advisory_unlock(hashtextextended($1, 0))", key)
-            report.elapsed_ms = int((time.monotonic() - started) * 1000)
-        return report
+            await self.release()
+        return self.report
 
-    async def _run(self, report: PartitionReport) -> None:
+    # --- phases -------------------------------------------------------------------------
+
+    async def acquire(self) -> bool:
+        """Take this table's advisory lock (single-flight); ``False`` if another run has it."""
+        if await self.conn.fetchval(
+            "SELECT pg_try_advisory_lock(hashtextextended($1, 0))", advisory_key(self.table)
+        ):
+            return True
+        self.report.skipped_locked = True
+        logger.info("partitions.skipped_locked", table=self.table.name)
+        return False
+
+    async def release(self) -> None:
+        await self.conn.execute(
+            "SELECT pg_advisory_unlock(hashtextextended($1, 0))", advisory_key(self.table)
+        )
+        self.report.elapsed_ms = int((time.monotonic() - self._started) * 1000)
+
+    async def prepare(self) -> None:
+        report = self.report
         partitions = await list_partitions(self.conn, self.table)
-        default = next((p for p in partitions if p.is_default), None)
+        self._default = default = next((p for p in partitions if p.is_default), None)
         now: datetime = await self.conn.fetchval("SELECT now()")
         cutoff_probe = day_bounds(utc_day(now) - timedelta(days=self.policy.retention_days))[0]
         default_days: list[date] = []
@@ -299,7 +349,7 @@ class PartitionMaintainer:
                 )
             ]
         orphans = [r["name"] for r in await self.conn.fetch(_ORPHANS_SQL, self.table.name)]
-        plan = plan_maintenance(
+        self._plan = plan = plan_maintenance(
             table=self.table,
             partitions=partitions,
             now=now,
@@ -308,20 +358,48 @@ class PartitionMaintainer:
             orphans=orphans,
         )
         report.cutoff = plan.cutoff
+        if plan.blocked:
+            report.blocked_days = [d.isoformat() for d in plan.blocked]
+            report.complete = False
+            logger.warning(
+                "partitions.blocked_by_default_rows",
+                table=self.table.name,
+                days=report.blocked_days,
+                hint=(
+                    "rows of these days sit in the DEFAULT partition and cannot be moved "
+                    "(foreign keys reference this table); see docs/partitioning.md"
+                ),
+            )
         if self.policy.dry_run:
             report.created = [self.table.partition_name(d) for d in plan.create]
             report.finalized = [p.name for p in plan.finalize]
-            report.detached = [p.name for p in plan.retire]
-            report.dropped = [p.name for p in plan.retire] + plan.orphans
-        else:
-            await self._finalize(plan.finalize, report)
-            await self._premake(plan.create, default, report)
-            await self._retire(
-                plan.retire, plan.orphans, has_default=default is not None, report=report
-            )
-            if default is not None:
-                await self._sweep_default(default, plan.cutoff, report)
-        await self._summarise(report, default)
+            if not self.policy.premake_only:
+                report.detached = [p.name for p in plan.retire]
+                report.dropped = [p.name for p in plan.retire] + plan.orphans
+
+    async def premake_phase(self) -> None:
+        plan = self._plan
+        if plan is None or self.policy.dry_run:
+            return
+        if not self.policy.premake_only:
+            await self._finalize(plan.finalize, self.report)
+        await self._premake(plan.create, self._default, self.report)
+
+    async def retire_phase(self) -> None:
+        plan = self._plan
+        if plan is None or self.policy.dry_run or self.policy.premake_only:
+            return
+        await self._retire(
+            plan.retire,
+            plan.orphans,
+            has_default=self._default is not None,
+            report=self.report,
+        )
+        if self._default is not None:
+            await self._sweep_default(self._default, plan.cutoff, self.report)
+
+    async def summarise(self) -> None:
+        await self._summarise(self.report, self._default)
 
     # --- steps --------------------------------------------------------------------------
 
@@ -355,7 +433,9 @@ class PartitionMaintainer:
             name = self.table.partition_name(day)
             ok, moved = await self._with_retries(
                 f"create {name}",
-                functools.partial(self._create_partition, day, default, columns),
+                functools.partial(
+                    self._create_partition, day, default if self.table.movable else None, columns
+                ),
                 report,
                 name,
             )
@@ -534,6 +614,18 @@ class PartitionMaintainer:
         for attempt in range(self.policy.ddl_retries + 1):
             try:
                 return True, await step()
+            except asyncpg.exceptions.ForeignKeyViolationError as exc:
+                # Detaching a referenced events / deliveries partition while a referencing row
+                # is left: that day's child drop was deferred. Not retryable inside this run.
+                logger.warning(
+                    "partitions.detach_blocked",
+                    table=self.table.name,
+                    step=what,
+                    detail=exc.detail,
+                )
+                report.blocked.append(name)
+                report.complete = False
+                return False, None
             except asyncpg.exceptions.LockNotAvailableError:
                 logger.warning(
                     "partitions.lock_timeout",
@@ -549,3 +641,53 @@ class PartitionMaintainer:
         report.deferred.append(name)
         report.complete = False
         return False, None
+
+
+async def maintain(
+    conn: asyncpg.Connection,
+    policy: PartitionPolicy,
+    *,
+    tables: Sequence[PartitionedTable] = PARTITIONED_TABLES,
+    should_stop: Callable[[], bool] = lambda: False,
+    sleep: Callable[[float], Awaitable[None]] = asyncio.sleep,
+) -> list[PartitionReport]:
+    """Maintain ``tables`` (parents first in ``tables``) in the order their foreign keys need.
+
+    Premake runs parents first, retirement children first, so one day of the event graph is
+    dropped child-to-parent and Postgres' own check (no row still references a detached
+    partition) never fires unless a child drop was deferred. Tables whose advisory lock another
+    run holds are skipped (their report says so). Raises :class:`NotPartitionedError` before
+    changing anything if a table is not partitioned."""
+    maintainers = [
+        PartitionMaintainer(conn, policy, table=t, should_stop=should_stop, sleep=sleep)
+        for t in tables
+    ]
+    held: list[PartitionMaintainer] = []
+    try:
+        for m in maintainers:
+            if await m.acquire():
+                held.append(m)  # noqa: PERF401 - awaits in the condition
+        for m in held:
+            await m.prepare()
+        for m in held:
+            await m.premake_phase()
+        for m in reversed(held):
+            await m.retire_phase()
+        for m in held:
+            await m.summarise()
+    finally:
+        for m in reversed(held):
+            await m.release()
+    return [m.report for m in maintainers]
+
+
+async def ensure_premade(
+    conn: asyncpg.Connection, policy: PartitionPolicy, *, min_days_ahead: int
+) -> list[PartitionReport]:
+    """The relay's safety net: make sure every table has partitions through today +
+    ``min_days_ahead`` (UTC), premaking under the same advisory locks the CronJob uses.
+
+    Never retires or sweeps, so a healthy CronJob and the relay cannot disagree: whoever holds
+    the lock does the (idempotent) premake, the other skips."""
+    quick = replace(policy, premake_days=min_days_ahead, premake_only=True)
+    return await maintain(conn, quick)

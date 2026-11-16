@@ -73,6 +73,7 @@ _BUSY_EVENTS_SQL = text(
         SELECT d.event_id, d.status
         FROM deliveries AS d
         WHERE d.event_id = ANY(CAST(:ids AS uuid[]))
+          AND d.event_created_at = ANY(CAST(:created AS timestamptz[]))
         FOR SHARE
     )
     SELECT DISTINCT event_id FROM locked
@@ -84,7 +85,8 @@ _PURGE_PAYLOADS_SQL = text(
     """
     UPDATE events
     SET payload = NULL, payload_purged_at = now()
-    WHERE id = ANY(CAST(:ids AS uuid[])) AND payload_purged_at IS NULL
+    WHERE id = ANY(CAST(:ids AS uuid[])) AND created_at = ANY(CAST(:created AS timestamptz[]))
+      AND payload_purged_at IS NULL
     RETURNING id
     """
 )
@@ -95,7 +97,9 @@ _SCRUB_RESPONSES_SQL = text(
     SET response_body = NULL, response_truncated = false
     FROM deliveries AS d
     WHERE d.event_id = ANY(CAST(:ids AS uuid[]))
+      AND d.event_created_at = ANY(CAST(:created AS timestamptz[]))
       AND a.tenant_id = d.tenant_id AND a.delivery_id = d.id
+      AND a.event_created_at = d.event_created_at
       AND a.response_body IS NOT NULL
     RETURNING a.id
     """
@@ -151,17 +155,37 @@ async def purge_payloads(
     if not rows:
         return PayloadBatch(0, 0, 0, 0, None)
     last: Cursor = (rows[-1].created_at, rows[-1].id)
+    # The candidates' created_at values prune every statement below to their daily partitions.
+    created_of = {r.id: r.created_at for r in rows}
     fanned = [r.id for r in rows if r.fanned_out]
+
+    def days(ids: list[uuid.UUID]) -> list[datetime]:
+        return sorted({created_of[i] for i in ids})
+
     busy: set[uuid.UUID] = set()
     if fanned:
-        busy = set((await session.scalars(_BUSY_EVENTS_SQL, {"ids": fanned})).all())
+        busy = set(
+            (
+                await session.scalars(_BUSY_EVENTS_SQL, {"ids": fanned, "created": days(fanned)})
+            ).all()
+        )
     ready = [event_id for event_id in fanned if event_id not in busy]
     purged: list[uuid.UUID] = []
     scrubbed = 0
     if ready:
-        purged = list((await session.scalars(_PURGE_PAYLOADS_SQL, {"ids": ready})).all())
+        purged = list(
+            (
+                await session.scalars(_PURGE_PAYLOADS_SQL, {"ids": ready, "created": days(ready)})
+            ).all()
+        )
         if purged:
-            scrubbed = len((await session.execute(_SCRUB_RESPONSES_SQL, {"ids": purged})).all())
+            scrubbed = len(
+                (
+                    await session.execute(
+                        _SCRUB_RESPONSES_SQL, {"ids": purged, "created": days(purged)}
+                    )
+                ).all()
+            )
     return PayloadBatch(
         scanned=len(rows),
         purged=len(purged),
@@ -184,6 +208,10 @@ class RetentionPolicy:
     pause_s: float = 0.0
     payload_retention_s: int | None = None
     expire_events: bool = True
+    # Row-by-row expiry only touches events this long past retain_until: with partitioned
+    # events the partition drop (hookrelay-partitions) removes them first, so this is the
+    # backstop for a maintenance job that is not running. 0 = purge as soon as expired.
+    event_purge_grace_s: int = 0
 
     @classmethod
     def from_settings(cls, settings: Settings) -> RetentionPolicy:
@@ -192,6 +220,7 @@ class RetentionPolicy:
             max_batches=settings.retention_max_batches,
             pause_s=settings.retention_batch_pause_ms / 1000,
             payload_retention_s=settings.event_payload_retention_s,
+            event_purge_grace_s=settings.retention_event_purge_grace_s,
         )
 
 
@@ -281,7 +310,10 @@ class RetentionRunner:
         size = self.policy.batch_size
         if self.policy.expire_events:
             report.events = await self._run_counting(
-                report, lambda s: purge_expired_events(s, batch_size=size)
+                report,
+                lambda s: purge_expired_events(
+                    s, batch_size=size, grace_s=self.policy.event_purge_grace_s
+                ),
             )
         if self.policy.payload_retention_s is not None:
             await self._run_payloads(report, self.policy.payload_retention_s)
