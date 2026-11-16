@@ -10,7 +10,6 @@ from sqlalchemy import (
     CheckConstraint,
     DateTime,
     ForeignKey,
-    ForeignKeyConstraint,
     Index,
     LargeBinary,
     PrimaryKeyConstraint,
@@ -35,12 +34,8 @@ class IdempotencyKey(Base):
     __tablename__ = "idempotency_keys"
     __table_args__ = (
         PrimaryKeyConstraint("tenant_id", "key", name="pk_idempotency_keys"),
-        ForeignKeyConstraint(
-            ["tenant_id", "event_id"],
-            ["events.tenant_id", "events.id"],
-            ondelete="CASCADE",
-            name="fk_idempotency_keys_event_same_tenant",
-        ),
+        # No FK to events: events are partitioned (migration 0012) and a key expires by its own
+        # expires_at; event_id is informational (the stored response is self-contained).
         CheckConstraint(
             f"octet_length(fingerprint) = {FINGERPRINT_BYTES}", name="fingerprint_sha256"
         ),

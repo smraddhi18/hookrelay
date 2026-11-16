@@ -75,8 +75,8 @@ class Delivery(TimestampMixin, Base):
     __tablename__ = "deliveries"
     __table_args__ = (
         ForeignKeyConstraint(
-            ["tenant_id", "event_id"],
-            ["events.tenant_id", "events.id"],
+            ["tenant_id", "event_id", "event_created_at"],
+            ["events.tenant_id", "events.id", "events.created_at"],
             ondelete="CASCADE",
             name="fk_deliveries_event_same_tenant",
         ),
@@ -87,10 +87,15 @@ class Delivery(TimestampMixin, Base):
             name="fk_deliveries_endpoint_same_tenant",
         ),
         # Exactly one delivery per (event, endpoint): the relay inserts with ON CONFLICT DO
-        # NOTHING, so a re-run after a crash, or two relays racing, can never duplicate.
-        UniqueConstraint("event_id", "endpoint_id", name="uq_deliveries_event_endpoint"),
-        # Target of the composite (tenant_id, delivery_id) FK from delivery_attempts.
-        UniqueConstraint("tenant_id", "id", name="uq_deliveries_tenant_id_id"),
+        # NOTHING, so a re-run after a crash, or two relays racing, can never duplicate. The
+        # partition key (the event's created_at, identical for every delivery of an event) is
+        # part of every unique key of a partitioned table; it does not weaken this one.
+        UniqueConstraint(
+            "event_id", "endpoint_id", "event_created_at", name="uq_deliveries_event_endpoint"
+        ),
+        # Target of the composite (tenant_id, delivery_id, event_created_at) FK from
+        # delivery_attempts.
+        UniqueConstraint("tenant_id", "id", "event_created_at", name="uq_deliveries_tenant_id_id"),
         CheckConstraint(f"status IN ({_STATUSES})", name="status_valid"),
         CheckConstraint("attempt_count >= 0", name="attempt_count_non_negative"),
         CheckConstraint(
@@ -155,6 +160,12 @@ class Delivery(TimestampMixin, Base):
         UUID(as_uuid=True), ForeignKey("tenants.id", ondelete="CASCADE"), nullable=False
     )
     event_id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), nullable=False)
+    # Partition key (daily, migration 0012): the parent event's created_at, so one UTC day holds
+    # a whole event graph and retention drops events, deliveries and attempts together. The
+    # fan-out passes it (a BEFORE ROW trigger cannot fill a partition key: routing comes first).
+    event_created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, primary_key=True
+    )
     endpoint_id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), nullable=False)
     # Copied from the (immutable) event by a BEFORE INSERT trigger (migration 0009), so delivery
     # search can filter on it without a join; whatever a writer passes is overwritten.

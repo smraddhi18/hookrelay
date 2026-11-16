@@ -15,6 +15,7 @@ from sqlalchemy import (
     BigInteger,
     CheckConstraint,
     DateTime,
+    FetchedValue,
     ForeignKey,
     ForeignKeyConstraint,
     Identity,
@@ -43,8 +44,10 @@ class Event(Base):
 
     __tablename__ = "events"
     __table_args__ = (
-        # Target of the composite (tenant_id, event_id) FKs from event_outbox and deliveries.
-        UniqueConstraint("tenant_id", "id", name="uq_events_tenant_id_id"),
+        # Target of the composite (tenant_id, event_id, event_created_at) FKs from event_outbox
+        # and deliveries. Partitioned by created_at (migration 0012), so every unique key of
+        # this table carries it.
+        UniqueConstraint("tenant_id", "id", "created_at", name="uq_events_tenant_id_id"),
         # The event type must be registered for this tenant. NO ACTION (not RESTRICT) so that
         # deleting a tenant, which cascades to both tables, is checked at statement end.
         ForeignKeyConstraint(
@@ -62,14 +65,8 @@ class Event(Base):
         CheckConstraint("payload_size >= 2", name="payload_size_positive"),
         CheckConstraint(f"external_id ~ '{EXTERNAL_ID_PATTERN}'", name="external_id_format"),
         CheckConstraint("retain_until > created_at", name="retain_after_created"),
-        # A client-supplied id is unique per tenant: a retried publish cannot create a twin.
-        Index(
-            "uq_events_tenant_external_id",
-            "tenant_id",
-            "external_id",
-            unique=True,
-            postgresql_where=text("external_id IS NOT NULL"),
-        ),
+        # A client-supplied id is unique per tenant through ``event_external_ids`` (a unique index
+        # here could not span the daily partitions).
         Index("ix_events_tenant_created", "tenant_id", "created_at", "id"),
         Index("ix_events_tenant_type_created", "tenant_id", "event_type", "created_at", "id"),
         # Retention sweeps (and later time partitioning) walk this index.
@@ -100,8 +97,9 @@ class Event(Base):
     occurred_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), server_default=func.now(), nullable=False
     )
+    # Partition key (daily, migration 0012) and so part of the primary key.
     created_at: Mapped[datetime] = mapped_column(
-        DateTime(timezone=True), server_default=func.now(), nullable=False
+        DateTime(timezone=True), server_default=func.now(), nullable=False, primary_key=True
     )
     retain_until: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
     fanned_out_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
@@ -119,8 +117,8 @@ class OutboxEntry(Base):
     __tablename__ = "event_outbox"
     __table_args__ = (
         ForeignKeyConstraint(
-            ["tenant_id", "event_id"],
-            ["events.tenant_id", "events.id"],
+            ["tenant_id", "event_id", "event_created_at"],
+            ["events.tenant_id", "events.id", "events.created_at"],
             ondelete="CASCADE",
             name="fk_event_outbox_event_same_tenant",
         ),
@@ -145,6 +143,11 @@ class OutboxEntry(Base):
     id: Mapped[int] = mapped_column(BigInteger, Identity(always=True), primary_key=True)
     tenant_id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), nullable=False)
     event_id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), nullable=False)
+    # The event's created_at (its partition key). Ingest passes it; a BEFORE INSERT trigger
+    # fills it from the event when a raw writer leaves it NULL.
+    event_created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), FetchedValue(), nullable=False
+    )
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), server_default=func.now(), nullable=False
     )
@@ -157,3 +160,27 @@ class OutboxEntry(Base):
 
     def __repr__(self) -> str:
         return f"OutboxEntry(id={self.id}, event_id={self.event_id!s})"
+
+
+class EventExternalId(Base):
+    """Claim on a tenant's ``external_id`` for the life of its event.
+
+    ``events`` is partitioned by day, so a unique index on ``(tenant_id, external_id)`` cannot
+    live there. This plain table is the global uniqueness guard: written in the ingest
+    transaction, expires with the event (``expires_at`` = ``retain_until``) and is reclaimable
+    by a new event from then on.
+    """
+
+    __tablename__ = "event_external_ids"
+    __table_args__ = (
+        CheckConstraint(f"external_id ~ '{EXTERNAL_ID_PATTERN}'", name="external_id_format"),
+        Index("ix_event_external_ids_expires_at", "expires_at"),
+    )
+
+    tenant_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("tenants.id", ondelete="CASCADE"), primary_key=True
+    )
+    external_id: Mapped[str] = mapped_column(String(MAX_EXTERNAL_ID_LENGTH), primary_key=True)
+    event_id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), nullable=False)
+    event_created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    expires_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)

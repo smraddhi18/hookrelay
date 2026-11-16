@@ -55,8 +55,8 @@ class DeliveryAttempt(Base):
     __tablename__ = "delivery_attempts"
     __table_args__ = (
         ForeignKeyConstraint(
-            ["tenant_id", "delivery_id"],
-            ["deliveries.tenant_id", "deliveries.id"],
+            ["tenant_id", "delivery_id", "event_created_at"],
+            ["deliveries.tenant_id", "deliveries.id", "deliveries.event_created_at"],
             ondelete="CASCADE",
             name="fk_delivery_attempts_delivery_same_tenant",
         ),
@@ -66,10 +66,11 @@ class DeliveryAttempt(Base):
             ondelete="CASCADE",
             name="fk_delivery_attempts_endpoint_same_tenant",
         ),
-        # Per partition (a Postgres rule for partitioned tables): attempt numbers are assigned
-        # under the delivery's lease fence; this is the backstop, see docs/partitioning.md.
+        # Partitioned by the event's day, like every attempt of one delivery: still exact per
+        # delivery (see docs/partitioning.md); attempt numbers are also assigned under the
+        # delivery's lease fence.
         UniqueConstraint(
-            "delivery_id", "attempt_number", "created_at", name="uq_delivery_attempts_number"
+            "delivery_id", "attempt_number", "event_created_at", name="uq_delivery_attempts_number"
         ),
         CheckConstraint(f"outcome IN ({_OUTCOMES})", name="outcome_valid"),
         CheckConstraint("attempt_number >= 1", name="attempt_number_positive"),
@@ -123,6 +124,12 @@ class DeliveryAttempt(Base):
         UUID(as_uuid=True), ForeignKey("tenants.id", ondelete="CASCADE"), nullable=False
     )
     delivery_id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), nullable=False)
+    # Partition key (daily, migration 0012): the delivery's event_created_at, so attempts live
+    # in the partition of their delivery's day and expire with it. The worker passes it (a BEFORE
+    # ROW trigger cannot fill a partition key: routing comes first).
+    event_created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, primary_key=True
+    )
     # Copied from the parent delivery by a BEFORE INSERT trigger (migration 0009).
     endpoint_id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), nullable=False)
     attempt_number: Mapped[int] = mapped_column(Integer, nullable=False)
@@ -143,7 +150,7 @@ class DeliveryAttempt(Base):
     next_attempt_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     # Partition key, so part of the primary key.
     created_at: Mapped[datetime] = mapped_column(
-        DateTime(timezone=True), server_default=func.now(), nullable=False, primary_key=True
+        DateTime(timezone=True), server_default=func.now(), nullable=False
     )
 
     def __repr__(self) -> str:
