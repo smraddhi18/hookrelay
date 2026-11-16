@@ -46,9 +46,12 @@ async def list_attempts(
     limit: int,
 ) -> Page[DeliveryAttempt]:
     """Attempts newest first (keyset on ``(created_at, id)``); 404 for another tenant's id."""
-    await get_delivery(session, tenant_id, delivery_id)
+    delivery = await get_delivery(session, tenant_id, delivery_id)
+    # All of a delivery's attempts live in the partition of its day: one partition is read.
     stmt = select(DeliveryAttempt).where(
-        DeliveryAttempt.tenant_id == tenant_id, DeliveryAttempt.delivery_id == delivery_id
+        DeliveryAttempt.tenant_id == tenant_id,
+        DeliveryAttempt.delivery_id == delivery_id,
+        DeliveryAttempt.event_created_at == delivery.event_created_at,
     )
     return await paginate(
         session,

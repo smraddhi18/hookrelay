@@ -60,6 +60,8 @@ DEFAULT_MAX_IN_FLIGHT: Final = 10
 class Lease:
     delivery_id: uuid.UUID
     token: uuid.UUID
+    # The delivery's partition key: carried so every fenced write touches one daily partition.
+    event_created_at: datetime
 
 
 @dataclass(frozen=True, slots=True)
@@ -71,6 +73,7 @@ class LeasedDelivery:
     event_id: uuid.UUID
     endpoint_id: uuid.UUID
     lease_token: uuid.UUID
+    event_created_at: datetime  # partition key of the delivery (and its event / attempts)
     attempt_number: int
     created_at: datetime
     event_type: str
@@ -91,7 +94,7 @@ class LeasedDelivery:
 
     @property
     def lease(self) -> Lease:
-        return Lease(self.id, self.lease_token)
+        return Lease(self.id, self.lease_token, self.event_created_at)
 
     @property
     def run_attempt(self) -> int:
@@ -209,10 +212,10 @@ _ELIGIBLE_SQL_REDIS_RL = text(
 _LEASE_SQL = text(
     """
     WITH due AS (
-        SELECT picked.id
+        SELECT picked.id, picked.event_created_at
         FROM unnest(CAST(:endpoint_ids AS uuid[]), CAST(:quotas AS int[])) AS a(endpoint_id, quota)
         CROSS JOIN LATERAL (
-            SELECT d.id FROM deliveries AS d
+            SELECT d.id, d.event_created_at FROM deliveries AS d
             WHERE d.endpoint_id = a.endpoint_id AND d.status = 'pending'
               AND d.next_attempt_at <= now()
             ORDER BY d.next_attempt_at, d.id
@@ -228,11 +231,11 @@ _LEASE_SQL = text(
         attempt_count = d.attempt_count + 1,
         last_attempt_at = now()
     FROM due, events AS ev, endpoints AS e
-    WHERE d.id = due.id
-      AND ev.tenant_id = d.tenant_id AND ev.id = d.event_id
+    WHERE d.id = due.id AND d.event_created_at = due.event_created_at
+      AND ev.tenant_id = d.tenant_id AND ev.id = d.event_id AND ev.created_at = d.event_created_at
       AND e.tenant_id = d.tenant_id AND e.id = d.endpoint_id
     RETURNING d.id, d.tenant_id, d.event_id, d.endpoint_id, d.lease_token, d.attempt_count,
-              d.created_at, d.attempt_offset, d.run_started_at,
+              d.event_created_at, d.created_at, d.attempt_offset, d.run_started_at,
               ev.event_type, ev.payload, ev.occurred_at, ev.traceparent, ev.tracestate,
               e.url, e.headers, e.timeout_ms, e.secret_ciphertext,
               CASE WHEN e.previous_secret_expires_at > now()
@@ -311,9 +314,10 @@ def allocate(slots: Sequence[EndpointSlot], free: int) -> dict[uuid.UUID, int]:
 _RENEW_SQL = text(
     """
     WITH mine AS (
-        SELECT d.id FROM deliveries AS d
-        JOIN unnest(CAST(:ids AS uuid[]), CAST(:tokens AS uuid[])) AS l(id, token)
-          ON d.id = l.id AND d.lease_token = l.token
+        SELECT d.id, d.event_created_at FROM deliveries AS d
+        JOIN unnest(CAST(:ids AS uuid[]), CAST(:tokens AS uuid[]), CAST(:created AS timestamptz[]))
+          AS l(id, token, event_created_at)
+          ON d.id = l.id AND d.event_created_at = l.event_created_at AND d.lease_token = l.token
         WHERE d.status = 'delivering'
         ORDER BY d.id
         FOR UPDATE OF d
@@ -321,7 +325,7 @@ _RENEW_SQL = text(
     UPDATE deliveries AS d
     SET leased_until = now() + make_interval(secs => :lease_s)
     FROM mine
-    WHERE d.id = mine.id
+    WHERE d.id = mine.id AND d.event_created_at = mine.event_created_at
     RETURNING d.id
     """
 )
@@ -335,7 +339,8 @@ _COMPLETE_SQL = text(
         completed_at = CASE WHEN :terminal THEN now() END,
         last_status_code = :status_code,
         last_error_class = :error_class
-    WHERE id = :id AND lease_token = :token AND status = 'delivering'
+    WHERE id = :id AND event_created_at = :event_created_at
+      AND lease_token = :token AND status = 'delivering'
     RETURNING attempt_count
     """
 )
@@ -348,11 +353,14 @@ _COMPLETE_MANY_SQL = text(
         SELECT * FROM unnest(
             CAST(:ids AS uuid[]), CAST(:tokens AS uuid[]), CAST(:statuses AS text[]),
             CAST(:next_attempts AS timestamptz[]), CAST(:terminals AS boolean[]),
-            CAST(:status_codes AS int[]), CAST(:error_classes AS text[])
-        ) AS c(id, token, status, next_attempt_at, terminal, status_code, error_class)
+            CAST(:status_codes AS int[]), CAST(:error_classes AS text[]),
+            CAST(:created AS timestamptz[])
+        ) AS c(id, token, status, next_attempt_at, terminal, status_code, error_class,
+               event_created_at)
     ), mine AS (
-        SELECT d.id, d.lease_token AS token FROM deliveries AS d
-        JOIN c ON d.id = c.id AND d.lease_token = c.token
+        SELECT d.id, d.event_created_at, d.lease_token AS token FROM deliveries AS d
+        JOIN c ON d.id = c.id AND d.event_created_at = c.event_created_at
+              AND d.lease_token = c.token
         WHERE d.status = 'delivering'
         ORDER BY d.id
         FOR UPDATE OF d
@@ -365,7 +373,7 @@ _COMPLETE_MANY_SQL = text(
         last_status_code = c.status_code,
         last_error_class = c.error_class
     FROM mine JOIN c ON c.id = mine.id AND c.token = mine.token
-    WHERE d.id = mine.id
+    WHERE d.id = mine.id AND d.event_created_at = mine.event_created_at
     RETURNING d.id, c.token
     """
 )
@@ -377,16 +385,18 @@ _RELEASE_SQL = text(
         lease_token = NULL, leased_until = NULL, leased_by = NULL,
         attempt_count = d.attempt_count - 1,
         next_attempt_at = now()
-    FROM unnest(CAST(:ids AS uuid[]), CAST(:tokens AS uuid[])) AS l(id, token)
-    WHERE d.id = l.id AND d.lease_token = l.token AND d.status = 'delivering'
+    FROM unnest(CAST(:ids AS uuid[]), CAST(:tokens AS uuid[]), CAST(:created AS timestamptz[]))
+         AS l(id, token, event_created_at)
+    WHERE d.id = l.id AND d.event_created_at = l.event_created_at
+      AND d.lease_token = l.token AND d.status = 'delivering'
     RETURNING d.id
     """
 )
 
 _EXPIRED_SQL = text(
     """
-    SELECT d.id, d.tenant_id, d.endpoint_id, d.attempt_count, d.attempt_offset, d.run_started_at,
-           d.leased_by, d.last_attempt_at, e.url, now() AS now
+    SELECT d.id, d.event_created_at, d.tenant_id, d.endpoint_id, d.attempt_count,
+           d.attempt_offset, d.run_started_at, d.leased_by, d.last_attempt_at, e.url, now() AS now
     FROM deliveries AS d
     JOIN endpoints AS e ON e.tenant_id = d.tenant_id AND e.id = d.endpoint_id
     WHERE d.status = 'delivering' AND d.leased_until < now()
@@ -494,6 +504,7 @@ async def lease_due(
             event_id=r.event_id,
             endpoint_id=r.endpoint_id,
             lease_token=r.lease_token,
+            event_created_at=r.event_created_at,
             attempt_number=r.attempt_count,
             created_at=r.created_at,
             event_type=r.event_type,
@@ -527,8 +538,12 @@ async def lease_due(
     return leased
 
 
-def _lease_arrays(leases: Sequence[Lease]) -> dict[str, list[uuid.UUID]]:
-    return {"ids": [lease.delivery_id for lease in leases], "tokens": [x.token for x in leases]}
+def _lease_arrays(leases: Sequence[Lease]) -> dict[str, list[Any]]:
+    return {
+        "ids": [lease.delivery_id for lease in leases],
+        "tokens": [x.token for x in leases],
+        "created": [x.event_created_at for x in leases],
+    }
 
 
 async def renew_leases(
@@ -616,6 +631,7 @@ async def complete(
             "status_code": record.status_code,
             "error_class": None if error_class is None else error_class.value,
             "id": delivery.id,
+            "event_created_at": delivery.event_created_at,
             "token": delivery.lease_token,
         },
     )
@@ -653,6 +669,7 @@ def _attempt_row(
     return DeliveryAttempt(
         tenant_id=delivery.tenant_id,
         delivery_id=delivery.id,
+        event_created_at=delivery.event_created_at,
         endpoint_id=delivery.endpoint_id,
         attempt_number=delivery.attempt_number,
         outcome=completion.outcome.value,
@@ -757,6 +774,7 @@ async def complete_many(
         {
             "ids": [item.delivery.id for item in items],
             "tokens": [item.delivery.lease_token for item in items],
+            "created": [item.delivery.event_created_at for item in items],
             "statuses": [completion.status.value for completion, _ in plans],
             "next_attempts": [completion.next_attempt_at for completion, _ in plans],
             "terminals": [completion.status.is_terminal for completion, _ in plans],
@@ -828,7 +846,7 @@ async def reclaim_expired(
                     completed_at = CASE WHEN :terminal THEN now() END,
                     last_status_code = NULL,
                     last_error_class = :error_class
-                WHERE id = :id
+                WHERE id = :id AND event_created_at = :event_created_at
                 """
             ),
             {
@@ -837,6 +855,7 @@ async def reclaim_expired(
                 "terminal": status.is_terminal,
                 "error_class": error_class.value,
                 "id": r.id,
+                "event_created_at": r.event_created_at,
             },
         )
         started = r.last_attempt_at or r.now
@@ -844,6 +863,7 @@ async def reclaim_expired(
             DeliveryAttempt(
                 tenant_id=r.tenant_id,
                 delivery_id=r.id,
+                event_created_at=r.event_created_at,
                 endpoint_id=r.endpoint_id,
                 attempt_number=r.attempt_count,
                 outcome=(
