@@ -150,7 +150,7 @@ async def test_a_lost_lease_in_the_middle_of_a_batch_skips_only_that_row(
             "SELECT d.id, d.status, d.lease_token, d.attempt_count, d.last_status_code, "
             "d.last_error_class, d.completed_at, count(a.id) AS attempts "
             "FROM deliveries d LEFT JOIN delivery_attempts a ON a.delivery_id = d.id "
-            "GROUP BY d.id",
+            "GROUP BY d.id, d.event_created_at",
         )
     }
     fenced = rows[leased[2].id]
@@ -201,7 +201,7 @@ async def test_a_stale_token_and_a_duplicate_of_the_same_delivery_complete_it_ex
     rows = await query(
         db_url,
         "SELECT d.id, d.status, d.last_status_code, count(a.id) AS attempts "
-        "FROM deliveries d LEFT JOIN delivery_attempts a ON a.delivery_id = d.id GROUP BY d.id",
+        "FROM deliveries d LEFT JOIN delivery_attempts a ON a.delivery_id = d.id GROUP BY d.id, d.event_created_at",
     )
     by_id = {r["id"]: r for r in rows}
     assert by_id[current.id]["attempts"] == by_id[other.id]["attempts"] == 1
@@ -444,7 +444,7 @@ async def test_drain_writes_finished_attempts_instead_of_releasing_them(
         db_url,
         "SELECT d.endpoint_id, d.status, d.attempt_count, count(a.id) AS attempts "
         "FROM deliveries d LEFT JOIN delivery_attempts a ON a.delivery_id = d.id "
-        "GROUP BY d.id",
+        "GROUP BY d.id, d.event_created_at",
     )
     by_endpoint: dict[str, Counter[tuple[str, int, int]]] = {}
     for r in rows:

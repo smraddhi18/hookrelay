@@ -5,6 +5,7 @@ keyset pagination, tenant isolation, validation, index use) and the endpoint hea
 
 from __future__ import annotations
 
+import re
 import uuid
 from datetime import UTC, datetime, timedelta
 from typing import Any
@@ -276,7 +277,9 @@ async def test_search_queries_use_the_new_indexes(
         ):
             plan = "\n".join(r[0] for r in await conn.fetch(f"EXPLAIN {sql}", *args))
             assert "Index" in plan, plan
-            assert "Sort" not in plan, plan
+            # M9d: a Merge Append over the per-day index scans prints "Sort Key"; what must not
+            # appear is a Sort *node* (that would be a sort of the whole result).
+            assert not re.search(r"(^|->\s+)Sort\s", plan, re.MULTILINE), plan
     finally:
         await conn.close()
 
@@ -296,9 +299,9 @@ async def _insert_attempts(
     conn = await asyncpg.connect(_asyncpg_dsn(db_url))
     try:
         await conn.executemany(
-            "INSERT INTO delivery_attempts (tenant_id, delivery_id, attempt_number, outcome, "
+            "INSERT INTO delivery_attempts (tenant_id, delivery_id, event_created_at, attempt_number, outcome, "
             "status_code, latency_ms, error_class, error_message, request_url, worker_id, "
-            "started_at, finished_at, created_at) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, "
+            "started_at, finished_at, created_at) VALUES ($1, $2, COALESCE((SELECT event_created_at FROM deliveries WHERE id = $2), now()), $3, $4, $5, $6, $7, $8, "
             "'http://x.test/', 'w', now() - make_interval(secs => $9), "
             "now() - make_interval(secs => $9), now() - make_interval(secs => $9))",
             [

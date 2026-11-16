@@ -283,6 +283,59 @@ async def test_external_id_is_unique_per_tenant(
         assert response.status_code == 422, bad
 
 
+async def test_external_id_claim_is_recorded_and_reclaimable_after_expiry(
+    client: httpx.AsyncClient, typed_tenant: TenantCtx, migrated_database_url: str
+) -> None:
+    tenant = uuid.UUID(typed_tenant.id)
+    first = await publish(client, typed_tenant, "invoice.paid", external_id="reuse-me")
+    assert first.status_code == 202
+    claim = await _count(
+        migrated_database_url,
+        "SELECT count(*) FROM event_external_ids x JOIN events e "
+        "ON e.id = x.event_id AND e.created_at = x.event_created_at "
+        "WHERE x.tenant_id = $1 AND x.external_id = 'reuse-me' AND x.expires_at = e.retain_until",
+        tenant,
+    )
+    assert claim == 1
+    # While the claim is live, the id stays taken (and the loser leaves no claim row either).
+    assert (
+        await publish(client, typed_tenant, "invoice.paid", external_id="reuse-me")
+    ).status_code == 409
+    assert (
+        await _count(
+            migrated_database_url,
+            "SELECT count(*) FROM event_external_ids WHERE tenant_id = $1",
+            tenant,
+        )
+        == 1
+    )
+
+    # Once its event is past retention the id is reusable, even though the old event row may
+    # still be waiting for its partition drop.
+    conn = await asyncpg.connect(_asyncpg_dsn(migrated_database_url))
+    try:
+        await conn.execute("UPDATE event_external_ids SET expires_at = now() - interval '1 second'")
+    finally:
+        await conn.close()
+    second = await publish(client, typed_tenant, "invoice.paid", {"n": 2}, external_id="reuse-me")
+    assert second.status_code == 202
+    assert second.json()["id"] != first.json()["id"]
+    holder = await _count(
+        migrated_database_url,
+        "SELECT count(*) FROM event_external_ids WHERE event_id = $1",
+        uuid.UUID(second.json()["id"]),
+    )
+    assert holder == 1
+    assert (
+        await _count(
+            migrated_database_url,
+            "SELECT count(*) FROM event_external_ids WHERE tenant_id = $1",
+            tenant,
+        )
+        == 1
+    )
+
+
 async def test_failure_after_insert_rolls_back_event_outbox_and_key(
     migrated_database_url: str, monkeypatch: pytest.MonkeyPatch
 ) -> None:

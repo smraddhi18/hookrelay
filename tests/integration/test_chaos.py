@@ -244,7 +244,7 @@ async def assert_at_least_once(db_url: str, receiver: MockReceiver) -> Semantics
         FROM deliveries d
         JOIN endpoints e ON e.id = d.endpoint_id
         LEFT JOIN delivery_attempts a ON a.delivery_id = d.id
-        GROUP BY d.id, e.url
+        GROUP BY d.id, d.event_created_at, e.url
         """,
     )
     assert rows, "no deliveries were fanned out"
