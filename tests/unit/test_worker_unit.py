@@ -60,6 +60,7 @@ def _delivery(**overrides: Any) -> LeasedDelivery:
         "event_id": uuid.uuid4(),
         "endpoint_id": endpoint_id,
         "lease_token": uuid.uuid4(),
+        "event_created_at": datetime.now(UTC),
         "attempt_number": 1,
         "created_at": datetime.now(UTC),
         "event_type": "invoice.paid",

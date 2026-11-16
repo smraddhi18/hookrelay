@@ -171,7 +171,7 @@ def _runner(
         list(secrets or []),
     )
 
-    async def purge_events(_s: object, *, batch_size: int) -> int:
+    async def purge_events(_s: object, *, batch_size: int, grace_s: int = 0) -> int:
         return events_left.pop(0) if events_left else 0
 
     async def purge_payloads(

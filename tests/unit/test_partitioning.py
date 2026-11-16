@@ -9,10 +9,14 @@ from pydantic import ValidationError
 
 from hookrelay import partitions as partitions_cli
 from hookrelay.db.partitioning import (
+    DELIVERIES,
     DELIVERY_ATTEMPTS,
+    EVENTS,
+    PARTITIONED_TABLES,
     RangeBound,
     day_bounds,
     include_name,
+    include_object,
     parse_range_bound,
     utc_day,
 )
@@ -202,3 +206,94 @@ def test_cli_rejects_unknown_flags(capsys: pytest.CaptureFixture[str]) -> None:
     with pytest.raises(SystemExit):
         partitions_cli.main(["--nope"])
     assert "--dry-run" in capsys.readouterr().err
+
+
+def test_the_event_graph_tables_and_their_keys() -> None:
+    assert PARTITIONED_TABLES == (EVENTS, DELIVERIES, DELIVERY_ATTEMPTS)  # parents first
+    assert [t.key for t in PARTITIONED_TABLES] == [
+        "created_at",
+        "event_created_at",
+        "event_created_at",
+    ]
+    assert EVENTS.partition_name(date(2026, 11, 15)) == "events_p20261115"
+    assert DELIVERIES.default_partition == "deliveries_default"
+    # Only the leaf table may have rows moved out of DEFAULT (no FK references it).
+    assert [t.movable for t in PARTITIONED_TABLES] == [False, False, True]
+    assert EVENTS.day_of("deliveries_p20261115") is None
+    assert not include_name("events_p20261115", "table", {})
+    assert not include_name("deliveries_default", "table", {})
+    assert include_name("event_external_ids", "table", {})
+
+
+class _Obj:
+    def __init__(self, referred: str | None) -> None:
+        self.referred_table = None if referred is None else type("T", (), {"name": referred})()
+
+
+def test_include_object_hides_cloned_foreign_keys_to_partitions_only() -> None:
+    fk = "foreign_key_constraint"
+    assert not include_object(_Obj("events_p20261115"), None, fk, True, None)
+    assert not include_object(_Obj("deliveries_default"), None, fk, True, None)
+    assert include_object(_Obj("events"), None, fk, True, None)  # the real FK to the parent
+    assert include_object(_Obj("tenants"), None, fk, True, None)
+    assert include_object(_Obj("events_p20261115"), None, fk, False, None)  # model side
+    assert include_object(_Obj(None), None, fk, True, None)
+    assert include_object(object(), "ix_x", "index", True, None)
+
+
+def test_plan_never_moves_parent_table_rows_out_of_default() -> None:
+    today = NOW.date()
+    stuck = today + timedelta(days=2)
+    parts = [EVENTS.partition_name(today + timedelta(days=k)) for k in (0, 1, 3)]
+    partitions = [
+        Partition(name, RangeBound(*day_bounds(today + timedelta(days=k))))
+        for name, k in zip(parts, (0, 1, 3), strict=True)
+    ]
+    plan = plan_maintenance(
+        table=EVENTS,
+        partitions=partitions,
+        now=NOW,
+        policy=_policy(),
+        default_days=[stuck, today + timedelta(days=9)],
+        orphans=[],
+    )
+    # today+2 is inside the premake horizon but its rows sit in DEFAULT: reported, not created.
+    assert plan.blocked == [stuck]
+    assert plan.create == []
+    # A leaf table creates that day and moves the rows instead.
+    leaf = plan_maintenance(
+        table=DELIVERY_ATTEMPTS,
+        partitions=[_daily(today + timedelta(days=k)) for k in (0, 1, 3)],
+        now=NOW,
+        policy=_policy(),
+        default_days=[stuck],
+        orphans=[],
+    )
+    assert leaf.blocked == []
+    assert leaf.create == [stuck]
+
+
+def test_report_logs_blocked_days() -> None:
+    report = PartitionReport(table="events", blocked_days=["2026-11-20"], blocked=["events_p1"])
+    log = report.as_log()
+    assert log["blocked_days"] == ["2026-11-20"]
+    assert log["blocked"] == ["events_p1"]
+
+
+def test_safety_net_and_retention_settings_are_bounded() -> None:
+    settings = make_settings()
+    assert settings.retention_event_purge_grace_s == 2 * 86_400
+    assert settings.relay_partition_check_interval_s == 300
+    assert settings.relay_partition_min_days_ahead == 2
+    assert make_settings(relay_partition_check_interval_s=0).relay_partition_check_interval_s == 0
+    assert make_settings(retention_event_purge_grace_s=0).retention_event_purge_grace_s == 0
+    for bad in (
+        {"retention_event_purge_grace_s": -1},
+        {"retention_event_purge_grace_s": 31 * 86_400},
+        {"relay_partition_check_interval_s": -1},
+        {"relay_partition_check_interval_s": 86_401},
+        {"relay_partition_min_days_ahead": 0},
+        {"relay_partition_min_days_ahead": 31},
+    ):
+        with pytest.raises(ValidationError):
+            make_settings(**bad)

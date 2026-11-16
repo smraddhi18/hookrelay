@@ -193,6 +193,7 @@ def test_run_attempt_counts_from_the_last_replay() -> None:
         event_id=uuid.uuid4(),
         endpoint_id=uuid.uuid4(),
         lease_token=uuid.uuid4(),
+        event_created_at=NOW,
         attempt_number=5,
         created_at=NOW,
         event_type="invoice.paid",
