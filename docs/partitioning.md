@@ -1,152 +1,220 @@
-# Partitioning `delivery_attempts`
+# Partitioning the event graph
 
-Milestone 9c. `delivery_attempts` gets one row per HTTP attempt, so it is the fastest-growing
-table and the only one whose expiry used to be row by row: when an event expired, the
-retention job's `DELETE` on `events` cascaded through `deliveries` into every attempt. Since
-migration `0011` the table is natively range-partitioned by `created_at`, one partition per UTC
-day. Expired days are detached and dropped as whole tables, so their space goes back to the OS
-at once instead of becoming dead tuples for autovacuum. Time-windowed reads also prune to the
-days they need. Read [the limitation](#limitation-the-event-cascade-still-runs-first) before
-assuming this removes all delete work: it does not yet.
+Milestones 9c and 9d. Three tables grow with traffic: `events` (one row per published event),
+`deliveries` (one per event and subscribed endpoint) and `delivery_attempts` (one per HTTP
+attempt). Until 9c their expiry was row by row: the retention job's `DELETE` on `events`
+cascaded through `deliveries` into every attempt. Since migration `0012` all three are natively
+range-partitioned by **the event's UTC day**, so one day of the graph is one set of partitions
+and expiry is `DETACH` + `DROP` of those partitions, children first. Space returns to the OS at
+once instead of becoming dead tuples for autovacuum.
 
-`deliveries` and `events` are still unpartitioned. They are mutable (leases, retries, status) and
-their keys are referenced by other tables, so they need a separate design. See
-[What is left](#what-is-left).
-
-## Layout
+## The design in one picture
 
 ```
-delivery_attempts                  PARTITION BY RANGE (created_at)
-├── delivery_attempts_p20261114    FOR VALUES FROM ('2026-11-14 00:00+00') TO ('2026-11-15 00:00+00')
-├── delivery_attempts_p20261115    … one per UTC day, PARTITION_PREMAKE_DAYS (7) ahead
-├── …
-└── delivery_attempts_default      DEFAULT: should stay empty (alerted on)
+events                  PARTITION BY RANGE (created_at)
+deliveries              PARTITION BY RANGE (event_created_at)    event_created_at = the event's created_at
+delivery_attempts       PARTITION BY RANGE (event_created_at)    event_created_at = the delivery's
+
+events_p20261115        ┐
+deliveries_p20261115    ├─ day D of the graph: events of D, their deliveries, their attempts
+delivery_attempts_p20261115 ┘   (an attempt made on D + 3 for an event of D still lives here)
+… PARTITION_PREMAKE_DAYS (7) ahead, plus a DEFAULT per table that should stay empty
 ```
 
-- Names are `<table>_pYYYYMMDD` (`hookrelay.db.partitioning`). The bounds are UTC midnights,
-  whatever the server's `TimeZone` setting is, and the maintenance job connects with
-  `TimeZone=UTC`.
-- The DEFAULT partition is a safety net: if the job stops, inserts still succeed instead of
-  failing with "no partition of relation found for row". The job moves those rows into proper
-  partitions when it catches up (see below), and `hookrelay_partition_default_rows` exposes them.
-- Alembic only sees the parent: `include_name` in `alembic/env.py` skips partitions, so
-  `alembic check` stays clean. The model declares `postgresql_partition_by`.
+Why the *event's* day for all three, and not each table's own `created_at`:
 
-## Keys and constraints (the trade-off)
+- A day is a connected component of the FK graph (`events` ← `deliveries` ← `attempts`), so
+  dropping the day's three partitions leaves nothing dangling and nothing to cascade.
+- With 9c's key (the attempt's own `created_at`) an event created on day D expires during day
+  D + N but its attempts' partitions of D .. D + N only become droppable later, so the cascade
+  still deleted most attempt rows first. Keyed by the event's day, the same run drops them all.
+- Retention is global (`retain_until = created_at + EVENT_RETENTION_DAYS`), so "the event's day
+  is past the cutoff" is exactly "every row of that day is expired".
 
-Postgres requires every primary key and unique constraint on a partitioned table to include the
-partition key:
+### Keys and constraints (the trade-off)
 
-| 0010 (unpartitioned) | 0011 (partitioned) |
-|---|---|
-| `PRIMARY KEY (id)` | `PRIMARY KEY (id, created_at)` |
-| `UNIQUE (delivery_id, attempt_number)` | `UNIQUE (delivery_id, attempt_number, created_at)` |
+Postgres needs every primary key and unique constraint of a partitioned table to contain the
+partition key, and an FK that targets one needs the key in the referenced columns:
 
-- `id` is still a random UUID from `gen_random_uuid()`. In practice it is unique; the database
-  just no longer proves that across days. Nothing references `delivery_attempts.id` by foreign
-  key.
-- The attempt-number constraint is now a backstop *within one partition*. Attempt numbers are
-  assigned under the delivery's lease fence: `attempt_count` is incremented when the lease is
-  taken, and the attempt row is written only by the transition that ends that lease (completion
-  or the reaper), fenced by `lease_token`. A worker whose lease was reclaimed writes nothing, so
-  it cannot land a second attempt with the same number on any day.
-  `test_attempt_numbers_are_unique_per_partition_only` pins down the weaker guarantee (rejected
-  within a day, accepted across days), so nobody relies on the old one by accident.
-- Unique-violation errors name the partition's index (for example
-  `delivery_attempts_p20261114_delivery_id_attempt_number_crea_key`), not
-  `uq_delivery_attempts_number`. The application never maps that constraint name to a response.
-- Outgoing FKs (to `deliveries`, `endpoints` and `tenants`, including the same-tenant composite
-  FKs) are declared on the parent. Postgres clones them onto every partition, as it does indexes
-  and the endpoint trigger. `ON DELETE CASCADE` from `deliveries` still works.
+| table | 0011 | 0012 |
+|---|---|---|
+| `events` | `PRIMARY KEY (id)`, unique `(tenant_id, id)`, unique `(tenant_id, external_id)` | `PRIMARY KEY (id, created_at)`, unique `(tenant_id, id, created_at)`, **external ids moved** (below) |
+| `deliveries` | `PRIMARY KEY (id)`, unique `(event_id, endpoint_id)` | `PRIMARY KEY (id, event_created_at)`, unique `(event_id, endpoint_id, event_created_at)`, unique `(tenant_id, id, event_created_at)` |
+| `delivery_attempts` | `PRIMARY KEY (id, created_at)`, unique `(delivery_id, attempt_number, created_at)` | `PRIMARY KEY (id, event_created_at)`, unique `(delivery_id, attempt_number, event_created_at)` |
+| `event_outbox` | FK `(tenant_id, event_id)` | plain table, new `event_created_at`, FK `(tenant_id, event_id, event_created_at)` |
 
-## Reads
+- Ids are still random UUIDs from `gen_random_uuid()`: unique in practice, no longer proven
+  across days by the database. Nothing references them without the key.
+- The per-event invariants stay *exact*, not weakened: "one delivery per (event, endpoint)" and
+  "attempt number unique per delivery" are scoped to one event, and an event, its deliveries and
+  its attempts share one day by construction, so the wider keys cover precisely the same rows
+  (`test_attempt_numbers_are_unique_per_delivery` shows a retry made days later is still
+  rejected). 9c's weaker "unique per partition only" caveat is gone.
+- **`external_id` uniqueness moved to `event_external_ids`**, a small plain table
+  (`PRIMARY KEY (tenant_id, external_id)`, `event_id`, `event_created_at`, `expires_at` = the
+  event's `retain_until`). It is claimed in the ingest transaction with
+  `INSERT … ON CONFLICT DO UPDATE … WHERE expires_at <= now()`: a live claim makes the publish a
+  `409 event_exists` (same body as before), an expired one is taken over, exactly as the old
+  unique index let a purged event's id be reused, but now it holds even while the old event row
+  is still waiting for its partition drop. The relay's housekeeping deletes expired claims.
+- **`idempotency_keys` lost its FK to `events`.** It would need the key too, and it only
+  cascaded cleanup. A record is self-contained and expires by its own `expires_at` (the sweep
+  already existed). The replayed response is stored, so it never needed the event row.
+- **Writers pass the key.** A `BEFORE ROW` trigger cannot fill a partition key (the row is routed
+  first: "moving row to another partition during a BEFORE FOR EACH ROW trigger is not
+  supported"), so `deliveries` and `delivery_attempts` inserts carry `event_created_at`, which
+  the lease carries from the delivery row to every fenced write (`Lease`, `LeasedDelivery`). A
+  wrong value is rejected by the composite FK (`test_the_partition_key_cannot_be_wrong_or_missing`),
+  and the existing `BEFORE INSERT` triggers that derive `event_type` / `endpoint_id` now look the
+  parent up by primary key, so they hit one partition. `event_outbox` is not partitioned, so its
+  trigger can still fill `event_created_at` when left NULL.
+- Unique-violation errors name the partition's index (`deliveries_p20261115_event_id_endpoint_…`),
+  not `uq_deliveries_event_endpoint`. The application never maps those names to responses.
+- `alembic check`: Postgres clones an FK that targets a partitioned table onto the referencing
+  table once per referenced partition, which reflection reports as extra FKs. `include_object`
+  in `hookrelay.db.partitioning` hides those clones and `include_name` hides the partitions.
+
+## Reads: what prunes and what does not
 
 | Query | Pruning |
 |---|---|
-| Endpoint health, dashboard and attempt listings bounded by `created_at` | plan-time pruning for literal bounds; run-time pruning (`Subplans Removed`) for `now() - interval` |
-| Attempts of one delivery (`WHERE delivery_id = …`) | none: one index probe per partition |
-| Cascade from an expiring delivery | one index probe per partition |
+| Hot paths: lease, complete, renew, release, reaper, fan-out, mark-processed, per-event delivery list | keyed by `(id, event_created_at)` or `event_created_at = …`: one partition |
+| `GET /v1/events/{id}` and `GET /v1/deliveries/{id}` (id only) | one index probe per partition (~39 with 30 days of retention + 7 premade + DEFAULT) |
+| Delivery log search / keyset pagination (`created_at` windows) | no pruning on deliveries' own `created_at` (the key is the event day); the `(tenant_id, status, created_at, id)` etc. indexes are per partition and the planner uses a Merge Append: no Sort node, still an index scan |
+| Endpoint health / dashboard windows on `delivery_attempts.created_at` | **lost**: attempts are keyed by the event day and a replay creates attempts under an old day, so a `created_at` window cannot bound `event_created_at`; one index probe per partition |
+| Day windows on the key (`event_created_at >= …`) | plan-time pruning for literals, run-time pruning (`Subplans Removed`) for `now() - interval` |
 
-The per-delivery probe costs about one index lookup per partition. With 30 days of retention plus
-7 premade days that is around 38 small probes, which is acceptable for an API read of one
-delivery. If it ever matters, the fix is to carry the delivery's `created_at` into those queries,
-since an attempt is never older than its delivery. The integration tests check both behaviours
-with `EXPLAIN`.
+### Measured cost of those trade-offs
+
+`loadtest/partition_bench.py`, run on the build box (Postgres 16.16, one machine, shared with
+everything else, defaults for the rest; medians of 25 `EXPLAIN ANALYZE` runs, no extrapolation).
+Data: 31 UTC days × 15,000 events, one delivery each, two attempts each (465k events, 465k
+deliveries, 930k attempts), 39 partitions per table, 50 endpoints. The 0011-style rows below are
+the same attempts partitioned by their own `created_at`; "plain" is the same deliveries in an
+unpartitioned table with the same index.
+
+| Query | 0012 layout | comparison | |
+|---|---|---|---|
+| endpoint health, last 1 h | plan 1.76 ms, exec 0.26 ms | 0011-style: plan 0.48 ms, exec 0.11 ms | +1.3 ms plan, +0.15 ms exec |
+| endpoint health, last 24 h | plan 1.76 ms, exec 0.91 ms | 0011-style: plan 0.52 ms, exec 0.75 ms | +1.2 ms plan, +0.16 ms exec |
+| lease candidate pick, 50 endpoints × 20 | plan 2.63 ms, exec 4.21 ms | plain table: plan 0.03 ms, exec 0.32 ms | **+3.9 ms exec**, about 13× |
+| delivery by `(id, event_created_at)` | plan 0.07 ms, exec 0.005 ms | | one partition |
+| delivery by `id` only | plan 1.95 ms, exec 0.14 ms | | probes 39 partitions |
+
+The window reads cost about a millisecond more to plan and a fraction of a millisecond more to
+run: the attempt-window pruning loss is real but small at this size. The **lease pick is the
+cost to watch**: every lease cycle probes the partial `endpoint_due` index of each partition for
+each endpoint with capacity (about 2,000 empty probes here, 4.2 ms against 0.3 ms). It is one
+statement per lease cycle, not per delivery, and old partitions are nearly always empty, but it
+is a fixed tax per cycle that grows with `EVENT_RETENTION_DAYS`. Ways to shrink it when it
+matters, none done yet: bound the pick by the oldest day that can still hold due work (unsafe
+today, because a replay re-queues old deliveries), or keep due work in a small plain table.
+
+### Retention cost
+
+Same data, retiring the oldest day (14,999 events, 14,999 deliveries, 29,998 attempts), child
+first, one connection:
+
+| table | `DETACH` | `DROP` |
+|---|---|---|
+| `delivery_attempts` | 10.9 ms | 9.7 ms |
+| `deliveries` | 278.5 ms | 9.0 ms |
+| `events` | 113.6 ms | 3.5 ms |
+
+For comparison the row-by-row `DELETE` of one day of events (cascading into the same deliveries
+and attempts, the 0011 retention path) took 1,704 ms here, **before** autovacuum has to reclaim
+those tuples. At 300 events per day the same three detaches took 8.9 / 15.9 / 9.4 ms, so
+the two parent detaches scale with the data: **`DETACH` of a partition that other partitions
+reference scans the referencing side to prove no row still points at it, while it holds
+`ACCESS EXCLUSIVE` on the parent** (inserts and leases on that table queue behind it).
+`lock_timeout` only bounds the wait to *get* the lock, not the time the check then runs. At
+this size that is a third of a second once a day per table; at a hundred times the volume it
+would be tens of seconds, so schedule the job off-peak and re-measure at your volume (the
+script takes `N_PER_DAY`). Without a DEFAULT partition the job detaches `CONCURRENTLY`
+(verified for all three tables, see below), which does not hold `ACCESS EXCLUSIVE` for the
+check; the cost of that mode at volume has not been measured here.
+
+## Retention: the order, and why Postgres enforces it
+
+`PARTITION_RETENTION_DAYS` (0 = follow `EVENT_RETENTION_DAYS`, validated at least that) defines
+the cutoff, UTC midnight of today minus N. A day is droppable when its partition's upper bound
+is at or before it. `hookrelay-partitions` retires **children first**, premakes **parents
+first**:
+
+1. `delivery_attempts` day D: `DETACH`, `DROP`.
+2. `deliveries` day D: `DETACH` (Postgres checks that no attempt still references it), `DROP`.
+3. `events` day D: same, against deliveries and the outbox.
+
+Postgres itself refuses the wrong order: detaching a referenced partition fails with "removing
+partition violates foreign key constraint" while referencing rows exist, and it works once the
+child is gone (verified on 16; `test_a_parent_partition_is_never_dropped_while_children_reference_it`).
+So if a child drop is deferred (lock timeout) the parent is reported `blocked`, keeps every row,
+and the next run takes the whole day. Nothing is ever orphaned or half-deleted.
+
+The row-level event purge (`hookrelay-retention`, relay housekeeping) is now a **backstop**: it
+deletes events only `RETENTION_EVENT_PURGE_GRACE_S` (default 2 days) after their
+`retain_until`, by `(id, created_at)`, so a healthy partition job always gets there first and
+the cascade finds nothing. `0` purges as soon as an event expires (no partition job).
 
 ## Maintenance job: `hookrelay-partitions`
 
 `python -m hookrelay.partitions [--dry-run]` runs as an hourly CronJob in Helm (`partitions.*`
-values, `concurrencyPolicy: Forbid`, schedule `7 * * * *`) and as the `partitions` service in
-compose (`--profile ops`). Every step is idempotent, so a crashed run, a re-run or an overlapping
-run is harmless.
+values, `concurrencyPolicy: Forbid`, `7 * * * *`) and as the `partitions` compose service
+(`--profile ops`). It maintains all three tables in the order above; every step is idempotent,
+so a crashed, repeated or overlapping run is harmless.
 
-1. **Single runner.** `pg_try_advisory_lock(hashtextextended('hookrelay.partitions:delivery_attempts', 0))`.
-   If another run holds the lock, this run logs `partitions.skipped_locked` and exits 0. The lock
-   is session level, so the job connects to `DATABASE_DIRECT_URL` (`Settings.migration_dsn`), never
-   through PgBouncer in transaction mode. The pooled-code audit in `tests/unit/test_db_pooling.py`
-   allow-lists exactly this module and asserts that it uses the direct DSN.
-2. **Finalize** partitions left "detach pending" by an interrupted `DETACH ... CONCURRENTLY`.
-3. **Premake** today through today + `PARTITION_PREMAKE_DAYS`, plus every day that has rows in
-   DEFAULT and is not yet past the cutoff. Each partition is created with `CREATE TABLE ... (LIKE parent
-   INCLUDING DEFAULTS INCLUDING CONSTRAINTS INCLUDING STORAGE)` and a CHECK matching its bound.
-   Rows of that day are moved out of DEFAULT, then the table is `ATTACH`ed and the CHECK dropped,
-   all in one transaction. `ATTACH` needs only `SHARE UPDATE EXCLUSIVE` on the parent, unlike
-   `CREATE TABLE ... PARTITION OF`, which takes `ACCESS EXCLUSIVE`, so inserts keep flowing. The
-   CHECK lets Postgres skip scanning the new table. When a DEFAULT exists, `ATTACH` locks and
-   re-checks it, so a racing insert into DEFAULT makes the transaction fail and roll back rather
-   than misplace a row. The next run retries.
-4. **Retire** every partition whose upper bound is at or before the cutoff (UTC midnight of
-   today minus the retention days): `DETACH`, then `DROP TABLE`. Leftover tables named like
-   partitions (detached but not dropped by a crashed run) are dropped too.
-5. **Sweep DEFAULT** of rows older than the cutoff, in `ctid` batches of `RETENTION_BATCH_SIZE`
-   (at most `RETENTION_MAX_BATCHES` per run).
-6. **Summarise**: one `partitions.finished` log line with the counts, plus the gauges below.
+1. **Single runner per table.** `pg_try_advisory_lock(hashtextextended('hookrelay.partitions:<table>', 0))`
+   for each table; a table whose lock is held is skipped (`partitions.skipped_locked`), the rest
+   proceed. Session level, so a direct connection (`DATABASE_DIRECT_URL`), never PgBouncer in
+   transaction mode.
+2. **Finalize** partitions left "detach pending" by an interrupted `DETACH … CONCURRENTLY`.
+3. **Premake** today .. today + `PARTITION_PREMAKE_DAYS` per table with `CREATE TABLE … (LIKE
+   parent INCLUDING DEFAULTS INCLUDING CONSTRAINTS INCLUDING STORAGE)` + a bound `CHECK` +
+   `ATTACH` (`SHARE UPDATE EXCLUSIVE` on the parent, unlike `PARTITION OF`'s `ACCESS
+   EXCLUSIVE`; the CHECK lets `ATTACH` skip the scan), then the CHECK is dropped.
+4. **Rows stranded in DEFAULT.** `delivery_attempts` is a leaf table: it creates the day's
+   partition and moves the rows (DELETE + INSERT in one transaction). `events` and `deliveries`
+   are **not** moved: the move is a DELETE, and `ON DELETE CASCADE` would delete the rows that
+   reference them. The day is reported as `blocked_days` (`partitions.blocked_by_default_rows`
+   warning, exit code 3, `hookrelay_partition_default_rows`) and needs an operator (see
+   below). The relay's premake keeps this from happening in the first place.
+5. **Retire** children first (above), then drop orphaned tables a crashed run detached.
+6. **Sweep DEFAULT** of rows older than the cutoff, child first, in `ctid` batches (an event's
+   deliveries cascade, which is intended: it is past retention).
+7. **Summarise** one `partitions.finished` line per table, plus the gauges below.
 
-### Retention is safe by construction
+`DETACH … CONCURRENTLY` is used only for tables without a DEFAULT partition (Postgres refuses
+it otherwise); it works for referenced partitions too, so an operator who removes the DEFAULTs
+(detach first: a DEFAULT cannot be dropped directly while the FKs reference it) gets a fully
+concurrent, child-first day drop (`test_without_default_partitions_a_whole_day_drops_concurrently`).
+With the DEFAULTs in place (the shipped layout) it is a plain `DETACH` under `lock_timeout`,
+retried with capped backoff, deferred to the next run (exit 3) if still blocked.
 
-An attempt is never older than its event. So a partition whose upper bound is at or before
-`today - N days` only holds attempts of events older than N days, and those events have already
-expired at `EVENT_RETENTION_DAYS = N`. That is why `PARTITION_RETENTION_DAYS` (0 means "same as
-`EVENT_RETENTION_DAYS`") is validated to be at least `EVENT_RETENTION_DAYS`: the drop never takes
-history that the API can still show. If `EVENT_RETENTION_DAYS` is lowered, partitions expire one
-day after the matching events, because only whole days are dropped.
+### The relay is a second safety net
 
-### Limitation: the event cascade still runs first
+Every `RELAY_PARTITION_CHECK_INTERVAL_S` (300; 0 turns it off) the relay opens a direct
+connection and makes sure every table has partitions through today + `RELAY_PARTITION_MIN_DAYS_AHEAD`
+(2), under the **same advisory locks**, so whichever of relay and CronJob holds a lock does the
+(idempotent) premake and the other skips. It **never retires or sweeps** (`premake_only`), so a
+healthy CronJob and the relay can not disagree. Anything it creates logs `relay.partitions_premade`
+(a warning: the CronJob is behind or dead) and increments
+`hookrelay_partition_safety_premakes_total{table}`: alert on it being non-zero, it is the
+signal that the job is not running while the relay is hiding the symptom. A failure of the check
+is a counted loop error, never a stopped relay.
 
-The FK from `delivery_attempts` to `deliveries` is `ON DELETE CASCADE`, and the relay's
-housekeeping (or `hookrelay-retention`) deletes expired events at their `retain_until`. Those events cascade into
-their deliveries and attempts. An event created on day D expires during day D + N, but the
-partition for day D can only be dropped from D + N + 1 00:00 UTC, so for most rows the cascade
-gets there first. The partition drop then removes a table that is mostly dead tuples. That is
-still cheaper than vacuuming them, but the row-by-row delete has not gone away. Each cascaded
-delivery delete also probes every partition's `delivery_id` index.
+### If rows are stranded in `events_default` / `deliveries_default`
 
-There are two ways to make the drop do all of the work. Neither is done yet; both are on the
-roadmap:
-
-- partition attempts by the *delivery's* (or event's) creation day instead of the attempt's
-  own, so the attempts expire in the same run as their events, and the cascade finds nothing
-  left once the job runs ahead of the relay's purge;
-- allow `PARTITION_RETENTION_DAYS < EVENT_RETENTION_DAYS` as a product choice (attempt history
-  kept for a shorter time than events), so partitions are dropped before their events expire.
-
-### Locks, CONCURRENTLY and the DEFAULT partition
-
-- Postgres refuses `DETACH PARTITION ... CONCURRENTLY` while a DEFAULT partition exists ("cannot
-  detach partitions concurrently when a default partition exists"). This table keeps a DEFAULT,
-  so the job uses a plain `DETACH`, which takes a brief `ACCESS EXCLUSIVE` lock on the parent.
-  The detach itself is metadata only and takes milliseconds, but it waits behind long-running
-  transactions on the table. To keep it from queueing every new insert behind it, the job sets
-  `lock_timeout = PARTITION_LOCK_TIMEOUT_MS` (2 s). On `55P03` it retries with capped exponential
-  backoff (`PARTITION_DDL_RETRIES`, default 5). If that is still not enough, the step is
-  *deferred*: logged, the next step continues, and the process exits `3` so the Job shows up as
-  failed. The next hourly run picks the step up again.
-- Tables partitioned without a DEFAULT (other tables later, or an operator who drops it) get
-  `DETACH ... CONCURRENTLY`. `test_without_a_default_partition_detach_is_concurrent` covers that
-  path, and `..._is_finalized` covers recovery from an interrupted concurrent detach.
-- `DROP TABLE` of a detached partition briefly locks the tables its FKs reference (`deliveries`,
-  `endpoints`, `tenants`) to remove the FK triggers. The same lock timeout and retry policy
-  applies.
+It happens only if partitions were missing when a row arrived (the CronJob **and** the relay
+down for longer than the premake horizon, or a clock / time-zone mistake). The job refuses to
+move them, because the move is a DELETE whose `ON DELETE CASCADE` would delete the rows that
+reference them, and reports the day in `blocked_days` (tested:
+`test_days_stranded_in_default_are_blocked_not_moved_for_parent_tables`). Rows older than the
+cutoff are simply swept. Repairing a live day is a manual, **untested** operation in this
+milestone: it needs the day's three partitions created while the rows are re-homed with FK
+triggers off (`SET session_replication_role = replica` as a superuser), with the relay and
+workers stopped. A cascade-safe automatic repair needs that superuser setting or a different FK
+design (deferrable `NO ACTION` plus an explicit purge); it is recorded as remaining work
+rather than shipped half-tested. The relay's premake exists to keep this from happening.
 
 ### Settings
 
@@ -156,57 +224,55 @@ roadmap:
 | `PARTITION_RETENTION_DAYS` | 0 | 0 = follow `EVENT_RETENTION_DAYS`; otherwise must be at least that |
 | `PARTITION_LOCK_TIMEOUT_MS` | 2000 | `lock_timeout` for each DDL statement |
 | `PARTITION_DDL_RETRIES` | 5 | retries per step on lock timeout before deferring it |
+| `RETENTION_EVENT_PURGE_GRACE_S` | 172800 | the row-level event purge waits this long past `retain_until` (0-30 d; 0 = purge on expiry) |
+| `RELAY_PARTITION_CHECK_INTERVAL_S` | 300 | relay premake safety net cadence (0 = off) |
+| `RELAY_PARTITION_MIN_DAYS_AHEAD` | 2 | how far ahead the relay premakes (1-30) |
 
-Exit codes: `0` done (or another runner holds the lock), `3` incomplete (something deferred or
-the sweep cap was reached), `1` the table is not partitioned (database below `0011`).
+Exit codes: `0` done (or another runner holds a lock), `3` incomplete (something deferred or
+blocked, or the sweep cap was reached), `1` a table is not partitioned (database below `0012`).
 
 ### Metrics and alerts
 
-Refreshed by the relay's gauge loop with the other queue gauges (`table` label):
-
-| Metric | Alert when |
+| Metric (label `table`) | Alert when |
 |---|---|
 | `hookrelay_partitions` | n/a (capacity view) |
-| `hookrelay_partition_premade_seconds` (upper bound of the newest partition minus now) | `< 2 * 86400`: the job has been failing for days and DEFAULT will start filling |
+| `hookrelay_partition_premade_seconds` | `< 2 * 86400`: premake has been failing for days |
 | `hookrelay_partition_default_rows` (capped at 10,000) | `> 0` for an hour: rows are landing in DEFAULT |
+| `hookrelay_partition_safety_premakes_total` (counter, relay) | any increase: the CronJob is behind and the relay is covering for it |
 
-Alert on CronJob failures too (`kube_job_status_failed`), which covers the deferred-step exit code.
+Alert on CronJob failures too (`kube_job_status_failed`), which covers exit code 3.
 
-## Migrating an existing table
+## Migrating an existing database: `0012`
 
-`0011` does the simple thing: inside the migration transaction it renames the old table, creates
-the partitioned parent and a partition for each day that has rows, copies the rows before any
-index exists (one bulk index build per partition), adds keys, indexes, FKs and the trigger, and
-drops the old table. Writes to `delivery_attempts` wait for the whole copy. That is fine at the
-sizes this project runs at and is fully reversible: the downgrade copies back into an
-unpartitioned table with the `0010` keys, and it fails loudly instead of dropping rows if the
-weaker constraint ever let a duplicate attempt number through.
-`test_m9c_partitioning_roundtrip_keeps_every_attempt` seeds three days of attempts at `0010`,
-upgrades, checks each row's partition, downgrades, compares every row, and re-upgrades with an
-empty schema diff.
+`0012` is the simple in-migration copy, like `0011`. In one transaction (`ACCESS EXCLUSIVE` on
+the old tables, so writes wait for the copy): rename the three tables, drop their keys, indexes
+and the FKs that point at them, create the partitioned tables (`LIKE` the old ones plus
+`event_created_at`), one partition per UTC day that has events plus today .. today + 7 plus
+DEFAULT for each, copy the rows (deliveries and attempts joined to their parent for the key),
+then add keys, indexes, FKs and triggers; backfill `event_outbox.event_created_at`; create and
+backfill `event_external_ids`; drop the idempotency FK and the old tables.
 
-For a table too big to copy inside a maintenance window, use one of two online paths:
+The downgrade restores the 0011 layout, keeps every row, deletes idempotency records whose event
+no longer exists (there was no FK to stop that happening), and fails loudly if two live events
+ended up sharing an `external_id` (possible after a reclaimed claim) rather than lose one.
+`test_m9d_partitioned_event_graph_roundtrip_keeps_every_row` seeds events on three days (one 40
+days old) with external ids, an idempotency key, outbox rows, deliveries and attempts (one made
+two days after its event), upgrades, checks every row's partition, deletes an event to leave a
+dangling key, downgrades, compares, re-upgrades, and checks an empty schema diff each time.
 
-1. **Attach the old table as a legacy partition** (the cheapest). Create the partitioned
-   parent, add a `NOT VALID` CHECK `created_at < <cutover>` on the old table, `VALIDATE` it (no
-   write lock), then `ATTACH` it as `FOR VALUES FROM (MINVALUE) TO (<cutover>)`, which skips the
-   scan because the CHECK proves the bound. New days go into new daily partitions. The legacy
-   partition ages out as one big `DROP` once it is past retention. Unique indexes still have to
-   be rebuilt with the partition key (`CREATE UNIQUE INDEX CONCURRENTLY` on the old table first).
-2. **Dual-write plus backfill.** A trigger on the old table mirrors inserts into the new
-   partitioned table. A batched backfill (`INSERT ... SELECT ... WHERE id > $last ORDER BY id
-   LIMIT n ... ON CONFLICT DO NOTHING`) copies history while the app keeps writing. Then verify
-   counts and checksums per day, and in one short transaction rename the tables and drop the
-   trigger. Rolling back before the rename is just dropping the new table.
+For a database too big to copy inside a window, the online paths are unchanged from 9c and
+still documented, not automated:
+
+1. **Attach the old table as a legacy partition**: `NOT VALID` CHECK + `VALIDATE` on the old
+   table, then `ATTACH` as `FROM (MINVALUE) TO (<cutover>)`; unique indexes rebuilt with the key
+   first (`CREATE UNIQUE INDEX CONCURRENTLY`). It ages out as one `DROP`.
+2. **Dual-write plus backfill**: a trigger mirrors inserts, a batched `INSERT … SELECT … ON
+   CONFLICT DO NOTHING` backfills history, verify counts per day, then rename in one short
+   transaction.
 
 ## What is left
 
-- Make the drop do all of the retention work (see
-  [the limitation](#limitation-the-event-cascade-still-runs-first)).
-- Partition `deliveries` and `events`. `deliveries` is mutable and leased, so partition pruning
-  must not make the lease query scan every partition. `events` is referenced by `deliveries` and
-  `outbox`, and FKs that point *at* a partitioned table need the partition key in the referenced
-  key. Both need their own design and migration.
-- Let a long-running process (the relay) premake partitions as well, so a dead CronJob cannot
-  fill DEFAULT. Today that case is covered by the DEFAULT safety net plus the alerts above.
-- Tooling for the online migration paths above. They are documented, not automated.
+- A cascade-safe automatic repair of stranded `events` / `deliveries` DEFAULT rows (see above).
+- Making the parent `DETACH` cheap at high volume (see the measured scaling) and shrinking the
+  lease-pick tax with a retention-independent bound.
+- Tooling for the online migration paths. They are documented, not automated.
