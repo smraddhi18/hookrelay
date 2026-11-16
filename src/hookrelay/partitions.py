@@ -1,17 +1,21 @@
 """``python -m hookrelay.partitions`` / ``hookrelay-partitions``: one partition maintenance run.
 
-Premakes daily ``delivery_attempts`` partitions ``PARTITION_PREMAKE_DAYS`` ahead, moves rows
-out of the ``DEFAULT`` partition, detaches + drops partitions past ``PARTITION_RETENTION_DAYS``
-(see :mod:`hookrelay.services.partitions`). Meant for an hourly CronJob: every step is
-idempotent, and concurrent runs are safe (an advisory lock makes the second one a no-op).
+For ``events``, ``deliveries`` and ``delivery_attempts`` (the three tables of the event graph,
+all partitioned by the event's UTC day): premakes daily partitions ``PARTITION_PREMAKE_DAYS``
+ahead (parents first), moves stray ``delivery_attempts`` rows out of the ``DEFAULT`` partition,
+detaches + drops partitions past ``PARTITION_RETENTION_DAYS`` (children first, so one day leaves
+as a unit; see :mod:`hookrelay.services.partitions`). Meant for an hourly CronJob: every step
+is idempotent, and concurrent runs are safe (an advisory lock per table makes the second one a
+no-op). The relay runs the premake part as a safety net.
 
 Connects to Postgres directly (``Settings.migration_dsn``: ``DATABASE_DIRECT_URL`` when
-``DB_PGBOUNCER=true``), because the advisory lock is session-level and
+``DB_PGBOUNCER=true``), because the advisory locks are session-level and
 ``DETACH ... CONCURRENTLY`` cannot run inside a transaction.
 
 Exit codes: 0 done (or another run holds the lock), 3 incomplete (a lock timeout outlasted
-the retries, SIGTERM, or the default-partition sweep hit its batch budget: run it again),
-1 the table is not partitioned yet (run migrations first).
+the retries, SIGTERM, a day blocked by rows in a DEFAULT partition, a drop blocked by
+referencing rows, or the default-partition sweep hit its batch budget: look at the log, run it
+again), 1 a table is not partitioned yet (run migrations first).
 """
 
 from __future__ import annotations
@@ -29,10 +33,10 @@ from hookrelay.core.config import Settings, get_settings
 from hookrelay.core.logging import configure_logging
 from hookrelay.services.partitions import (
     NotPartitionedError,
-    PartitionMaintainer,
     PartitionPolicy,
     PartitionReport,
     connect_kwargs,
+    maintain,
 )
 
 logger = structlog.stdlib.get_logger("hookrelay.partitions")
@@ -46,7 +50,7 @@ def asyncpg_dsn(sqlalchemy_url: str) -> str:
     return sqlalchemy_url.replace("postgresql+asyncpg://", "postgresql://", 1)
 
 
-async def run(settings: Settings, *, dry_run: bool = False) -> PartitionReport:
+async def run(settings: Settings, *, dry_run: bool = False) -> list[PartitionReport]:
     policy = PartitionPolicy.from_settings(settings, dry_run=dry_run)
     stop = asyncio.Event()
     loop = asyncio.get_running_loop()
@@ -68,9 +72,10 @@ async def run(settings: Settings, *, dry_run: bool = False) -> PartitionReport:
             lock_timeout_ms=policy.lock_timeout_ms,
             dry_run=dry_run,
         )
-        report = await PartitionMaintainer(conn, policy, should_stop=stop.is_set).run()
-        logger.info("partitions.finished", **report.as_log())
-        return report
+        reports = await maintain(conn, policy, should_stop=stop.is_set)
+        for report in reports:
+            logger.info("partitions.finished", **report.as_log())
+        return reports
     finally:
         for sig in installed:
             loop.remove_signal_handler(sig)
@@ -91,11 +96,11 @@ def main(argv: list[str] | None = None) -> int:
     settings = get_settings()
     configure_logging(settings)
     try:
-        report = asyncio.run(run(settings, dry_run=args.dry_run))
+        reports = asyncio.run(run(settings, dry_run=args.dry_run))
     except NotPartitionedError as exc:
         logger.error("partitions.not_partitioned", error=str(exc))  # noqa: TRY400 - expected
         return EXIT_NOT_PARTITIONED
-    return 0 if report.complete else EXIT_INCOMPLETE
+    return 0 if all(r.complete for r in reports) else EXIT_INCOMPLETE
 
 
 if __name__ == "__main__":

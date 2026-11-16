@@ -35,6 +35,7 @@ async def run(settings: Settings, *, max_batches: int | None = None) -> Retentio
             max_batches=max_batches,
             pause_s=policy.pause_s,
             payload_retention_s=policy.payload_retention_s,
+            event_purge_grace_s=policy.event_purge_grace_s,
         )
     stop = asyncio.Event()
     loop = asyncio.get_running_loop()

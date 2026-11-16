@@ -30,6 +30,7 @@ import time
 from dataclasses import asdict, dataclass
 from pathlib import Path
 
+import asyncpg
 import structlog
 from opentelemetry import trace
 from sqlalchemy.exc import SQLAlchemyError
@@ -48,9 +49,16 @@ from hookrelay.observability.runtime import (
     shutdown_observability,
 )
 from hookrelay.observability.tracing import start_span
+from hookrelay.partitions import asyncpg_dsn
 from hookrelay.redis_ import RedisBundle, WakeupPublisher
 from hookrelay.redis_.runtime import build_redis_bundle
 from hookrelay.services import fanout, housekeeping, notifications
+from hookrelay.services.partitions import (
+    PartitionPolicy,
+    PartitionReport,
+    connect_kwargs,
+    ensure_premade,
+)
 from hookrelay.services.retention import RetentionPolicy, RetentionRunner
 
 logger = structlog.stdlib.get_logger("hookrelay.relay")
@@ -78,6 +86,7 @@ class RelayStats:
     purged_replay_requests: int = 0
     purged_payloads: int = 0
     cleared_previous_secrets: int = 0
+    partitions_premade: int = 0  # safety-net premakes (the CronJob was behind)
     notifications_sent: int = 0
     notifications_failed: int = 0
     notifications_abandoned: int = 0
@@ -138,7 +147,10 @@ class Relay:
                 try:
                     async with session.begin_nested():
                         created = await fanout.fan_out(
-                            session, [r.event_id for r in rows], cache=self.cache
+                            session,
+                            [r.event_id for r in rows],
+                            cache=self.cache,
+                            created_at=[r.event_created_at for r in rows],
                         )
                         await fanout.mark_processed(session, rows)
                     result = BatchResult(
@@ -178,7 +190,12 @@ class Relay:
         for row in rows:
             try:
                 async with session.begin_nested():
-                    created += await fanout.fan_out(session, [row.event_id], cache=self.cache)
+                    created += await fanout.fan_out(
+                        session,
+                        [row.event_id],
+                        cache=self.cache,
+                        created_at=[row.event_created_at],
+                    )
                     await fanout.mark_processed(session, [row])
                 processed += 1
             except SQLAlchemyError as exc:
@@ -235,7 +252,15 @@ class Relay:
         dispatched notifications and old replay audit rows; then one bounded retention pass
         (payloads past EVENT_PAYLOAD_RETENTION_DAYS, ended secret overlaps)."""
         totals = dict.fromkeys(
-            ("idempotency_keys", "outbox_rows", "events", "notifications", "replay_requests"), 0
+            (
+                "idempotency_keys",
+                "outbox_rows",
+                "events",
+                "notifications",
+                "replay_requests",
+                "external_ids",
+            ),
+            0,
         )
         for _ in range(HOUSEKEEPING_MAX_ROUNDS):
             async with self.database.session() as session:
@@ -245,6 +270,7 @@ class Relay:
                     batch_size=HOUSEKEEPING_BATCH_SIZE,
                     notification_retention_s=self.settings.notification_retention_s,
                     replay_retention_s=self.settings.event_retention_days * 86_400,
+                    event_purge_grace_s=self.settings.retention_event_purge_grace_s,
                 )
             for name in totals:
                 totals[name] += getattr(swept, name)
@@ -278,6 +304,40 @@ class Relay:
                 previous_secrets=retention.previous_secrets,
             )
         return total
+
+    async def ensure_partitions(self) -> list[PartitionReport]:
+        """Second safety net for time partitioning: make sure every event-graph table has
+        partitions through today + ``RELAY_PARTITION_MIN_DAYS_AHEAD``, premaking under the same
+        advisory locks as ``hookrelay-partitions`` (whichever holds the lock does the work).
+
+        A dedicated direct connection (``migration_dsn``): the locks are session-level, which
+        PgBouncer's transaction pooling cannot keep. Anything it creates means the CronJob is
+        behind, so it is a warning and a counter to alert on, not routine."""
+        policy = PartitionPolicy.from_settings(self.settings)
+        conn = await asyncpg.connect(
+            asyncpg_dsn(self.settings.migration_dsn),
+            timeout=self.settings.db_connect_timeout_s,
+            **connect_kwargs(policy, application_name=f"{self.settings.app_name}-relay-partitions"),
+        )
+        try:
+            reports = await ensure_premade(
+                conn, policy, min_days_ahead=self.settings.relay_partition_min_days_ahead
+            )
+        finally:
+            await conn.close()
+        for report in reports:
+            if not report.created:
+                continue
+            self.stats.partitions_premade += len(report.created)
+            if self.metrics is not None:
+                self.metrics.record_partition_safety_premake(report.table, len(report.created))
+            logger.warning(
+                "relay.partitions_premade",
+                table=report.table,
+                created=report.created,
+                hint="hookrelay-partitions is behind or not running",
+            )
+        return reports
 
     async def notify_once(self) -> notifications.DispatchResult:
         """Dispatch one batch of due operator notifications."""
@@ -322,7 +382,7 @@ class Relay:
         min_s = self.settings.relay_poll_min_ms / 1000
         max_s = self.settings.relay_poll_max_ms / 1000
         delay = min_s
-        next_housekeeping = next_notify = time.monotonic()
+        next_housekeeping = next_notify = next_partition_check = time.monotonic()
         logger.info(
             "relay.started",
             batch_size=self.settings.relay_batch_size,
@@ -362,6 +422,21 @@ class Relay:
                         logger.exception("relay.housekeeping_failed", error=type(exc).__name__)
                     next_housekeeping = (
                         time.monotonic() + self.settings.relay_housekeeping_interval_s
+                    )
+                if (
+                    not self.stopping
+                    and self.settings.relay_partition_check_interval_s
+                    and time.monotonic() >= next_partition_check
+                ):
+                    try:
+                        await self.ensure_partitions()
+                    except Exception as exc:
+                        self.stats.loop_errors += 1
+                        if self.metrics is not None:
+                            self.metrics.record_relay_loop_error()
+                        logger.exception("relay.partition_check_failed", error=type(exc).__name__)
+                    next_partition_check = (
+                        time.monotonic() + self.settings.relay_partition_check_interval_s
                     )
                 if claimed >= self.settings.relay_batch_size:
                     delay = min_s
