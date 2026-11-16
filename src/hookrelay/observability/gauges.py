@@ -7,7 +7,7 @@ from dataclasses import dataclass
 from sqlalchemy import text
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from hookrelay.db.partitioning import DELIVERY_ATTEMPTS, PartitionedTable
+from hookrelay.db.partitioning import DELIVERY_ATTEMPTS, PARTITIONED_TABLES, PartitionedTable
 from hookrelay.observability.metrics import Metrics
 
 _QUEUE_SQL = text(
@@ -88,15 +88,18 @@ async def snapshot_partitions(
     )
 
 
-async def refresh_partition_gauges(session: AsyncSession, metrics: Metrics) -> PartitionSnapshot:
-    snap = await snapshot_partitions(session)
-    metrics.set_partition_state(
-        table=snap.table,
-        partitions=snap.partitions,
-        premade_seconds=snap.premade_seconds,
-        default_rows=snap.default_rows,
-    )
-    return snap
+async def refresh_partition_gauges(
+    session: AsyncSession, metrics: Metrics
+) -> list[PartitionSnapshot]:
+    snaps = [await snapshot_partitions(session, table) for table in PARTITIONED_TABLES]
+    for snap in snaps:
+        metrics.set_partition_state(
+            table=snap.table,
+            partitions=snap.partitions,
+            premade_seconds=snap.premade_seconds,
+            default_rows=snap.default_rows,
+        )
+    return snaps
 
 
 @dataclass(frozen=True, slots=True)

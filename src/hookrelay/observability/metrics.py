@@ -73,6 +73,7 @@ class Metrics:
     worker_completion_batch_size: Histogram
     worker_completion_flush_seconds: Histogram
     worker_completion_retries: Counter
+    partition_safety_premakes: Counter
     partitions: Gauge
     partition_premade_seconds: Gauge
     partition_default_rows: Gauge
@@ -97,6 +98,9 @@ class Metrics:
 
     def record_relay_batch(self) -> None:
         self.relay_batches.labels(service=self.service).inc()
+
+    def record_partition_safety_premake(self, table: str, n: int = 1) -> None:
+        self.partition_safety_premakes.labels(service=self.service, table=table).inc(n)
 
     def record_relay_loop_error(self) -> None:
         self.relay_loop_errors.labels(service=self.service).inc()
@@ -277,6 +281,13 @@ def build_metrics(service: str) -> Metrics:
             "hookrelay_worker_completion_retries_total",
             "Completion transactions retried after a transient database error.",
             ["service"],
+            registry=registry,
+        ),
+        partition_safety_premakes=Counter(
+            "hookrelay_partition_safety_premakes_total",
+            "Daily partitions the relay's safety net had to create because the maintenance job "
+            "had not (alert on any increase: hookrelay-partitions is behind or dead).",
+            ["service", "table"],
             registry=registry,
         ),
         partitions=Gauge(
