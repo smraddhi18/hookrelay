@@ -18,6 +18,7 @@ from hookrelay import retention as retention_cli
 from hookrelay.db.engine import Database
 from hookrelay.relay import Relay
 from hookrelay.services.retention import RetentionPolicy, RetentionRunner, purge_payloads
+from tests.integration.aging import age_events
 from tests.integration.conftest import _asyncpg_dsn, publish
 from tests.integration.test_replays import _run, dead_backlog  # noqa: F401 - fixture
 from tests.integration.test_worker import (  # noqa: F401 - pytest fixtures
@@ -38,11 +39,7 @@ DAY = 86_400
 
 
 async def _age_events(db_url: str, days: float = 3) -> None:
-    await _run(
-        db_url,
-        "UPDATE events SET created_at = now() - make_interval(secs => $1)",
-        float(days * DAY),
-    )
+    await age_events(db_url, f"{days * DAY} seconds")
 
 
 def _policy(**overrides: Any) -> RetentionPolicy:
@@ -62,6 +59,40 @@ async def _deliver_all(make_worker: Any) -> None:
     while worker.stats.leased != previous:
         previous = worker.stats.leased
         await worker.run_once()
+
+
+async def test_leases_and_completions_carry_the_events_day_even_for_old_events(
+    api: httpx.AsyncClient,
+    *,
+    settings_for: Any,
+    receiver: Receiver,
+    make_worker: Any,
+    db_url: str,
+) -> None:
+    """Every fenced write is keyed by the delivery's ``event_created_at``: delivering a
+    delivery whose event is three days old files its attempts under that day, not today."""
+    receiver.handler = lambda _r: Reply(200)
+    _tenant, _endpoint_id, _, event_ids = await _setup(api, settings_for(), receiver, events=2)
+    await _age_events(db_url, days=3)
+    await _deliver_all(make_worker)
+    rows = await _fetch(
+        db_url,
+        "SELECT a.event_created_at = e.created_at AS keyed, d.status, "
+        "a.event_created_at AT TIME ZONE 'UTC' < date_trunc('day', now() AT TIME ZONE 'UTC') AS old "
+        "FROM delivery_attempts a "
+        "JOIN deliveries d ON d.id = a.delivery_id AND d.event_created_at = a.event_created_at "
+        "JOIN events e ON e.id = d.event_id AND e.created_at = d.event_created_at",
+    )
+    assert len(rows) == len(event_ids) == 2
+    assert all(r["keyed"] and r["old"] and r["status"] == "succeeded" for r in rows)
+    # The key is the event day; created_at stays the wall clock of the attempt (not the key).
+    assert (
+        await _val(
+            db_url,
+            "SELECT count(*) FROM delivery_attempts WHERE created_at < now() - interval '1 day'",
+        )
+        == 0
+    )
 
 
 async def test_purges_only_old_settled_events_and_scrubs_responses(
@@ -155,11 +186,7 @@ async def test_cursor_moves_past_busy_events(
         "WHERE event_id <> ALL($1::uuid[])",
         busy_ids,
     )
-    await _run(
-        db_url,
-        "UPDATE events SET created_at = now() - interval '2 days' WHERE id <> ALL($1::uuid[])",
-        busy_ids,
-    )
+    await age_events(db_url, "2 days", except_=busy_ids)
     report = await RetentionRunner(database, _policy(batch_size=2)).run()
     assert report.payloads == 5
     assert report.payloads_skipped_busy == 5

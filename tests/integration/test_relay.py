@@ -27,6 +27,7 @@ from hookrelay.healthcheck import heartbeat_is_fresh
 from hookrelay.relay import Relay, main, serve
 from hookrelay.services import fanout
 from hookrelay.services.subscriptions import pattern_matches
+from tests.integration.aging import age_events
 from tests.integration.conftest import (
     TenantCtx,
     _admin,
@@ -410,12 +411,7 @@ async def test_housekeeping_purges_expired_rows(
         "UPDATE idempotency_keys SET created_at = now() - interval '3 days', "
         "expires_at = now() - interval '1 day' WHERE key = 'old'",
     )
-    await _fetch(
-        db_url,
-        "UPDATE events SET created_at = now() - interval '40 days', "
-        "retain_until = now() - interval '10 days' WHERE id = $1",
-        uuid.UUID(doomed),
-    )
+    await age_events(db_url, "40 days", retain_until_ago="10 days", only=[uuid.UUID(doomed)])
     swept = await relay.housekeep()
     # The expired event goes (cascading to its idempotency key and deliveries); the
     # processed outbox row of the live event goes because retention is 0s.
@@ -428,6 +424,80 @@ async def test_housekeeping_purges_expired_rows(
     assert await _val(db_url, "SELECT array_agg(key) FROM idempotency_keys") == ["live"]
     assert relay.stats.housekeeping_runs == 1
     assert (await relay.housekeep()).total == 0
+
+
+async def test_housekeeping_event_purge_waits_for_the_partition_drop_grace(
+    api: httpx.AsyncClient, database: Database, settings_for: Any, db_url: str
+) -> None:
+    """The partition drop is what expires events; the row-level purge is only a backstop that
+    runs once an event is ``retention_event_purge_grace_s`` past ``retain_until``."""
+    tenant, _ = await _setup_simple(api, endpoints=1)
+    just = (await publish(api, tenant, "order.placed", {"n": 1})).json()["id"]
+    long = (await publish(api, tenant, "order.placed", {"n": 2})).json()["id"]
+    await _drain(Relay(database, settings_for()))
+    await age_events(db_url, "40 days", retain_until_ago="1 day", only=[uuid.UUID(just)])
+    await age_events(db_url, "40 days", retain_until_ago="3 days", only=[uuid.UUID(long)])
+    relay = Relay(database, settings_for(retention_event_purge_grace_s=2 * 86_400))
+    swept = await relay.housekeep()
+    # Expired a day ago: inside the 2-day grace, the partition drop still owns it.
+    assert swept.events == 1
+    remaining = [str(r["id"]) for r in await _fetch(db_url, "SELECT id FROM events")]
+    assert remaining == [just]
+    # A zero grace (no partition job) purges as soon as the event expires.
+    zero = Relay(database, settings_for(retention_event_purge_grace_s=0))
+    assert (await zero.housekeep()).events == 1
+    assert await _val(db_url, "SELECT count(*) FROM events") == 0
+    assert await _val(db_url, "SELECT count(*) FROM deliveries") == 0
+
+
+async def test_housekeeping_purges_expired_external_id_claims(
+    api: httpx.AsyncClient, database: Database, settings_for: Any, db_url: str
+) -> None:
+    tenant, _ = await _setup_simple(api, endpoints=1)
+    response = await publish(api, tenant, "order.placed", {"n": 1}, external_id="ext-1")
+    assert response.status_code == 202
+    relay = Relay(database, settings_for())
+    assert (await relay.housekeep()).external_ids == 0  # live claim stays
+    await _fetch(db_url, "UPDATE event_external_ids SET expires_at = now() - interval '1 second'")
+    swept = await relay.housekeep()
+    assert swept.external_ids == 1
+    assert await _val(db_url, "SELECT count(*) FROM event_external_ids") == 0
+    assert relay.stats.housekeeping_runs == 2
+
+
+async def test_loop_runs_the_partition_safety_net_and_survives_its_failure(
+    database: Database, settings_for: Any, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    relay = Relay(database, settings_for(relay_partition_check_interval_s=1))
+    calls = 0
+
+    async def failing() -> Any:
+        nonlocal calls
+        calls += 1
+        if calls >= 2:
+            relay.stop()
+        raise OSError("direct connection refused")
+
+    monkeypatch.setattr(relay, "ensure_partitions", failing)
+    await asyncio.wait_for(relay.run(), timeout=15)
+    assert calls == 2  # once at start-up, then on its interval
+    assert relay.stats.loop_errors >= 2
+
+
+async def test_partition_safety_net_can_be_turned_off(
+    database: Database, settings_for: Any, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    relay = Relay(database, settings_for(relay_partition_check_interval_s=0))
+
+    async def forbidden() -> Any:
+        raise AssertionError("the safety net is disabled")
+
+    monkeypatch.setattr(relay, "ensure_partitions", forbidden)
+    task = asyncio.create_task(relay.run())
+    await asyncio.sleep(0.3)
+    relay.stop()
+    await asyncio.wait_for(task, timeout=5)
+    assert relay.stats.loop_errors == 0
 
 
 async def test_housekeeping_keeps_unprocessed_outbox_rows(
