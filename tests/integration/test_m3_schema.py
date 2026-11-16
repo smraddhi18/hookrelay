@@ -11,17 +11,19 @@ from tests.integration.test_m1_schema import _endpoint, _event_type, _tenant, _v
 from tests.integration.test_m2_schema import _event
 
 _ATTEMPT = (
-    "INSERT INTO delivery_attempts (tenant_id, delivery_id, attempt_number, outcome, "
+    "INSERT INTO delivery_attempts (tenant_id, delivery_id, event_created_at, attempt_number, outcome, "
     "status_code, error_class, request_url, worker_id, started_at, finished_at) "
-    "VALUES ($1, $2, $3, $4, $5, $6, 'https://a.example.com/', 'w', now(), now())"
+    "VALUES ($1, $2, COALESCE((SELECT event_created_at FROM deliveries WHERE id = $2), now()), $3, $4, $5, $6, 'https://a.example.com/', 'w', now(), now())"
 )
 
 
 async def _delivery(pg: asyncpg.Connection, tenant: uuid.UUID) -> uuid.UUID:
     await _event_type(pg, tenant, "x.y")
     delivery_id: uuid.UUID = await pg.fetchval(
-        "INSERT INTO deliveries (tenant_id, event_id, endpoint_id, retain_until) "
-        "VALUES ($1, $2, $3, now() + interval '1 day') RETURNING id",
+        "INSERT INTO deliveries (tenant_id, event_id, endpoint_id, retain_until, "
+        "event_created_at) "
+        "VALUES ($1, $2, $3, now() + interval '1 day', "
+        "COALESCE((SELECT created_at FROM events WHERE id = $2), now())) RETURNING id",
         tenant,
         await _event(pg, tenant, "x.y"),
         await _endpoint(pg, tenant, f"https://{uuid.uuid4().hex[:8]}.example.com/"),
@@ -69,11 +71,11 @@ async def test_attempts_stay_inside_the_tenant_and_are_numbered_once(
         "fk_delivery_attempts_delivery_same_tenant"
     )
     await pg.execute(_ATTEMPT, world["a"], d, 1, "retrying", 503, "http_status")
-    # M9c: delivery_attempts is partitioned, so Postgres names the partition's copy of
-    # uq_delivery_attempts_number (delivery_id, attempt_number, created_at) in the error.
+    # delivery_attempts is partitioned, so Postgres names the partition's copy of
+    # uq_delivery_attempts_number (delivery_id, attempt_number, event_created_at).
     violated = await _violation(pg, _ATTEMPT, world["a"], d, 1, "failed", 500, "http_status")
     assert violated.startswith("delivery_attempts_p")
-    assert violated.endswith("_delivery_id_attempt_number_crea_key")
+    assert "_delivery_id_attempt_number_" in violated
     await pg.execute("DELETE FROM deliveries WHERE id = $1", d)
     assert (
         await pg.fetchval("SELECT count(*) FROM delivery_attempts WHERE delivery_id = $1", d) == 0
@@ -103,9 +105,9 @@ async def test_attempt_checks(
 
 async def test_attempt_bounds(pg: asyncpg.Connection, world: dict[str, uuid.UUID]) -> None:
     base = (
-        "INSERT INTO delivery_attempts (tenant_id, delivery_id, attempt_number, outcome, "
+        "INSERT INTO delivery_attempts (tenant_id, delivery_id, event_created_at, attempt_number, outcome, "
         "error_class, request_url, worker_id, started_at, finished_at, {}) "
-        "VALUES ($1, $2, 1, 'failed', 'timeout', 'u', 'w', now(), now(), $3)"
+        "VALUES ($1, $2, COALESCE((SELECT event_created_at FROM deliveries WHERE id = $2), now()), 1, 'failed', 'timeout', 'u', 'w', now(), now(), $3)"
     )
     t, d = world["a"], world["delivery_a"]
     assert await _violation(pg, base.format("latency_ms"), t, d, -1) == (
@@ -121,8 +123,8 @@ async def test_attempt_bounds(pg: asyncpg.Connection, world: dict[str, uuid.UUID
         "ck_delivery_attempts_request_headers_object"
     )
     backwards = (
-        "INSERT INTO delivery_attempts (tenant_id, delivery_id, attempt_number, outcome, "
+        "INSERT INTO delivery_attempts (tenant_id, delivery_id, event_created_at, attempt_number, outcome, "
         "error_class, request_url, worker_id, started_at, finished_at) "
-        "VALUES ($1, $2, 1, 'failed', 'timeout', 'u', 'w', now(), now() - interval '1 second')"
+        "VALUES ($1, $2, COALESCE((SELECT event_created_at FROM deliveries WHERE id = $2), now()), 1, 'failed', 'timeout', 'u', 'w', now(), now() - interval '1 second')"
     )
     assert await _violation(pg, backwards, t, d) == "ck_delivery_attempts_finished_after_started"

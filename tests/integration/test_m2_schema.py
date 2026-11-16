@@ -81,7 +81,14 @@ async def test_event_checks(pg: asyncpg.Connection, world: dict[str, uuid.UUID])
     )
     assert await _violation(pg, bad_external, a, "has space") == "ck_events_external_id_format"
     await _event(pg, a, "x.y", external_id="ext-1")
-    assert await _violation(pg, bad_external, a, "ext-1") == "uq_events_tenant_external_id"
+    # M9d: uniqueness lives in the event_external_ids claim table (events is partitioned).
+    claim = (
+        "INSERT INTO event_external_ids (tenant_id, external_id, event_id, event_created_at, "
+        "expires_at) VALUES ($1, $2, gen_random_uuid(), now(), now() + interval '1 day')"
+    )
+    await pg.execute(claim, a, "ext-1")
+    assert await _violation(pg, claim, a, "ext-1") == "pk_event_external_ids"
+    assert await _violation(pg, claim, a, "has space") == "ck_event_external_ids_external_id_format"
     await _event(pg, world["b"], "x.y", external_id="ext-1")  # other tenant: fine
 
 
@@ -96,8 +103,10 @@ async def test_outbox_and_deliveries_stay_inside_the_tenant(
     assert await _violation(pg, outbox, world["a"], world["event_a"]) == "uq_event_outbox_event_id"
 
     delivery = (
-        "INSERT INTO deliveries (tenant_id, event_id, endpoint_id, retain_until) "
-        "VALUES ($1, $2, $3, now() + interval '1 day')"
+        "INSERT INTO deliveries (tenant_id, event_id, endpoint_id, retain_until, "
+        "event_created_at) "
+        "VALUES ($1, $2, $3, now() + interval '1 day', "
+        "COALESCE((SELECT created_at FROM events WHERE id = $2), now()))"
     )
     assert await _violation(pg, delivery, world["a"], world["event_b"], world["endpoint_a"]) == (
         "fk_deliveries_event_same_tenant"
@@ -106,17 +115,20 @@ async def test_outbox_and_deliveries_stay_inside_the_tenant(
         "fk_deliveries_endpoint_same_tenant"
     )
     await pg.execute(delivery, world["a"], world["event_a"], world["endpoint_a"])
-    assert await _violation(pg, delivery, world["a"], world["event_a"], world["endpoint_a"]) == (
-        "uq_deliveries_event_endpoint"
-    )
+    # M9d: deliveries is partitioned, so Postgres names the partition's copy of the unique key.
+    violated = await _violation(pg, delivery, world["a"], world["event_a"], world["endpoint_a"])
+    assert violated.startswith("deliveries_p")
+    assert "event_id_endpoint_id" in violated
 
 
 async def test_delivery_state_checks_and_trigger(
     pg: asyncpg.Connection, world: dict[str, uuid.UUID]
 ) -> None:
     delivery_id = await pg.fetchval(
-        "INSERT INTO deliveries (tenant_id, event_id, endpoint_id, retain_until) "
-        "VALUES ($1, $2, $3, now() + interval '1 day') RETURNING id",
+        "INSERT INTO deliveries (tenant_id, event_id, endpoint_id, retain_until, "
+        "event_created_at) "
+        "VALUES ($1, $2, $3, now() + interval '1 day', "
+        "COALESCE((SELECT created_at FROM events WHERE id = $2), now())) RETURNING id",
         world["a"],
         world["event_a"],
         world["endpoint_a"],
@@ -168,9 +180,7 @@ async def test_idempotency_record_checks(
     assert await _violation(pg, insert, a, "k", FP, event_a, 500, '{"x": 1}') == (
         "ck_idempotency_keys_response_status_success"
     )
-    assert await _violation(pg, insert, a, "k", FP, world["event_b"], 202, "{}") == (
-        "fk_idempotency_keys_event_same_tenant"
-    )
+    # M9d: no FK to events any more (events is partitioned); the row is purged by expiry.
     await pg.execute(insert, a, "k", FP, event_a, 202, "{}")
     expired = (
         "INSERT INTO idempotency_keys (tenant_id, key, request_method, request_path, fingerprint, "
@@ -187,8 +197,10 @@ async def test_deleting_a_tenant_cascades_everything(
         "INSERT INTO event_outbox (tenant_id, event_id) VALUES ($1, $2)", a, world["event_a"]
     )
     await pg.execute(
-        "INSERT INTO deliveries (tenant_id, event_id, endpoint_id, retain_until) "
-        "VALUES ($1, $2, $3, now() + interval '1 day')",
+        "INSERT INTO deliveries (tenant_id, event_id, endpoint_id, retain_until, "
+        "event_created_at) "
+        "VALUES ($1, $2, $3, now() + interval '1 day', "
+        "COALESCE((SELECT created_at FROM events WHERE id = $2), now()))",
         a,
         world["event_a"],
         world["endpoint_a"],

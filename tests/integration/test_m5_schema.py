@@ -22,8 +22,10 @@ async def _delivery(
     conn: asyncpg.Connection, tenant: uuid.UUID, event: uuid.UUID, endpoint: uuid.UUID
 ) -> uuid.UUID:
     delivery_id: uuid.UUID = await conn.fetchval(
-        "INSERT INTO deliveries (tenant_id, event_id, endpoint_id, retain_until) "
-        "VALUES ($1, $2, $3, now() + interval '1 day') RETURNING id",
+        "INSERT INTO deliveries (tenant_id, event_id, endpoint_id, retain_until, "
+        "event_created_at) "
+        "VALUES ($1, $2, $3, now() + interval '1 day', "
+        "COALESCE((SELECT created_at FROM events WHERE id = $2), now())) RETURNING id",
         tenant,
         event,
         endpoint,
@@ -35,9 +37,9 @@ async def _attempt(
     conn: asyncpg.Connection, tenant: uuid.UUID, delivery: uuid.UUID, number: int = 1
 ) -> uuid.UUID:
     attempt_id: uuid.UUID = await conn.fetchval(
-        "INSERT INTO delivery_attempts (tenant_id, delivery_id, attempt_number, outcome, "
+        "INSERT INTO delivery_attempts (tenant_id, delivery_id, event_created_at, attempt_number, outcome, "
         "status_code, error_class, request_url, worker_id, started_at, finished_at) "
-        "VALUES ($1, $2, $3, 'retrying', 503, 'http_status', 'https://a.example.com/', 'w', "
+        "VALUES ($1, $2, COALESCE((SELECT event_created_at FROM deliveries WHERE id = $2), now()), $3, 'retrying', 503, 'http_status', 'https://a.example.com/', 'w', "
         "now(), now()) RETURNING id",
         tenant,
         delivery,
@@ -53,8 +55,22 @@ async def _seed_m4(url: str) -> dict[str, uuid.UUID]:
         await _event_type(conn, tenant, "order.created")
         endpoint = await _endpoint(conn, tenant, "https://a.example.com/")
         event = await _event(conn, tenant, "order.created")
-        delivery = await _delivery(conn, tenant, event, endpoint)
-        await _attempt(conn, tenant, delivery)
+        # Raw SQL in the 0008 shape (no partition key columns yet; this seed runs pre-0012).
+        delivery = await conn.fetchval(
+            "INSERT INTO deliveries (tenant_id, event_id, endpoint_id, retain_until) "
+            "VALUES ($1, $2, $3, now() + interval '1 day') RETURNING id",
+            tenant,
+            event,
+            endpoint,
+        )
+        await conn.execute(
+            "INSERT INTO delivery_attempts (tenant_id, delivery_id, attempt_number, outcome, "
+            "status_code, error_class, request_url, worker_id, started_at, finished_at) "
+            "VALUES ($1, $2, 1, 'retrying', 503, 'http_status', 'https://a.example.com/', 'w', "
+            "now(), now())",
+            tenant,
+            delivery,
+        )
         return {"tenant": tenant, "endpoint": endpoint, "event": event, "delivery": delivery}
     finally:
         await conn.close()
@@ -127,8 +143,10 @@ async def test_triggers_derive_columns_and_constraints_hold(head_url: str) -> No
 
         # A writer cannot set the derived columns to something else: the trigger wins.
         delivery = await conn.fetchval(
-            "INSERT INTO deliveries (tenant_id, event_id, endpoint_id, retain_until, event_type) "
-            "VALUES ($1, $2, $3, now() + interval '1 day', 'forged.type') RETURNING id",
+            "INSERT INTO deliveries (tenant_id, event_id, endpoint_id, retain_until, event_type, "
+            "event_created_at) "
+            "VALUES ($1, $2, $3, now() + interval '1 day', 'forged.type', "
+            "COALESCE((SELECT created_at FROM events WHERE id = $2), now())) RETURNING id",
             tenant,
             event,
             endpoint,
@@ -138,9 +156,9 @@ async def test_triggers_derive_columns_and_constraints_hold(head_url: str) -> No
             == "a.b"
         )
         attempt = await conn.fetchval(
-            "INSERT INTO delivery_attempts (tenant_id, delivery_id, endpoint_id, attempt_number, "
+            "INSERT INTO delivery_attempts (tenant_id, delivery_id, event_created_at, endpoint_id, attempt_number, "
             "outcome, status_code, request_url, worker_id, started_at, finished_at) "
-            "VALUES ($1, $2, $3, 1, 'succeeded', 200, 'https://a.example.com/', 'w', now(), "
+            "VALUES ($1, $2, COALESCE((SELECT event_created_at FROM deliveries WHERE id = $2), now()), $3, 1, 'succeeded', 200, 'https://a.example.com/', 'w', now(), "
             "now()) RETURNING id",
             tenant,
             delivery,

@@ -5,6 +5,7 @@ from datetime import UTC, datetime, timedelta
 from typing import Any
 
 import asyncpg
+import pytest
 from alembic import command
 from alembic.autogenerate import compare_metadata
 from alembic.runtime.migration import MigrationContext
@@ -14,7 +15,7 @@ from sqlalchemy.engine import Connection
 from sqlalchemy.ext.asyncio import create_async_engine
 
 from hookrelay.db.base import Base
-from hookrelay.db.partitioning import include_name
+from hookrelay.db.partitioning import include_name, include_object
 from tests.integration.conftest import _asyncpg_dsn, alembic_config
 
 M1_TABLES = {"api_keys", "endpoints", "event_types", "subscriptions"}
@@ -61,6 +62,7 @@ def _schema_diff(url: str) -> list[Any]:
                             "compare_type": True,
                             "compare_server_default": True,
                             "include_name": include_name,  # as alembic/env.py
+                            "include_object": include_object,
                         },
                     )
                     return list(compare_metadata(ctx, Base.metadata))
@@ -146,6 +148,7 @@ def test_each_revision_downgrades_one_step(scratch_database_url: str) -> None:
     script = ScriptDirectory.from_config(cfg)
     command.upgrade(cfg, "head")
     expected_removed = {
+        "0012": set(),  # events/deliveries/delivery_attempts swapped for partitioned copies
         "0011": set(),  # delivery_attempts swapped for an unpartitioned copy (same name)
         "0010": set(),  # traceparent/tracestate columns only
         "0009": set(),  # columns, indexes and triggers only
@@ -174,7 +177,8 @@ def test_m2_downgrade_drops_delivery_trigger(scratch_database_url: str) -> None:
     triggers = asyncio.run(
         _fetch(
             scratch_database_url,
-            "SELECT tgname FROM pg_trigger WHERE tgname = 'trg_deliveries_updated_at'",
+            "SELECT tgname FROM pg_trigger WHERE tgname = 'trg_deliveries_updated_at' "
+            "AND tgparentid = 0",  # partitions carry cloned copies
         )
     )
     assert len(triggers) == 1
@@ -195,8 +199,9 @@ async def _seed_m3_rows(url: str) -> None:
         await _event_type(conn, tenant, "x.y")
         insert = (
             "INSERT INTO deliveries (tenant_id, event_id, endpoint_id, retain_until, status, "
-            "completed_at, lease_token, leased_until, leased_by) "
-            "VALUES ($1, $2, $3, now() + interval '1 day', $4, $5, $6, $7, $8)"
+            "completed_at, lease_token, leased_until, leased_by, event_created_at) "
+            "VALUES ($1, $2, $3, now() + interval '1 day', $4, $5, $6, $7, $8, "
+            "COALESCE((SELECT created_at FROM events WHERE id = $2), now()))"
         )
         endpoint = await _endpoint(conn, tenant, "https://a.example.com/")
         failed = (await _event(conn, tenant, "x.y"), "failed", "now", None, None, None)
@@ -349,7 +354,6 @@ def test_m9c_partitioning_roundtrip_keeps_every_attempt(scratch_database_url: st
     )
     assert kind[0]["k"] == "p"
     assert "delivery_attempts_m0010" not in _tables(url)
-    assert _schema_diff(url) == []
 
     command.downgrade(cfg, "0010")
     back = asyncio.run(
@@ -378,3 +382,244 @@ def test_m9c_partitioning_roundtrip_keeps_every_attempt(scratch_database_url: st
     assert pk[0]["d"] == "PRIMARY KEY (id)"
     command.upgrade(cfg, "head")
     assert _schema_diff(url) == []
+
+
+async def _seed_event_graph_0011(url: str) -> dict[str, Any]:
+    """Three events on three UTC days (one 40 days old) with external ids, an idempotency key,
+    outbox rows, deliveries and attempts, in the 0011 shape (attempts keyed by their own day)."""
+    from tests.integration.test_m1_schema import _endpoint, _event_type, _tenant  # noqa: PLC0415
+
+    conn = await asyncpg.connect(_asyncpg_dsn(url))
+    try:
+        tenant = await _tenant(conn, "m9d-roundtrip")
+        await _event_type(conn, tenant, "x.y")
+        endpoint = await _endpoint(conn, tenant, "https://a.example.com/")
+        now = await conn.fetchval("SELECT now()")
+        events: list[dict[str, Any]] = []
+        for label, age_days, external in (
+            ("old", 40, "ext-old"),
+            ("mid", 1, "ext-mid"),
+            ("new", 0, None),
+        ):
+            created = now - timedelta(days=age_days)
+            event_id = await conn.fetchval(
+                "INSERT INTO events (tenant_id, event_type, payload, payload_size, occurred_at, "
+                "created_at, retain_until, external_id) "
+                "VALUES ($1, 'x.y', '{}', 2, $2::timestamptz, $2::timestamptz, "
+                "$2::timestamptz + interval '90 days', $3) RETURNING id",
+                tenant,
+                created,
+                external,
+            )
+            delivery_id = await conn.fetchval(
+                "INSERT INTO deliveries (tenant_id, event_id, endpoint_id, retain_until, "
+                "attempt_count) VALUES ($1, $2, $3, $4, 2) RETURNING id",
+                tenant,
+                event_id,
+                endpoint,
+                created + timedelta(days=90),
+            )
+            for n in (1, 2):
+                # The second attempt happens two days after the event (a retry / replay).
+                at = created + timedelta(days=2 * (n - 1))
+                await conn.execute(
+                    "INSERT INTO delivery_attempts (tenant_id, delivery_id, attempt_number, "
+                    "outcome, status_code, error_class, request_url, worker_id, started_at, "
+                    "finished_at, created_at) VALUES ($1, $2, $3, 'retrying', 503, "
+                    "'http_status', 'https://a.example.com/', 'w', $4, $4, $4)",
+                    tenant,
+                    delivery_id,
+                    n,
+                    at,
+                )
+            await conn.execute(
+                "INSERT INTO event_outbox (tenant_id, event_id, processed_at) "
+                "VALUES ($1, $2, CASE WHEN $3 THEN now() END)",
+                tenant,
+                event_id,
+                label != "new",
+            )
+            events.append({"label": label, "id": event_id, "created": created, "ext": external})
+        await conn.execute(
+            "INSERT INTO idempotency_keys (tenant_id, key, request_method, request_path, "
+            "fingerprint, expires_at, event_id, response_status, response_body) "
+            "VALUES ($1, 'k-old', 'POST', '/v1/events', $2, now() + interval '1 day', $3, 202, '{}')",
+            tenant,
+            b"\x00" * 32,
+            events[0]["id"],
+        )
+        return {"tenant": tenant, "events": events}
+    finally:
+        await conn.close()
+
+
+def _assert_graph_0012(url: str, seeded: dict[str, Any]) -> None:
+    """Every row is there and sits in the partition of its EVENT's UTC day."""
+    events = {str(e["id"]): e for e in seeded["events"]}
+
+    def day(moment: datetime) -> str:
+        return moment.astimezone(UTC).strftime("%Y%m%d")
+
+    for r in asyncio.run(
+        _fetch(url, "SELECT id, created_at, tableoid::regclass::text AS p FROM events")
+    ):
+        assert r["p"] == f"events_p{day(events[str(r['id'])]['created'])}"
+    rows = asyncio.run(
+        _fetch(
+            url,
+            "SELECT d.event_id, d.event_created_at, e.created_at, "
+            "d.tableoid::regclass::text AS p FROM deliveries d "
+            "JOIN events e ON e.id = d.event_id AND e.created_at = d.event_created_at",
+        )
+    )
+    assert len(rows) == 3
+    for r in rows:
+        assert r["p"] == f"deliveries_p{day(events[str(r['event_id'])]['created'])}"
+    attempts = asyncio.run(
+        _fetch(
+            url,
+            "SELECT d.event_id, a.attempt_number, a.created_at, "
+            "a.tableoid::regclass::text AS p FROM delivery_attempts a "
+            "JOIN deliveries d ON d.id = a.delivery_id AND d.event_created_at = a.event_created_at",
+        )
+    )
+    assert len(attempts) == 6
+    for r in attempts:  # the retry made two days later still lives with its event's day
+        assert r["p"] == f"delivery_attempts_p{day(events[str(r['event_id'])]['created'])}"
+    outbox = asyncio.run(
+        _fetch(
+            url,
+            "SELECT count(*) AS n FROM event_outbox o JOIN events e "
+            "ON e.id = o.event_id AND e.created_at = o.event_created_at",
+        )
+    )
+    assert outbox[0]["n"] == 3
+    claims = asyncio.run(
+        _fetch(
+            url,
+            "SELECT x.external_id, x.expires_at = e.retain_until AS same FROM event_external_ids x "
+            "JOIN events e ON e.id = x.event_id AND e.created_at = x.event_created_at "
+            "ORDER BY x.external_id",
+        )
+    )
+    assert [(c["external_id"], c["same"]) for c in claims] == [("ext-mid", True), ("ext-old", True)]
+    assert len(asyncio.run(_fetch(url, "SELECT 1 FROM idempotency_keys"))) == 1
+
+
+def test_m9d_partitioned_event_graph_roundtrip_keeps_every_row(scratch_database_url: str) -> None:
+    url = scratch_database_url
+    cfg = alembic_config(url)
+    command.upgrade(cfg, "0011")
+    seeded = asyncio.run(_seed_event_graph_0011(url))
+
+    command.upgrade(cfg, "0012")
+    _assert_graph_0012(url, seeded)
+    assert _schema_diff(url) == []
+    kinds = asyncio.run(
+        _fetch(
+            url,
+            "SELECT relname, relkind::text AS k FROM pg_class WHERE relname IN "
+            "('events', 'deliveries', 'delivery_attempts', 'events_m0011', 'deliveries_m0011')",
+        )
+    )
+    assert {r["relname"]: r["k"] for r in kinds} == {
+        "events": "p",
+        "deliveries": "p",
+        "delivery_attempts": "p",
+    }
+    # idempotency_keys no longer reference events: expiring the event leaves the record alone,
+    # and the downgrade drops such dangling records instead of failing on the old FK.
+    old_id = seeded["events"][0]["id"]
+    asyncio.run(_fetch(url, "DELETE FROM events WHERE id = $1", old_id))
+    assert len(asyncio.run(_fetch(url, "SELECT 1 FROM idempotency_keys"))) == 1
+
+    command.downgrade(cfg, "0011")
+    assert (
+        asyncio.run(
+            _fetch(url, "SELECT relkind::text AS k FROM pg_class WHERE relname = 'events'")
+        )[0]["k"]
+        == "r"
+    )
+    assert (
+        asyncio.run(
+            _fetch(
+                url, "SELECT relkind::text AS k FROM pg_class WHERE relname = 'delivery_attempts'"
+            )
+        )[0]["k"]
+        == "p"
+    )
+    assert "event_external_ids" not in _tables(url)
+    assert len(asyncio.run(_fetch(url, "SELECT 1 FROM events"))) == 2
+    assert len(asyncio.run(_fetch(url, "SELECT 1 FROM deliveries"))) == 2
+    assert len(asyncio.run(_fetch(url, "SELECT 1 FROM delivery_attempts"))) == 4
+    assert asyncio.run(_fetch(url, "SELECT 1 FROM idempotency_keys")) == []  # dangling: dropped
+    ext = asyncio.run(_fetch(url, "SELECT external_id FROM events ORDER BY created_at"))
+    assert [r["external_id"] for r in ext] == ["ext-mid", None]
+    # The 0011 unique index is back and enforces uniqueness again.
+    with pytest.raises(asyncpg.UniqueViolationError):
+        asyncio.run(
+            _fetch(
+                url,
+                "INSERT INTO events (tenant_id, event_type, payload, payload_size, occurred_at, "
+                "retain_until, external_id) SELECT tenant_id, 'x.y', '{}', 2, now(), "
+                "now() + interval '1 day', 'ext-mid' FROM events LIMIT 1",
+            )
+        )
+
+    command.upgrade(cfg, "0012")
+    survivors = [e for e in seeded["events"] if e["id"] != old_id]
+    _assert_survivors_0012(url, survivors)
+    assert _schema_diff(url) == []
+
+
+def _assert_survivors_0012(url: str, survivors: list[dict[str, Any]]) -> None:
+    ids = {str(e["id"]) for e in survivors}
+    assert {str(r["id"]) for r in asyncio.run(_fetch(url, "SELECT id FROM events"))} == ids
+    assert len(asyncio.run(_fetch(url, "SELECT 1 FROM deliveries"))) == 2
+    assert len(asyncio.run(_fetch(url, "SELECT 1 FROM delivery_attempts"))) == 4
+    claims = asyncio.run(_fetch(url, "SELECT external_id FROM event_external_ids"))
+    assert [c["external_id"] for c in claims] == ["ext-mid"]
+    mismatched = asyncio.run(
+        _fetch(
+            url,
+            "SELECT 1 FROM delivery_attempts a JOIN deliveries d ON d.id = a.delivery_id "
+            "WHERE a.event_created_at <> d.event_created_at",
+        )
+    )
+    assert mismatched == []
+
+
+def test_m9d_downgrade_refuses_to_lose_a_duplicate_external_id(
+    scratch_database_url: str,
+) -> None:
+    """An external id reclaimed while the expired event still waits for its partition drop
+    exists twice; the 0011 unique index cannot hold both, so the downgrade stops."""
+    url = scratch_database_url
+    cfg = alembic_config(url)
+    command.upgrade(cfg, "0012")
+    seeded = asyncio.run(_seed_event_graph_0012(url))
+    assert seeded
+    with pytest.raises(Exception, match=r"external_id|unique|duplicate"):
+        command.downgrade(cfg, "0011")
+    assert _version(url) == "0012"  # the failed downgrade rolled back completely
+    assert len(asyncio.run(_fetch(url, "SELECT 1 FROM events WHERE external_id = 'dup'"))) == 2
+
+
+async def _seed_event_graph_0012(url: str) -> bool:
+    from tests.integration.test_m1_schema import _event_type, _tenant  # noqa: PLC0415
+
+    conn = await asyncpg.connect(_asyncpg_dsn(url))
+    try:
+        tenant = await _tenant(conn, "m9d-dup")
+        await _event_type(conn, tenant, "x.y")
+        for age in (3, 0):
+            await conn.execute(
+                "INSERT INTO events (tenant_id, event_type, payload, payload_size, occurred_at, "
+                "created_at, retain_until, external_id) VALUES ($1, 'x.y', '{}', 2, now(), "
+                "now() - make_interval(days => $2), now() + interval '1 day', 'dup')",
+                tenant,
+                age,
+            )
+        return True
+    finally:
+        await conn.close()
