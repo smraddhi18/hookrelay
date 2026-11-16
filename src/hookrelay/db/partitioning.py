@@ -1,11 +1,13 @@
 """Native range partitioning: naming, bounds and the Alembic autogenerate filter (Milestone 9c).
 
-``delivery_attempts`` is ``PARTITION BY RANGE (created_at)`` with one partition per UTC day
-(``delivery_attempts_p20261114`` holds ``[2026-11-14 00:00Z, 2026-11-15 00:00Z)``) plus a
-``DEFAULT`` partition (``delivery_attempts_default``) that catches any row no daily partition
-covers, so an insert never fails because partition maintenance fell behind. Migration 0011
-creates the layout; :mod:`hookrelay.services.partitions` keeps partitions premade ahead and
-retires old ones.
+``events`` (by ``created_at``), ``deliveries`` and ``delivery_attempts`` (both by the event's
+``event_created_at``) are ``PARTITION BY RANGE`` with one partition per UTC day
+(``events_p20261114`` holds ``[2026-11-14 00:00Z, 2026-11-15 00:00Z)``, and the same day of the
+other two tables holds exactly the deliveries and attempts of those events) plus a ``DEFAULT``
+partition (``events_default`` ...) that catches any row no daily partition covers, so an insert
+never fails because partition maintenance fell behind. Migrations 0011 / 0012 create the layout;
+:mod:`hookrelay.services.partitions` keeps partitions premade ahead and retires old ones, child
+tables first.
 
 Partitions are not in ``Base.metadata`` (they are runtime objects, not schema), so the
 autogenerate filter :func:`include_name` hides them from ``alembic check``.
@@ -25,6 +27,10 @@ class PartitionedTable:
 
     name: str
     key: str
+    # Rows that strayed into DEFAULT can be moved into a new day partition only when no foreign
+    # key references the table: the move is DELETE + INSERT, and the DELETE would cascade into
+    # the referencing rows (events <- deliveries <- attempts).
+    movable: bool = False
 
     @property
     def default_partition(self) -> str:
@@ -47,8 +53,11 @@ class PartitionedTable:
         return table == self.default_partition or self.day_of(table) is not None
 
 
-DELIVERY_ATTEMPTS: Final = PartitionedTable("delivery_attempts", "created_at")
-PARTITIONED_TABLES: Final = (DELIVERY_ATTEMPTS,)
+EVENTS: Final = PartitionedTable("events", "created_at")
+DELIVERIES: Final = PartitionedTable("deliveries", "event_created_at")
+DELIVERY_ATTEMPTS: Final = PartitionedTable("delivery_attempts", "event_created_at", movable=True)
+# Parents first: creation order. Retention walks it reversed (children first).
+PARTITIONED_TABLES: Final = (EVENTS, DELIVERIES, DELIVERY_ATTEMPTS)
 
 
 def day_bounds(day: date) -> tuple[datetime, datetime]:
@@ -92,6 +101,22 @@ def _parse_ts(raw: str) -> datetime:
         msg = f"partition bound {raw!r} has no time zone"
         raise ValueError(msg)
     return value
+
+
+def include_object(
+    obj: object, name: str | None, type_: str, reflected: bool, _compare_to: object
+) -> bool:
+    """Alembic ``include_object`` hook: skip the per-partition clones of a foreign key.
+
+    A foreign key that targets a partitioned table is cloned by Postgres onto the referencing
+    table once per referenced partition (``..._fkey1``, ``..._fkey2`` ...); reflection reports
+    them as extra constraints that the models (one FK to the parent) do not have.
+    """
+    if type_ == "foreign_key_constraint" and reflected:
+        referred = getattr(getattr(obj, "referred_table", None), "name", None)
+        if referred is not None:
+            return not any(table.is_partition(referred) for table in PARTITIONED_TABLES)
+    return True
 
 
 def include_name(name: str | None, type_: str, _parent_names: object) -> bool:
