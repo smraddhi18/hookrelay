@@ -81,3 +81,17 @@ The chaos tests (`tests/integration/test_chaos.py`) run the same receiver in-pro
 - `APP_ENV=development` is used because only development may deliver to a loopback receiver
   (`DELIVERY_ALLOW_PRIVATE_NETWORKS` is refused in production by design). Credentials are
   random per run.
+
+## Partition costs: `partition_bench.py`
+
+Builds a scratch Postgres database with 31 UTC days of the event graph in the partitioned layout
+(`N_PER_DAY` events, one delivery and two attempts each; default 15,000), copies the same rows
+into the previous layouts, and prints medians for the endpoint-health window, the lease
+candidate pick and keyed vs id-only lookups, then times the child-first retirement of the oldest
+day against the row-by-row `DELETE` it replaces. The figures in
+[docs/partitioning.md](../docs/partitioning.md) come from it.
+
+```bash
+ADMIN_URL=postgresql://user:pw@localhost:5432/postgres N_PER_DAY=15000 \
+  uv run python loadtest/partition_bench.py
+```
