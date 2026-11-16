@@ -65,7 +65,9 @@ packages = ["src/hookrelay"]
 line-length = 100
 target-version = "py312"
 src = ["src", "tests"]
-extend-exclude = ["alembic/versions/*.py.mako"]
+# loadtest/partition_bench.py is a throw-away measurement script (prints, builds SQL from
+# constants), kept for reproducibility of the figures in docs/partitioning.md, not product code.
+extend-exclude = ["alembic/versions/*.py.mako", "loadtest/partition_bench.py"]
 
 [tool.ruff.lint]
 select = [
@@ -84,7 +86,7 @@ known-first-party = ["hookrelay", "tests"]
 known-third-party = ["alembic"]
 
 [tool.ruff.lint.per-file-ignores]
-"tests/**" = ["S101", "S105", "S106", "PLR2004", "ANN", "S311"]
+"tests/**" = ["S101", "S105", "S106", "PLR2004", "ANN", "S311", "E501"]
 # Worker-style modules share test_worker's per-test database fixtures by import.
 "tests/integration/test_backpressure.py" = ["F811"]
 "tests/integration/test_replays.py" = ["F811"]
@@ -99,6 +101,7 @@ known-third-party = ["alembic"]
 # DDL takes no bind parameters: identifiers are generated (and quoted) from our own naming
 # scheme and the catalog, never from input. Values still go through bind parameters.
 "alembic/versions/0011_partition_delivery_attempts.py" = ["ANN", "S608"]
+"alembic/versions/0012_partition_events_deliveries.py" = ["ANN", "S608"]
 "src/hookrelay/services/partitions.py" = ["S608"]
 
 [tool.ruff.lint.flake8-bugbear]

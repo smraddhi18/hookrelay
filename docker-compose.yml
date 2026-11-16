@@ -59,6 +59,9 @@ x-app-env: &app-env
   RETENTION_MAX_BATCHES: ${RETENTION_MAX_BATCHES:-200}
   PARTITION_PREMAKE_DAYS: ${PARTITION_PREMAKE_DAYS:-7}
   PARTITION_RETENTION_DAYS: ${PARTITION_RETENTION_DAYS:-0}
+  RETENTION_EVENT_PURGE_GRACE_S: ${RETENTION_EVENT_PURGE_GRACE_S:-172800}
+  RELAY_PARTITION_CHECK_INTERVAL_S: ${RELAY_PARTITION_CHECK_INTERVAL_S:-300}
+  RELAY_PARTITION_MIN_DAYS_AHEAD: ${RELAY_PARTITION_MIN_DAYS_AHEAD:-2}
   # Observability (Milestone 7). /metrics is public; set METRICS_TOKEN to require a bearer.
   METRICS_ENABLED: ${METRICS_ENABLED:-true}
   METRICS_TOKEN: ${METRICS_TOKEN:-}
@@ -208,8 +211,9 @@ services:
         condition: service_healthy
     restart: "no"
 
-  # One-shot delivery_attempts partition maintenance (Milestone 9c): premake daily partitions,
-  # detach + drop the ones past retention. `docker compose run --rm partitions` (cron it
+  # One-shot partition maintenance (Milestones 9c/9d) of events, deliveries and
+  # delivery_attempts: premake daily partitions, detach + drop the ones past retention (children
+  # first, so one event day leaves as a unit). `docker compose run --rm partitions` (cron it
   # hourly; the Helm chart ships it as a CronJob). Connects with DATABASE_DIRECT_URL (advisory
   # lock + DETACH CONCURRENTLY must not go through PgBouncer's transaction pooling).
   partitions:
