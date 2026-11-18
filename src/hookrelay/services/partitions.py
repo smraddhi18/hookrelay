@@ -15,7 +15,10 @@ lock, and does, in order:
    ``deliveries`` the move is impossible: it is a ``DELETE`` + ``INSERT`` and the ``DELETE``
    would cascade into the referencing rows. A day that has rows in their ``DEFAULT`` is
    reported as *blocked* (``blocked_days``, a warning, an incomplete run) instead, and those rows
-   expire through the ``DEFAULT`` sweep (step 4) or the row-by-row backstop purge. ``ATTACH``
+   expire through the ``DEFAULT`` sweep (step 4) or the row-by-row backstop purge, unless the
+   run has ``repair_default`` (Milestone 9e): then, before planning and only while it holds all
+   three advisory locks, it re-homes those days cascade-safely
+   (:mod:`hookrelay.services.partition_repair`). ``ATTACH``
    takes ``SHARE UPDATE EXCLUSIVE`` on the parent, so inserts and reads keep going
    (``CREATE TABLE ... PARTITION OF`` would take ``ACCESS EXCLUSIVE``);
 3. **retire** every partition whose whole day is older than ``retention_days``, children first
@@ -68,6 +71,7 @@ from hookrelay.db.partitioning import (
     parse_range_bound,
     utc_day,
 )
+from hookrelay.services.partition_repair import REPAIRED, WOULD_REPAIR, repair_defaults
 
 logger = structlog.stdlib.get_logger("hookrelay.partitions")
 
@@ -137,9 +141,16 @@ class PartitionPolicy:
     sweep_max_batches: int = 200
     dry_run: bool = False
     premake_only: bool = False  # the relay's safety net: never retire, never sweep
+    # Milestone 9e: re-home rows stranded in the events / deliveries DEFAULT partitions
+    # (hookrelay.services.partition_repair), at most this many days and rows per day per run.
+    repair_default: bool = False
+    repair_max_days: int = 7
+    repair_max_rows: int = 50_000
 
     @classmethod
-    def from_settings(cls, settings: Settings, *, dry_run: bool = False) -> PartitionPolicy:
+    def from_settings(
+        cls, settings: Settings, *, dry_run: bool = False, repair_default: bool | None = None
+    ) -> PartitionPolicy:
         return cls(
             premake_days=settings.partition_premake_days,
             retention_days=settings.partition_retention_days_effective,
@@ -148,6 +159,11 @@ class PartitionPolicy:
             sweep_batch_size=settings.retention_batch_size,
             sweep_max_batches=settings.retention_max_batches,
             dry_run=dry_run,
+            repair_default=(
+                settings.partition_repair_default if repair_default is None else repair_default
+            ),
+            repair_max_days=settings.partition_repair_max_days,
+            repair_max_rows=settings.partition_repair_max_rows,
         )
 
 
@@ -163,6 +179,11 @@ class PartitionReport:
     deferred: list[str] = field(default_factory=list)
     blocked_days: list[str] = field(default_factory=list)  # DEFAULT rows prevent the partition
     blocked: list[str] = field(default_factory=list)  # detach refused: referencing rows left
+    # Milestone 9e repair of stranded DEFAULT rows (only with repair_default):
+    repaired_days: list[str] = field(default_factory=list)  # days this table was the root of
+    repaired_rows: int = 0  # rows of this table re-homed (as root or as part of a component)
+    repair_planned: list[str] = field(default_factory=list)  # dry run: days it would repair
+    repair_skipped: list[str] = field(default_factory=list)  # "<day> <status>": left in DEFAULT
     default_rows_deleted: int = 0
     default_rows: int = 0  # left in DEFAULT after the run, capped at DEFAULT_ROWS_CAP
     partitions: int = 0  # daily partitions attached after the run
@@ -185,6 +206,10 @@ class PartitionReport:
             "deferred": self.deferred,
             "blocked_days": self.blocked_days,
             "blocked": self.blocked,
+            "repaired_days": self.repaired_days,
+            "repaired_rows": self.repaired_rows,
+            "repair_planned": self.repair_planned,
+            "repair_skipped": self.repair_skipped,
             "default_rows_deleted": self.default_rows_deleted,
             "default_rows": self.default_rows,
             "partitions": self.partitions,
@@ -663,10 +688,25 @@ async def maintain(
         for t in tables
     ]
     held: list[PartitionMaintainer] = []
+    # Milestone 9e: the repair needs all three table locks. Only the holder of the repair gate
+    # waits for the ones another run holds (every other acquirer only tries, so the waiting
+    # cannot deadlock); without the gate two overlapping runs could each hold part of the set
+    # and neither repair.
+    repair = policy.repair_default and not policy.premake_only
+    gate = repair and await _try_advisory_lock(conn, REPAIR_GATE_KEY)
     try:
         for m in maintainers:
-            if await m.acquire():
+            if await m.acquire() or (gate and await _acquire_patiently(m, policy, sleep)):
                 held.append(m)  # noqa: PERF401 - awaits in the condition
+        if repair:
+            await _repair_phase(
+                conn,
+                policy,
+                maintainers=maintainers,
+                held=held if gate else [],  # no gate: another run is repairing
+                should_stop=should_stop,
+                sleep=sleep,
+            )
         for m in held:
             await m.prepare()
         for m in held:
@@ -678,7 +718,68 @@ async def maintain(
     finally:
         for m in reversed(held):
             await m.release()
+        if gate:
+            await conn.execute(
+                "SELECT pg_advisory_unlock(hashtextextended($1, 0))", REPAIR_GATE_KEY
+            )
     return [m.report for m in maintainers]
+
+
+REPAIR_GATE_KEY = "hookrelay.partitions:repair"
+
+
+async def _try_advisory_lock(conn: asyncpg.Connection, key: str) -> bool:
+    return bool(await conn.fetchval("SELECT pg_try_advisory_lock(hashtextextended($1, 0))", key))
+
+
+async def _acquire_patiently(
+    m: PartitionMaintainer,
+    policy: PartitionPolicy,
+    sleep: Callable[[float], Awaitable[None]],
+) -> bool:
+    """Retry a table lock another run holds, with the DDL backoff (the repair gate holder
+    only): other runs finish or skip, so the lock frees up."""
+    delay = max(policy.retry_base_s, 0.05)
+    for _ in range(policy.ddl_retries):
+        await sleep(delay)
+        delay = min(delay * 2, policy.retry_max_s)
+        if await _try_advisory_lock(m.conn, advisory_key(m.table)):
+            m.report.skipped_locked = False
+            logger.info("partitions.lock_acquired_for_repair", table=m.table.name)
+            return True
+    return False
+
+
+async def _repair_phase(
+    conn: asyncpg.Connection,
+    policy: PartitionPolicy,
+    *,
+    maintainers: list[PartitionMaintainer],
+    held: list[PartitionMaintainer],
+    should_stop: Callable[[], bool],
+    sleep: Callable[[float], Awaitable[None]],
+) -> None:
+    """Re-home stranded DEFAULT rows before planning (so the plan sees the new partitions).
+
+    Needs every table's advisory lock: a component spans all three tables. If another runner
+    holds one, it is that runner's job (or the next run's); nothing is reported as repaired."""
+    reports = {m.table.name: m.report for m in maintainers}
+    if {m.table.name for m in held} != {t.name for t in PARTITIONED_TABLES}:
+        logger.info("partitions.repair_skipped_locked")
+        return
+    for result in await repair_defaults(conn, policy, should_stop=should_stop, sleep=sleep):
+        root = reports[result.table]
+        day = result.day.isoformat()
+        if result.status == WOULD_REPAIR:
+            root.repair_planned.append(day)
+        elif result.status == REPAIRED:
+            root.repaired_days.append(day)
+            for table, n in result.rows.items():
+                if table in reports:
+                    reports[table].repaired_rows += n
+        else:
+            root.repair_skipped.append(f"{day} {result.status}")
+            root.complete = False
 
 
 async def ensure_premade(
