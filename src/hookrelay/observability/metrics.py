@@ -45,6 +45,7 @@ _FLUSH_BUCKETS_S: Final = (0.001, 0.0025, 0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 1
 SERVICE_API: Final = "api"
 SERVICE_RELAY: Final = "relay"
 SERVICE_WORKER: Final = "worker"
+SERVICE_PARTITIONS: Final = "partitions"
 
 
 @dataclass(slots=True)
@@ -74,6 +75,7 @@ class Metrics:
     worker_completion_flush_seconds: Histogram
     worker_completion_retries: Counter
     partition_safety_premakes: Counter
+    partition_repaired_rows: Counter
     partitions: Gauge
     partition_premade_seconds: Gauge
     partition_default_rows: Gauge
@@ -101,6 +103,10 @@ class Metrics:
 
     def record_partition_safety_premake(self, table: str, n: int = 1) -> None:
         self.partition_safety_premakes.labels(service=self.service, table=table).inc(n)
+
+    def record_partition_repair(self, table: str, rows: int) -> None:
+        if rows:
+            self.partition_repaired_rows.labels(service=self.service, table=table).inc(rows)
 
     def record_relay_loop_error(self) -> None:
         self.relay_loop_errors.labels(service=self.service).inc()
@@ -287,6 +293,13 @@ def build_metrics(service: str) -> Metrics:
             "hookrelay_partition_safety_premakes_total",
             "Daily partitions the relay's safety net had to create because the maintenance job "
             "had not (alert on any increase: hookrelay-partitions is behind or dead).",
+            ["service", "table"],
+            registry=registry,
+        ),
+        partition_repaired_rows=Counter(
+            "hookrelay_partition_repaired_rows_total",
+            "Rows hookrelay-partitions --repair-default moved out of a DEFAULT partition into "
+            "their day partition, per table (written by the job; see --metrics-textfile).",
             ["service", "table"],
             registry=registry,
         ),
