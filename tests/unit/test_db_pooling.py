@@ -38,6 +38,9 @@ SESSION_FEATURES: dict[str, re.Pattern[str]] = {
 DIRECT_CONNECTION_MODULES = {
     # Milestone 9c: single-runner advisory lock + DETACH CONCURRENTLY (no transaction block).
     Path("services/partitions.py"): Path("partitions.py"),
+    # Milestone 9e: the DEFAULT repair runs inside that same maintenance session (its temp
+    # tables are ON COMMIT DROP, but they still live in the session's pg_temp schema).
+    Path("services/partition_repair.py"): Path("partitions.py"),
 }
 
 

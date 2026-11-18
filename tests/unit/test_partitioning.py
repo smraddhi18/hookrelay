@@ -21,6 +21,7 @@ from hookrelay.db.partitioning import (
     utc_day,
 )
 from hookrelay.observability.metrics import SERVICE_RELAY, build_metrics, render_metrics
+from hookrelay.services.partition_repair import DayRepair, ForeignKey, _match
 from hookrelay.services.partitions import (
     Partition,
     PartitionPolicy,
@@ -297,3 +298,65 @@ def test_safety_net_and_retention_settings_are_bounded() -> None:
     ):
         with pytest.raises(ValidationError):
             make_settings(**bad)
+
+
+# --- Milestone 9e: repair of stranded DEFAULT rows ------------------------------------------
+
+
+def test_repair_settings_are_off_by_default_and_bounded() -> None:
+    settings = make_settings()
+    assert settings.partition_repair_default is False
+    assert settings.partition_repair_max_days == 7
+    assert settings.partition_repair_max_rows == 50_000
+    policy = PartitionPolicy.from_settings(settings)
+    assert (policy.repair_default, policy.repair_max_days, policy.repair_max_rows) == (
+        False,
+        7,
+        50_000,
+    )
+    # The CLI flag overrides the setting either way.
+    assert PartitionPolicy.from_settings(settings, repair_default=True).repair_default
+    on = make_settings(partition_repair_default=True, partition_repair_max_rows=10)
+    assert PartitionPolicy.from_settings(on).repair_default
+    assert not PartitionPolicy.from_settings(on, repair_default=False).repair_default
+    assert PartitionPolicy.from_settings(on).repair_max_rows == 10
+    for bad in ({"partition_repair_max_days": 0}, {"partition_repair_max_rows": 0}):
+        with pytest.raises(ValidationError):
+            make_settings(**bad)
+
+
+def test_report_logs_repair_fields() -> None:
+    report = PartitionReport(table="events", repaired_days=["2026-11-20"], repaired_rows=3)
+    report.repair_skipped.append("2026-11-21 too_large")
+    log = report.as_log()
+    assert log["repaired_days"] == ["2026-11-20"]
+    assert log["repaired_rows"] == 3
+    assert log["repair_planned"] == []
+    assert log["repair_skipped"] == ["2026-11-21 too_large"]
+
+
+def test_repair_helpers() -> None:
+    fk = ForeignKey(
+        name="fk",
+        child="deliveries",
+        parent="events",
+        child_cols=("tenant_id", "event_id"),
+        parent_cols=("tenant_id", "id"),
+        on_delete="c",
+    )
+    assert fk.cascades
+    assert not ForeignKey("f", "a", "b", ("x",), ("y",), "n").cascades
+    assert _match(fk) == 'c."tenant_id" = p."tenant_id" AND c."event_id" = p."id"'
+    result = DayRepair(table="events", day=date(2026, 11, 20), status="repaired")
+    result.rows.update({"events": 2, "deliveries": 3})
+    assert result.total_rows == 5
+    assert result.as_log()["day"] == "2026-11-20"
+    assert result.as_log()["total_rows"] == 5
+
+
+def test_cli_accepts_the_repair_flags(capsys: pytest.CaptureFixture[str]) -> None:
+    with pytest.raises(SystemExit):
+        partitions_cli.main(["--help"])
+    out = capsys.readouterr().out
+    assert "--repair-default" in out
+    assert "--metrics-textfile" in out
