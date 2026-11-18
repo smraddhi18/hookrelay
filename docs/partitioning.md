@@ -158,7 +158,7 @@ the cascade finds nothing. `0` purges as soon as an event expires (no partition 
 
 ## Maintenance job: `hookrelay-partitions`
 
-`python -m hookrelay.partitions [--dry-run]` runs as an hourly CronJob in Helm (`partitions.*`
+`python -m hookrelay.partitions [--dry-run] [--repair-default] [--metrics-textfile PATH]` runs as an hourly CronJob in Helm (`partitions.*`
 values, `concurrencyPolicy: Forbid`, `7 * * * *`) and as the `partitions` compose service
 (`--profile ops`). It maintains all three tables in the order above; every step is idempotent,
 so a crashed, repeated or overlapping run is harmless.
@@ -176,8 +176,9 @@ so a crashed, repeated or overlapping run is harmless.
    partition and moves the rows (DELETE + INSERT in one transaction). `events` and `deliveries`
    are **not** moved: the move is a DELETE, and `ON DELETE CASCADE` would delete the rows that
    reference them. The day is reported as `blocked_days` (`partitions.blocked_by_default_rows`
-   warning, exit code 3, `hookrelay_partition_default_rows`) and needs an operator (see
-   below). The relay's premake keeps this from happening in the first place.
+   warning, exit code 3, `hookrelay_partition_default_rows`). With `--repair-default`
+   (`PARTITION_REPAIR_DEFAULT=true`) the run repairs those days first, cascade-safe (below).
+   The relay's premake keeps this from happening in the first place.
 5. **Retire** children first (above), then drop orphaned tables a crashed run detached.
 6. **Sweep DEFAULT** of rows older than the cutoff, child first, in `ctid` batches (an event's
    deliveries cascade, which is intended: it is past retention).
@@ -202,19 +203,138 @@ healthy CronJob and the relay can not disagree. Anything it creates logs `relay.
 signal that the job is not running while the relay is hiding the symptom. A failure of the check
 is a counted loop error, never a stopped relay.
 
-### If rows are stranded in `events_default` / `deliveries_default`
+### If rows are stranded in `events_default` / `deliveries_default`: `--repair-default` (Milestone 9e)
 
 It happens only if partitions were missing when a row arrived (the CronJob **and** the relay
-down for longer than the premake horizon, or a clock / time-zone mistake). The job refuses to
-move them, because the move is a DELETE whose `ON DELETE CASCADE` would delete the rows that
-reference them, and reports the day in `blocked_days` (tested:
-`test_days_stranded_in_default_are_blocked_not_moved_for_parent_tables`). Rows older than the
-cutoff are simply swept. Repairing a live day is a manual, **untested** operation in this
-milestone: it needs the day's three partitions created while the rows are re-homed with FK
-triggers off (`SET session_replication_role = replica` as a superuser), with the relay and
-workers stopped. A cascade-safe automatic repair needs that superuser setting or a different FK
-design (deferrable `NO ACTION` plus an explicit purge); it is recorded as remaining work
-rather than shipped half-tested. The relay's premake exists to keep this from happening.
+down for longer than the premake horizon, or a clock / time-zone mistake). Postgres then
+refuses to create that day's partition: `ATTACH` (like `CREATE TABLE … PARTITION OF`) fails
+while the DEFAULT holds rows of the new range. Rows past the cutoff are simply swept. For a live
+day, a plain run reports `blocked_days` (exit 3) and leaves every row where it is
+(`test_without_the_flag_blocked_days_are_still_reported`).
+
+**Why not just move the rows?** A move is `DELETE` + `INSERT`, and the `DELETE` of an `events`
+row fires `ON DELETE CASCADE` into `deliveries`, `delivery_attempts` and `event_outbox`.
+Referential actions cannot be deferred (only the `NO ACTION` check can), turning FK triggers
+off (`session_replication_role = replica`) needs a superuser, and dropping and re-adding the
+FKs would re-validate every row of the referencing tables (Postgres 16 refuses `NOT VALID`
+foreign keys on partitioned tables: "not yet supported on partitioned tables"). Copying the row into the new partition first does not work
+either: the partition cannot be attached while the DEFAULT still holds the original.
+
+**What the repair does instead** (`hookrelay.services.partition_repair`): it lets the cascade
+happen *inside one transaction*, after taking a copy of everything it will remove, and puts it
+all back. Per stranded day of one root table (`events`; `deliveries` when only that day's
+deliveries are stranded because the events partition existed):
+
+1. `LOCK TABLE … IN SHARE ROW EXCLUSIVE MODE` on every table of the component (`events`,
+   `deliveries`, `event_outbox`, `delivery_attempts`), parents first, **before anything else**.
+   Reads continue, but writes to the event graph wait until commit, which is a short write
+   freeze bounded by the row budget (measured below). The reason is a finding of this
+   milestone: `ATTACH` of an `events` partition takes `SHARE ROW EXCLUSIVE` on `deliveries` and
+   `event_outbox` (the referencing tables), and `ATTACH` of a `deliveries` partition takes it
+   on `events` and `delivery_attempts` (checked in `pg_locks`). Taking those locks only at
+   attach time deadlocked in testing with a concurrent ingest. That writer held `ROW EXCLUSIVE`
+   on `events` while it waited for the DEFAULT partition this transaction had locked. Taken
+   first, the repair waits (under `lock_timeout`) only while it holds nothing. The same
+   ordering makes a racing writer for the stranded day wait at the parent table, before tuple
+   routing, so after the commit it lands in the new partition
+   (`test_a_writer_racing_into_the_stranded_day_waits_and_loses_nothing`).
+2. Walk the FKs that reference the root **from the catalog** (`pg_constraint`, table-level
+   constraints only) and copy the day's connected component into `ON COMMIT DROP` temp tables,
+   parents first, `FOR UPDATE` on every source row. That row-locks rows in already-existing
+   day partitions and in plain tables (`event_outbox`), so no writer can modify, delete or newly
+   reference them before commit (a new delivery or attempt needs `FOR KEY SHARE` on its parent,
+   which conflicts). A non-cascading FK with matching rows (`NO ACTION` would fail, `SET NULL`
+   would silently change data) makes the day `unsupported`, and so does a table reachable along
+   two FK paths (the copy could not be faithful). A day bigger than
+   `PARTITION_REPAIR_MAX_ROWS` (whole component) is skipped as `too_large`, checked on the root
+   before anything is copied or locked: a day can only move as a unit, because `ATTACH` needs
+   the DEFAULT free of the entire range.
+3. `DELETE FROM ONLY <root>_default` for the day. The cascade removes the component. The deleted
+   count must equal the copied count, or the transaction rolls back.
+4. **Stage** each missing day partition standalone (`LIKE` the parent + a bound `CHECK`) and
+   fill it straight from its copy. A standalone table has no triggers and no FKs yet, so this
+   is one bulk insert per table instead of a trigger and an FK check per row. The copies
+   already hold the derived columns.
+5. Parents first, `ATTACH` each staged partition, or re-insert through the parent table for a
+   table whose day partition already existed and for plain tables (`event_outbox`; routing,
+   triggers and FK checks apply, and `OVERRIDING SYSTEM VALUE` keeps `event_outbox.id`).
+   `ATTACH` validates the new partition's FKs against the parents in one set-based check and
+   skips the bound scan thanks to the `CHECK`. Every inserted count must match. Staging matters
+   because `ATTACH` holds `ACCESS EXCLUSIVE` on the DEFAULT partition until commit, which blocks
+   even readers of queries that cannot prune the DEFAULT. The first version re-inserted every
+   row through the parent and took 5.1 s for a 50,000-row day; staging took 2.0 s, of which
+   0.6 s is after the first `ATTACH`.
+
+Any error rolls back the whole day: either the component moved completely or nothing changed.
+Lock timeouts, deadlocks, a `CHECK` violation from `ATTACH` (a row raced in) and a count
+mismatch are retried with the job's capped backoff (`PARTITION_DDL_RETRIES`), then the day is
+reported `deferred`. Other database errors are reported `failed`. The phase runs before planning
+(so premake sees the new partitions), only while the run holds **all three** per-table advisory
+locks, so it is single-flight with other runs and with the relay's premake. Because every
+acquirer only *tries* those locks, two overlapping repair runs could each hold part of the set
+and neither repair (the first full CI run caught this). So a repair run first takes a
+**repair gate** (`hookrelay.partitions:repair`). Only the gate holder then retries, with
+backoff, the table locks another run holds. Everyone else only tries, so this waiting cannot
+deadlock. A run without the gate maintains its tables as usual and leaves the repair to the
+holder. It is bounded by
+`PARTITION_REPAIR_MAX_DAYS` per run (the rest are `deferred` to the next run), `events` days
+first. With `--dry-run` the copy runs without locks and is rolled back, so the report lists
+`repair_planned` days, and `repair_day` returns the per-table counts.
+
+**Interaction with workers.** A worker holding a lease (row lock) on a delivery of the component
+makes the repair wait, bounded by `lock_timeout`, then retry or defer. A completion that arrives
+after the commit finds the row gone from the old partition, which it treats like a lost lease
+(fenced writes, Milestone 9a), so that delivery is retried after the lease expires. That is
+at-least-once delivery, never a lost row.
+
+**Signals.** Each day logs `partitions.repaired` or `partitions.repair_skipped` (with `day`,
+`status`, rows per table, `elapsed_ms`). The report adds `repaired_days`, `repaired_rows`,
+`repair_planned` and `repair_skipped`. A repaired day counts as done (exit 0), and a skipped one
+makes the run incomplete (exit 3), with the day still in `blocked_days` if it is inside the
+premake window. `hookrelay_partition_default_rows` drops to 0. Because a CronJob is never
+scraped, `--metrics-textfile PATH` writes `hookrelay_partition_repaired_rows_total{table}` for
+that run in the Prometheus text format, for a node-exporter textfile collector.
+
+**Tested on Postgres 16** (`tests/integration/test_partition_repair.py`, 20 tests). Every test
+compares the `to_jsonb` image of every row of the four tables before and after, plus FK
+integrity. The tests cover:
+
+- two stranded days, one in the past and one in the future, with a control event in an existing
+  partition;
+- idempotency;
+- a dry run changing nothing;
+- blocked days without the flag;
+- the row budget (the component, and the root alone);
+- the day budget;
+- a deliveries-only stranded day;
+- days past retention left to the sweep;
+- two concurrent runs (each day repaired exactly once);
+- a held repair gate, and the gate holder waiting for a table lock to free up;
+- a held advisory lock (repair skipped);
+- a held delivery row lock (`deferred`, then repaired by the next run);
+- `SET NULL` and diamond FKs (`unsupported`);
+- the catalog walk;
+- the CLI flag, exit codes and textfile;
+- new writes after a repair;
+- existing child partitions refilled through the parent;
+- a racing writer.
+
+**Measured** with `loadtest/partition_repair_bench.py` on the build box (Postgres 16.16, one shared
+box, `fsync = off` like the test cluster). The setup was 14 background days × 10,000 events in
+their own partitions, then one stranded future day per size. Each event has a delivery, two
+attempts and an outbox row, so 5 rows per event. Each size is one run, not a median. After every
+run, every row of the day was identical (`to_jsonb`).
+
+| Stranded day | Rows moved | Repair transaction (= write freeze) | delete (cascade) | after first `ATTACH` |
+|---|---|---|---|---|
+| 1,000 events | 5,000 | 331 ms | 124 ms | 149 ms |
+| 10,000 events | 50,000 (the default `PARTITION_REPAIR_MAX_ROWS`) | 2,028 ms | 1,148 ms | 594 ms |
+| 20,000 events | 100,000 | 3,712 ms | 2,265 ms | 1,128 ms |
+
+The cost is linear in the component and dominated by the row-by-row cascade of the `DELETE`
+(RI triggers). Writers to the event graph wait for the whole transaction, and readers of
+unprunable queries wait for the part after the first `ATTACH`. Size `PARTITION_REPAIR_MAX_ROWS`
+to the write pause you accept. Larger days, multi-node and a loaded system were not measured.
 
 ### Settings
 
@@ -227,9 +347,13 @@ rather than shipped half-tested. The relay's premake exists to keep this from ha
 | `RETENTION_EVENT_PURGE_GRACE_S` | 172800 | the row-level event purge waits this long past `retain_until` (0-30 d; 0 = purge on expiry) |
 | `RELAY_PARTITION_CHECK_INTERVAL_S` | 300 | relay premake safety net cadence (0 = off) |
 | `RELAY_PARTITION_MIN_DAYS_AHEAD` | 2 | how far ahead the relay premakes (1-30) |
+| `PARTITION_REPAIR_DEFAULT` | false | repair stranded `events` / `deliveries` DEFAULT rows on every run (same as `--repair-default`) |
+| `PARTITION_REPAIR_MAX_DAYS` | 7 | stranded days repaired per run, one transaction each (1-366) |
+| `PARTITION_REPAIR_MAX_ROWS` | 50000 | the most rows (whole component of a day) one repair transaction moves; a bigger day is skipped as `too_large` (1-5,000,000) |
 
-Exit codes: `0` done (or another runner holds a lock), `3` incomplete (something deferred or
-blocked, or the sweep cap was reached), `1` a table is not partitioned (database below `0012`).
+Exit codes: `0` done (or another runner holds a lock; a repaired day counts as done), `3`
+incomplete (something deferred or blocked, a repair skipped, or the sweep cap was reached), `1`
+a table is not partitioned (database below `0012`).
 
 ### Metrics and alerts
 
@@ -239,6 +363,7 @@ blocked, or the sweep cap was reached), `1` a table is not partitioned (database
 | `hookrelay_partition_premade_seconds` | `< 2 * 86400`: premake has been failing for days |
 | `hookrelay_partition_default_rows` (capped at 10,000) | `> 0` for an hour: rows are landing in DEFAULT |
 | `hookrelay_partition_safety_premakes_total` (counter, relay) | any increase: the CronJob is behind and the relay is covering for it |
+| `hookrelay_partition_repaired_rows_total` (job, via `--metrics-textfile`; that run's rows) | non-zero: a repair ran, so find out why partitions were missing |
 
 Alert on CronJob failures too (`kube_job_status_failed`), which covers exit code 3.
 
@@ -272,7 +397,6 @@ still documented, not automated:
 
 ## What is left
 
-- A cascade-safe automatic repair of stranded `events` / `deliveries` DEFAULT rows (see above).
 - Making the parent `DETACH` cheap at high volume (see the measured scaling) and shrinking the
   lease-pick tax with a retention-independent bound.
 - Tooling for the online migration paths. They are documented, not automated.
