@@ -65,9 +65,14 @@ packages = ["src/hookrelay"]
 line-length = 100
 target-version = "py312"
 src = ["src", "tests"]
-# loadtest/partition_bench.py is a throw-away measurement script (prints, builds SQL from
-# constants), kept for reproducibility of the figures in docs/partitioning.md, not product code.
-extend-exclude = ["alembic/versions/*.py.mako", "loadtest/partition_bench.py"]
+# loadtest/partition_bench.py and partition_repair_bench.py are throw-away measurement scripts
+# (prints, builds SQL from constants), kept for reproducibility of the figures in
+# docs/partitioning.md, not product code.
+extend-exclude = [
+    "alembic/versions/*.py.mako",
+    "loadtest/partition_bench.py",
+    "loadtest/partition_repair_bench.py",
+]
 
 [tool.ruff.lint]
 select = [
@@ -103,6 +108,7 @@ known-third-party = ["alembic"]
 "alembic/versions/0011_partition_delivery_attempts.py" = ["ANN", "S608"]
 "alembic/versions/0012_partition_events_deliveries.py" = ["ANN", "S608"]
 "src/hookrelay/services/partitions.py" = ["S608"]
+"src/hookrelay/services/partition_repair.py" = ["S608"]
 
 [tool.ruff.lint.flake8-bugbear]
 extend-immutable-calls = ["fastapi.Depends", "fastapi.Query", "fastapi.Header"]
