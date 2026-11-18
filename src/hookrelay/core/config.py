@@ -284,6 +284,15 @@ class Settings(BaseSettings):
     partition_retention_days: Annotated[int, Field(ge=0, le=3_650)] = 0
     partition_lock_timeout_ms: Annotated[int, Field(ge=50, le=60_000)] = 2_000
     partition_ddl_retries: Annotated[int, Field(ge=0, le=20)] = 5
+    # Milestone 9e: with PARTITION_REPAIR_DEFAULT (or `hookrelay-partitions --repair-default`)
+    # a run re-homes rows stranded in the events / deliveries DEFAULT partitions into new day
+    # partitions, one day's whole event graph per transaction (cascade-safe copy, delete,
+    # create, re-insert; hookrelay.services.partition_repair). Off by default: it is a repair,
+    # not routine work. Bounded per run by days and by rows per day (a bigger day is skipped
+    # and reported, since a day can only move as a unit).
+    partition_repair_default: bool = False
+    partition_repair_max_days: Annotated[int, Field(ge=1, le=366)] = 7
+    partition_repair_max_rows: Annotated[int, Field(ge=1, le=5_000_000)] = 50_000
     # Since Milestone 9d events, deliveries and delivery_attempts are all partitioned by the
     # event's day and dropped together. Row-by-row event expiry (cascading DELETEs) therefore
     # only runs as a backstop, for events this many seconds past retain_until: the partition
