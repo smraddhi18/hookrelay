@@ -95,3 +95,17 @@ day against the row-by-row `DELETE` it replaces. The figures in
 ADMIN_URL=postgresql://user:pw@localhost:5432/postgres N_PER_DAY=15000 \
   uv run python loadtest/partition_bench.py
 ```
+
+## Stranded-day repair: `partition_repair_bench.py`
+
+Milestone 9e. Builds a scratch database with `BG_DAYS` (14) past days of `BG_PER_DAY` (10,000)
+events in their own partitions, then for each size in `SIZES` strands one future day of `n`
+events in the DEFAULT partitions. Each event has one delivery, two attempts and an outbox row,
+so 5 rows per event. The script times `repair_day` (one transaction: copy, cascade delete,
+create partitions, re-insert) and checks that every row of the day is byte-identical
+(`to_jsonb`) afterwards.
+
+```bash
+ADMIN_URL=postgresql://user:pw@localhost:5432/postgres SIZES=1000,10000 \
+  uv run python loadtest/partition_repair_bench.py
+```
