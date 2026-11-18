@@ -88,8 +88,9 @@ See the **[roadmap](ROADMAP.md)** for the plan and progress log.
 | Deploy | CI `helm` job: `helm lint --strict`, `helm template` × 4 value sets through `kubeconform -strict` (+ KEDA / Prometheus Operator CRD schemas), guard-rail and chart-invariant tests, then a kind cluster: install, `helm test`, k6 e2e (no lost / duplicated deliveries), upgrade, worker `SIGTERM` drain | ✅ M9 |
 | Scale | Native range partitioning of `delivery_attempts` by UTC day (migration `0011`, DEFAULT safety net) with `hookrelay-partitions`: idempotent premake (`PARTITION_PREMAKE_DAYS`), retention by `DETACH` + `DROP` under `lock_timeout` with retries, advisory-lock single runner, Helm CronJob, partition gauges ([docs/partitioning.md](docs/partitioning.md)) | ✅ M9 |
 | Scale | The whole event graph partitioned by the **event's** UTC day (migration `0012`): `events`, `deliveries` and `delivery_attempts` share one key (`event_created_at`, carried by every lease and fenced write), composite FKs carry it, so one day is one connected component and retention is child-first `DETACH` + `DROP` with no cascade left to run; Postgres' own FK check enforces the order; the row-level event purge is a grace-period backstop (`RETENTION_EVENT_PURGE_GRACE_S`) | ✅ M9 |
-| Scale | The relay premakes partitions as a second safety net (`RELAY_PARTITION_CHECK_INTERVAL_S`, `RELAY_PARTITION_MIN_DAYS_AHEAD`) under the same advisory locks as `hookrelay-partitions`, never retiring; counted in `hookrelay_partition_safety_premakes_total`. Rows stranded in a parent table's DEFAULT are reported (`blocked_days`), never moved (the move would cascade) | ✅ M9 |
-| Scale | Cascade-safe automatic repair of stranded `events` / `deliveries` DEFAULT rows; tooling for the online (legacy-partition / dual-write) migration paths | 🔜 |
+| Scale | The relay premakes partitions as a second safety net (`RELAY_PARTITION_CHECK_INTERVAL_S`, `RELAY_PARTITION_MIN_DAYS_AHEAD`) under the same advisory locks as `hookrelay-partitions`, never retiring; counted in `hookrelay_partition_safety_premakes_total`. Rows stranded in a parent table's DEFAULT are reported (`blocked_days`, exit 3) | ✅ M9 |
+| Scale | Cascade-safe repair of rows stranded in the `events` / `deliveries` DEFAULT partitions (`hookrelay-partitions --repair-default` / `PARTITION_REPAIR_DEFAULT`). Each day's connected component is copied, deleted (the cascade fires inside the transaction), its partitions created and the rows re-inserted, all in one transaction under all three advisory locks. FKs are walked from the catalog, every count is checked, and the run is bounded by days and rows, with dry run, `partitions.repaired` logs and a textfile counter | ✅ M9 |
+| Scale | Tooling for the online (legacy-partition / dual-write) migration paths | 🔜 |
 
 ## Architecture
 
@@ -577,6 +578,8 @@ flowchart LR
     J["hookrelay-partitions<br/>hourly CronJob<br/>advisory lock per table"] -->|"premake: parents first"| D1
     J -->|"retire past the cutoff:<br/>attempts → deliveries → events<br/>DETACH then DROP"| OLD["day D − N<br/>dropped as a unit"]
     RL2["relay safety net<br/>premake only, same locks"] -.->|"missing partitions"| D1
+    J -.->|"--repair-default (opt-in, repair gate):<br/>copy the day's component · cascade DELETE ·<br/>stage + ATTACH parents first · counts checked"| DF
+    DF -.->|"stranded day re-homed<br/>in one transaction"| D1
     J -->|"gauges"| M["Prometheus"]
 ```
 
@@ -1289,6 +1292,47 @@ online migration path are in [docs/partitioning.md](docs/partitioning.md).
   for it); the downgrade is tested with data on three days (one 40 days old), refuses to drop a
   duplicated `external_id`, and removes dangling idempotency records.
 
+### Milestone 9e decisions (repairing stranded DEFAULT rows)
+
+- **Let the cascade happen, inside the transaction, and undo it.** Moving an `events` row out of
+  DEFAULT is a `DELETE`, and `ON DELETE CASCADE` cannot be deferred. Disabling FK triggers needs
+  a superuser, and re-adding the FKs re-validates every referencing row (Postgres 16 refuses
+  `NOT VALID` FKs on partitioned tables). The repair therefore copies the day's whole connected
+  component (events → deliveries → attempts, plus `event_outbox`) into temp tables, deletes the
+  root rows, creates the day partitions and re-inserts parents first, all in **one
+  transaction**. It is all or nothing, and it is checked: the deleted count and every inserted
+  count must equal the copied counts, or the transaction rolls back.
+- **Lock so the copy is the truth, and lock first.** Every table of the component is locked
+  `SHARE ROW EXCLUSIVE` before anything else (reads continue, writes to the event graph wait),
+  and every copied row is `FOR UPDATE`. `ATTACH` takes `SHARE ROW EXCLUSIVE` on the tables on
+  the other side of each FK anyway, which I confirmed in `pg_locks`. Taking those locks late
+  deadlocked in testing with a concurrent ingest, so the repair now waits only while it holds
+  nothing. The price is a write freeze for the length of the transaction: 2.0 s for a
+  50,000-row day on the build box.
+- **Stage partitions, then attach.** Missing day partitions are created standalone and filled
+  with one bulk insert from the copy (no triggers or FKs yet). They are then attached parents
+  first, so Postgres validates their FKs in one set-based check. Re-inserting every row through
+  the parent table cost 5.1 s for the same day (a per-row trigger and FK check), against 2.0 s
+  staged, and `ATTACH`'s `ACCESS EXCLUSIVE` on the DEFAULT is held only for the last 0.6 s.
+- **The FK graph comes from the catalog, and the code refuses what it cannot copy.** Referencing
+  tables come from `pg_constraint`. A future FK is either picked up, or it makes the day
+  `unsupported`: a non-cascading reference with matching rows, or a table reachable along two
+  paths. A new table can never be silently cascaded away.
+- **A gate so overlapping runs cannot starve the repair.** It needs all three per-table
+  advisory locks, and every acquirer only tries them, so two overlapping runs could each hold
+  part of the set. The first full CI run caught exactly that. A repair run therefore takes
+  `hookrelay.partitions:repair` first, and only the gate holder retries the table locks with
+  backoff, which cannot deadlock because nobody else waits.
+- **Opt-in and bounded.** A day moves as a unit (`ATTACH` needs the DEFAULT free of the whole
+  range), so the bound is rows per day (`PARTITION_REPAIR_MAX_ROWS`, skipped as `too_large`,
+  checked before locking) plus days per run. It is off by default, because it is a repair
+  rather than routine work. Without it, days are still reported as `blocked_days` with exit 3.
+  Workers are not stopped: a lease row lock makes the day wait or defer, and a completion that
+  loses the race is fenced like a lost lease, so the delivery is retried (at-least-once).
+- **Signals for a CronJob.** It is never scraped, so besides `partitions.repaired` logs and the
+  exit code, `--metrics-textfile` writes `hookrelay_partition_repaired_rows_total` for a
+  node-exporter textfile collector.
+
 ## Getting started
 
 ### Prerequisites
@@ -1519,6 +1563,8 @@ All settings are environment variables (or `.env`), validated at startup. See
 | `RETENTION_EVENT_PURGE_GRACE_S` | `172800` | the row-by-row expired-event purge (housekeeping / `hookrelay-retention`) waits this long past `retain_until`, so the partition drop gets there first (0-30 d; `0` = purge on expiry, i.e. no partition job) |
 | `RELAY_PARTITION_CHECK_INTERVAL_S` / `RELAY_PARTITION_MIN_DAYS_AHEAD` | `300` / `2` | relay safety net: how often (`0` = off) and how many days ahead (1-30) it premakes missing partitions, under the same advisory locks as the job (never retires) |
 | `PARTITION_LOCK_TIMEOUT_MS` / `PARTITION_DDL_RETRIES` | `2000` / `5` | `lock_timeout` per partition DDL statement / retries on lock timeout (capped backoff) before deferring to the next run |
+| `PARTITION_REPAIR_DEFAULT` | `false` | repair rows stranded in the `events` / `deliveries` DEFAULT partitions on every run (same as `hookrelay-partitions --repair-default`) |
+| `PARTITION_REPAIR_MAX_DAYS` / `PARTITION_REPAIR_MAX_ROWS` | `7` / `50000` | stranded days repaired per run (1-366) / most rows of one day's component moved in one transaction; a bigger day is skipped as `too_large` (1-5,000,000) |
 
 ### Observability (Milestone 7)
 
@@ -1784,7 +1830,8 @@ src/hookrelay/
   relay.py              fan-out relay process (`python -m hookrelay.relay` / `hookrelay-relay`)
   worker.py             delivery worker process (`python -m hookrelay.worker` / `hookrelay-worker`)
   retention.py          one bounded retention run (`python -m hookrelay.retention` / `hookrelay-retention`)
-  partitions.py         partition maintenance (`python -m hookrelay.partitions [--dry-run]` / `hookrelay-partitions`)
+  partitions.py         partition maintenance (`python -m hookrelay.partitions [--dry-run] [--repair-default]
+                        [--metrics-textfile PATH]` / `hookrelay-partitions`)
   mock_receiver.py      configurable webhook receiver for load / chaos tests (`hookrelay-mock-receiver`):
                         latency, jitter, failure / 429 / hang rates per endpoint, ack accounting, /stats
   redis_/               fail-soft redis.asyncio client, keys, coalescer, wakeup pub/sub, subscription
@@ -1811,7 +1858,8 @@ src/hookrelay/
                         machine + outcome recording), notifications (outbox + notifier), replays,
                         endpoint_secrets (rotation), endpoint_health (summary), dashboard (tenant
                         rollup), retention (payload purge + ended secret overlaps, batched runner),
-                        partitions (premake / detach + drop / DEFAULT sweep, advisory-lock runner);
+                        partitions (premake / detach + drop / DEFAULT sweep, advisory-lock runner),
+                        partition_repair (cascade-safe re-homing of stranded DEFAULT rows);
                         deliveries also holds search
   deploy/               Prometheus scrape config, Grafana provisioning + starter dashboard,
                         pgbouncer/ (compose pgbouncer.ini + userlist, run-test-pooler.sh for tests / CI),
@@ -1821,7 +1869,8 @@ alembic/                async env + versioned migrations (0001 tenants ... 0010 
                         0011 delivery_attempts range partitioning, 0012 events / deliveries partitioned by the event day)
 loadtest/               k6 scripts (ingest.js, e2e.js, lib.js) + run-local.sh (starts the stack, runs k6,
                         optional CHAOS_CMD fault injection, collects summaries and logs);
-                        partition_bench.py (measures partition read / lease / retention costs)
+                        partition_bench.py (measures partition read / lease / retention costs),
+                        partition_repair_bench.py (times one stranded-day repair)
 docs/capacity.md        measured capacity plan (throughput per worker, scaling, pool sizing, storage, limits)
 docs/partitioning.md    event-graph partitioning: layout, keys trade-off, measured costs, retention order, maintenance job + relay safety net, migration
 tests/receiver.py       raw-asyncio HTTP receiver + fake resolver used by delivery tests

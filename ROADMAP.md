@@ -89,7 +89,8 @@ The capacity plan's next levers, plus the deployment story an operator would act
 
 - [x] Native range partitioning by `created_at` for `delivery_attempts` (append-only, largest): daily partitions + DEFAULT (migration `0011`, tested downgrade), premade by a maintenance job (`hookrelay-partitions`, Helm CronJob), retention by `DETACH` + `DROP`, online migration path documented in [docs/partitioning.md](docs/partitioning.md)
 - [x] Partition `events` and `deliveries` too, keyed (with `delivery_attempts`) by the **event's** UTC day, so expiry is the partition drop alone, child first (migration `0012`, tested data-carrying roundtrip); relay-driven premake as a second safety net; row-level event purge demoted to a grace-period backstop; `external_id` uniqueness moved to a claim table
-- [ ] Remaining from the partitioning item: a cascade-safe automatic repair of rows stranded in `events` / `deliveries` DEFAULT partitions (today reported, not moved); tooling for the online (legacy-partition / dual-write + backfill) migration paths; a cheaper parent `DETACH` and a smaller lease-pick tax at high volume (measured in [docs/partitioning.md](docs/partitioning.md))
+- [x] Cascade-safe automatic repair of rows stranded in the `events` / `deliveries` DEFAULT partitions (`hookrelay-partitions --repair-default`): one day's connected component per transaction (copy, cascade delete, create partitions, re-insert, counts checked), FK graph from the catalog, under all three advisory locks, bounded, dry run, tested on Postgres 16 for no row loss, idempotency and concurrent runs
+- [ ] Remaining from the partitioning item: tooling for the online (legacy-partition / dual-write + backfill) migration paths; a cheaper parent `DETACH` and a smaller lease-pick tax at high volume (measured in [docs/partitioning.md](docs/partitioning.md))
 - [x] Batched completion writes in workers (one transaction for several finished attempts, still fenced per lease) to cut the one-completion-transaction-per-delivery cost (leases are already batched)
 - [x] PgBouncer (transaction pooling) in compose and docs: asyncpg prepared-statement settings, connection budget per process, re-measured pool sizing
 - [x] Helm chart: API / relay / worker Deployments, a pre-upgrade migration Job, liveness / readiness / heartbeat probes, PodDisruptionBudgets, `SIGTERM` grace above the drain timeout, secrets from Kubernetes Secrets
@@ -459,3 +460,54 @@ The capacity plan's next levers, plus the deployment story an operator would act
   head `0012`. The kind job itself still runs only in GitHub Actions (no docker on the build box).
 - Next: a cascade-safe repair of stranded parent-table DEFAULT rows, online-migration tooling,
   and the multi-node capacity re-run.
+
+### 2026-11-17/18: Milestone 9e (cascade-safe repair of stranded DEFAULT rows; built 2026-11-17, landing on main 2026-11-18)
+
+- New `hookrelay.services.partition_repair`, run by `hookrelay-partitions --repair-default`
+  (or `PARTITION_REPAIR_DEFAULT=true`, off by default). Rows of `events` / `deliveries` that
+  landed in the DEFAULT partition (a missed premake) used to be reported as `blocked_days`
+  (exit 3) and left there, because moving a parent row is a `DELETE` that cascades into
+  `deliveries`, `delivery_attempts` and `event_outbox`. Per stranded day, in one transaction:
+  lock every table of the component `SHARE ROW EXCLUSIVE` up front, copy the day's connected
+  component (FK graph read from `pg_constraint`) into `ON COMMIT DROP` temp tables with
+  `FOR UPDATE`, delete the root rows (the cascade removes the rest), stage the missing day
+  partitions standalone with one bulk insert each, `ATTACH` them parents first, and re-insert
+  through the parent where a partition already existed (and for `event_outbox`). The deleted
+  count and every inserted count must equal the copied counts, or the day rolls back.
+- Refuses what it cannot copy faithfully: a non-cascading FK with matching rows or a table
+  reachable along two FK paths makes the day `unsupported`; a day above
+  `PARTITION_REPAIR_MAX_ROWS` (50,000, whole component) is `too_large`, checked before locking;
+  at most `PARTITION_REPAIR_MAX_DAYS` (7) days per run, the rest `deferred`. Lock timeouts,
+  deadlocks, an `ATTACH` `CHECK` violation and count mismatches are retried with the job's
+  backoff, then deferred. `--dry-run` copies without locks and rolls back (`repair_planned`).
+- Concurrency: runs only while holding all three per-table advisory locks, behind a new repair
+  gate (`hookrelay.partitions:repair`) so two overlapping runs cannot each hold half the set (the
+  first full CI run caught that starvation). Taking the table locks late (at `ATTACH`) deadlocked
+  with a concurrent ingest in testing, hence lock first. A worker's lease row lock makes the day
+  wait or defer; a completion losing the race is fenced like a lost lease (at-least-once).
+- Signals: `partitions.repaired` / `partitions.repair_skipped` logs, `repaired_days`,
+  `repaired_rows`, `repair_skipped` in the report, and `--metrics-textfile PATH` writing
+  `hookrelay_partition_repaired_rows_total{table}` for a node-exporter textfile collector (a
+  CronJob is never scraped).
+- Measured on the build box (`loadtest/partition_repair_bench.py`, Postgres 16.16, background of
+  14 days x 10,000 events in their partitions, one stranded future day of n events, 5 rows per
+  event, single runs on one shared machine, every row `to_jsonb`-identical afterwards):
+  n = 1,000 (5,000 rows) 331 ms; n = 10,000 (50,000 rows) 2,028 ms (lock 115, copy 119,
+  delete 1,148, stage 45, attach 594); n = 20,000 (100,000 rows) 3,712 ms. The whole
+  transaction is a write freeze on the event graph. The first version, re-inserting every row
+  through the parent table, took 614 ms and 5,102 ms for the first two sizes. Not measured:
+  larger days, contention under live load, multi-node.
+- `tests/integration/test_partition_repair.py` (20 tests on Postgres 16, each comparing the
+  `to_jsonb` image of all four tables before and after plus FK integrity): past and future
+  stranded days with a control event, idempotency, dry run, blocked days without the flag, row
+  and day budgets, a deliveries-only day, days past retention left to the sweep, two concurrent
+  runs, the repair gate, a held advisory lock, a held delivery row lock (deferred, then repaired),
+  `SET NULL` and diamond FKs (`unsupported`), the catalog walk, the CLI flag / exit codes /
+  textfile, writes after a repair, existing partitions refilled through the parent, and a racing
+  writer. Unit tests for the settings, the policy and the FK matching.
+- 1110 tests (809 unit, 301 integration on Postgres 16 + Redis + PgBouncer, no skips), 97%
+  line+branch coverage (`partition_repair.py` 96%); ruff, ruff format, mypy strict, Alembic
+  upgrade (twice) / downgrade to base / upgrade + `alembic check`, helm lint / template /
+  kubeconform / guard rails, actionlint and shellcheck pass (`/workspace/hookrelay-ci-local-m9e.sh`).
+  No migration this milestone (head stays `0012`). The kind job runs only in GitHub Actions.
+- Next: online-migration tooling, a cheaper parent `DETACH`, and the multi-node capacity re-run.
